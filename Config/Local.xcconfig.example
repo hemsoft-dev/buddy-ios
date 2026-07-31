@@ -1,0 +1,2 @@
+// Copy this file to Local.xcconfig and keep local values out of source control.
+BUDDY_GITHUB_CLIENT_ID =

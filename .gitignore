@@ -15,10 +15,12 @@ xcuserdata/
 .build/
 .swiftpm/
 
-# Local environment and secrets
+# Local environment, configuration, and secrets
 .env
 .env.*
 !.env.example
+Config/Local.xcconfig
+*.mobileprovision
 
 # Fastlane generated output
 fastlane/report.xml

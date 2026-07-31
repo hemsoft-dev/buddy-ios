@@ -1,0 +1,5 @@
+// Safe, source-controlled defaults. Local.xcconfig is intentionally ignored.
+BUDDY_BUNDLE_IDENTIFIER = com.hemsoft.buddy
+BUDDY_GITHUB_CLIENT_ID =
+
+#include? "Local.xcconfig"
