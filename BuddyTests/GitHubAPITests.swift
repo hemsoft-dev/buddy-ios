@@ -104,7 +104,7 @@ final class GitHubAPITests: XCTestCase {
     func testAuthoredPullRequestsUsesVersionedEncodedBoundedSearchAndSortsResults() async throws {
         let httpClient = MockHTTPClient(responses: [
             .success(
-                #"{"total_count":72,"items":[{"id":1,"number":7,"title":"Older","draft":false,"updated_at":"2026-07-31T12:00:00Z","html_url":"https://github.com/HemSoft/Buddy/pull/7","repository_url":"https://api.github.com/repos/HemSoft/Buddy"},{"id":2,"number":9,"title":"Newer","draft":true,"updated_at":"2026-08-01T12:00:00Z","html_url":"https://github.com/HemSoft/Other/pull/9","repository_url":"https://api.github.com/repos/HemSoft/Other"}]}"#,
+                #"{"total_count":72,"incomplete_results":false,"items":[{"id":1,"number":7,"title":"Older","draft":false,"updated_at":"2026-07-31T12:00:00Z","html_url":"https://github.com/HemSoft/Buddy/pull/7","repository_url":"https://api.github.com/repos/HemSoft/Buddy"},{"id":2,"number":9,"title":"Newer","draft":true,"updated_at":"2026-08-01T12:00:00Z","html_url":"https://github.com/HemSoft/Other/pull/9","repository_url":"https://api.github.com/repos/HemSoft/Other"}]}"#,
                 statusCode: 200
             ),
         ])
@@ -136,12 +136,26 @@ final class GitHubAPITests: XCTestCase {
     }
 
     func testAuthoredPullRequestsSupportsEmptyResults() async throws {
-        let httpClient = MockHTTPClient(responses: [.success(#"{"total_count":0,"items":[]}"#, statusCode: 200)])
+        let httpClient = MockHTTPClient(responses: [.success(#"{"total_count":0,"incomplete_results":false,"items":[]}"#, statusCode: 200)])
 
         let collection = try await GitHubAPI(httpClient: httpClient)
             .authoredPullRequests(login: "octocat", token: "token")
 
         XCTAssertEqual(collection, GitHubPullRequestCollection(pullRequests: [], totalCount: 0))
+    }
+
+    func testAuthoredPullRequestsRejectsIncompleteSearchResults() async throws {
+        let httpClient = MockHTTPClient(responses: [
+            .success(#"{"total_count":1,"incomplete_results":true,"items":[]}"#, statusCode: 200),
+        ])
+
+        do {
+            _ = try await GitHubAPI(httpClient: httpClient)
+                .authoredPullRequests(login: "octocat", token: "token")
+            XCTFail("Expected incomplete search results to be rejected")
+        } catch let error as GitHubAPIError {
+            XCTAssertEqual(error, .incompleteResults)
+        }
     }
 
     func testAuthoredPullRequestsRejectsUnsafeLoginAndMalformedItems() async throws {
@@ -156,7 +170,7 @@ final class GitHubAPITests: XCTestCase {
 
         let malformedClient = MockHTTPClient(responses: [
             .success(
-                #"{"total_count":1,"items":[{"id":1,"number":1,"title":"PR","updated_at":"2026-08-01T12:00:00Z","html_url":"http://example.com/pr/1","repository_url":"https://api.github.com/repos/HemSoft/Buddy"}]}"#,
+                #"{"total_count":1,"incomplete_results":false,"items":[{"id":1,"number":1,"title":"PR","updated_at":"2026-08-01T12:00:00Z","html_url":"http://example.com/pr/1","repository_url":"https://api.github.com/repos/HemSoft/Buddy"}]}"#,
                 statusCode: 200
             ),
         ])

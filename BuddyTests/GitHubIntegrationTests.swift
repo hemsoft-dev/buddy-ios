@@ -91,6 +91,24 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(integration.summary.detail, "Authorization expired")
     }
 
+    func testIncompletePullRequestSearchMapsToRetryableConnectionError() async throws {
+        let api = StubGitHubAPI(pullRequestResults: [.failure(.incompleteResults)])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: MockCredentialStore(initialValue: "stored-token")
+        )
+        let account = GitHubAccount(id: 7, login: "franz", name: nil, avatarURL: nil)
+
+        do {
+            _ = try await integration.authoredPullRequests(for: account)
+            XCTFail("Expected incomplete results error")
+        } catch let error as GitHubConnectionError {
+            XCTAssertEqual(error, .incompleteResults)
+            XCTAssertEqual(error.localizedDescription, "GitHub returned partial search results. Refresh to try again.")
+        }
+    }
+
     func testConcurrentRestoresShareOneValidationResult() async throws {
         let account = GitHubAccount(id: 7, login: "franz", name: nil, avatarURL: nil)
         let api = SequencedSuspendedUserGitHubAPI()

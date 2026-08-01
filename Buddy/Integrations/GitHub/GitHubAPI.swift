@@ -201,6 +201,10 @@ struct GitHubAPI: GitHubAPIProviding {
             throw GitHubAPIError.malformedResponse
         }
 
+        guard !response.incompleteResults else {
+            throw GitHubAPIError.incompleteResults
+        }
+
         let pullRequests = try response.items.map { item in
             guard item.id > 0,
                   item.number > 0,
@@ -332,6 +336,7 @@ enum GitHubAPIError: Error, Equatable, Sendable {
     case deviceFlowDisabled
     case incorrectClientCredentials
     case rateLimited
+    case incompleteResults
     case server(Int)
 }
 
@@ -379,10 +384,12 @@ private struct UserResponse: Decodable {
 
 private struct PullRequestSearchResponse: Decodable {
     let totalCount: Int
+    let incompleteResults: Bool
     let items: [PullRequestSearchItem]
 
     enum CodingKeys: String, CodingKey {
         case totalCount = "total_count"
+        case incompleteResults = "incomplete_results"
         case items
     }
 }

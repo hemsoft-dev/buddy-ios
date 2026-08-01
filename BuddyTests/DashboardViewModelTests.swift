@@ -153,6 +153,19 @@ final class DashboardViewModelTests: XCTestCase {
         )
     }
 
+    func testGitHubDashboardSurfacesIncompleteSearchAsRetryableFailure() async {
+        let provider = StubPullRequestProvider(results: [.failure(.incompleteResults)])
+        let viewModel = DashboardViewModel(integrations: [], github: provider)
+
+        let failure = await viewModel.refresh(account: testAccount)
+
+        XCTAssertEqual(failure, .incompleteResults)
+        XCTAssertEqual(
+            viewModel.githubState,
+            .failed([], refreshedAt: nil, .incompleteResults)
+        )
+    }
+
     func testGitHubDashboardDoesNotReuseResultsAcrossAccounts() async {
         let refreshDate = Date(timeIntervalSince1970: 4_000)
         let firstAccountPullRequest = makePullRequest(id: 1, updatedAt: refreshDate)

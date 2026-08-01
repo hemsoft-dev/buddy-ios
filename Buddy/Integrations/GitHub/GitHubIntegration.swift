@@ -451,6 +451,8 @@ actor GitHubIntegration: IntegrationProviding {
                 return .invalidConfiguration
             case .rateLimited:
                 return .rateLimited
+            case .incompleteResults:
+                return .incompleteResults
             case let .server(statusCode):
                 return .server(statusCode)
             }
@@ -474,6 +476,7 @@ enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
     case networkUnavailable
     case malformedResponse
     case rateLimited
+    case incompleteResults
     case server(Int)
     case credentialStorage
 
@@ -497,6 +500,8 @@ enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
             "GitHub returned an unexpected response. Try again in a moment."
         case .rateLimited:
             "GitHub's request limit was reached. Wait a little while, then refresh again."
+        case .incompleteResults:
+            "GitHub returned partial search results. Refresh to try again."
         case let .server(statusCode):
             "GitHub returned an error (\(statusCode)). Try again later."
         case .credentialStorage:
@@ -515,6 +520,7 @@ enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
         case .networkUnavailable: "Unable to reach GitHub"
         case .malformedResponse: "Unexpected response from GitHub"
         case .rateLimited: "GitHub request limit reached"
+        case .incompleteResults: "GitHub returned partial results"
         case .server: "GitHub is unavailable"
         case .credentialStorage: "Keychain update failed"
         }

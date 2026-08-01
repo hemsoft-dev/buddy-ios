@@ -11,6 +11,7 @@ enum GitHubPullRequestFailure: Equatable, Sendable {
     case authenticationRequired
     case offline
     case rateLimited
+    case incompleteResults
     case malformedResponse
     case server
     case credentialStorage
@@ -24,6 +25,8 @@ enum GitHubPullRequestFailure: Equatable, Sendable {
             "Buddy is offline. Previously loaded pull requests remain available."
         case .rateLimited:
             "GitHub's request limit was reached. Try refreshing again later."
+        case .incompleteResults:
+            "GitHub returned partial search results. Refresh to try again."
         case .malformedResponse:
             "GitHub returned an unexpected response. Try again in a moment."
         case .server:
@@ -191,6 +194,8 @@ final class DashboardViewModel {
             .offline
         case .rateLimited:
             .rateLimited
+        case .incompleteResults:
+            .incompleteResults
         case .malformedResponse:
             .malformedResponse
         case .server:
