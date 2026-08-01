@@ -35,6 +35,9 @@ struct DashboardView: View {
                 }
             }
         }
+        .task {
+            await viewModel.refresh()
+        }
     }
 
     private var welcomeCard: some View {
