@@ -174,7 +174,14 @@ final class GitHubViewModel {
         connectionTask?.cancel()
         connectionTask = nil
         state = .disconnected
-        Task { await integration.cancelAuthorization() }
+        Task {
+            do {
+                try await integration.cancelAuthorization()
+            } catch {
+                retryAction = .restore
+                state = .needsAttention(error.localizedDescription)
+            }
+        }
     }
 
     func disconnect() async {

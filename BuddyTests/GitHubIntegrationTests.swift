@@ -4,7 +4,11 @@ import XCTest
 final class GitHubIntegrationTests: XCTestCase {
     func testSuccessfulAuthorizationValidatesBeforePersistingAndReportsConnected() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: "The Octocat", avatarURL: nil)
-        let api = StubGitHubAPI(pollResults: [.success(.authorized(token: "access-token"))], userResults: [.success(account)])
+        let api = StubGitHubAPI(
+            deviceResults: [.success(testAuthorization)],
+            pollResults: [.success(.authorized(token: "access-token"))],
+            userResults: [.success(account)]
+        )
         let credentials = MockCredentialStore()
         let integration = GitHubIntegration(
             clientID: "client-id",
@@ -12,13 +16,7 @@ final class GitHubIntegrationTests: XCTestCase {
             credentials: credentials,
             sleep: { _ in }
         )
-        let authorization = GitHubDeviceAuthorization(
-            deviceCode: "device-code",
-            userCode: "ABCD-EFGH",
-            verificationURI: URL(string: "https://github.com/login/device")!,
-            expiresIn: 900,
-            interval: 5
-        )
+        let authorization = try await integration.beginAuthorization()
 
         let connectedAccount = try await integration.completeAuthorization(authorization)
 
@@ -63,6 +61,7 @@ final class GitHubIntegrationTests: XCTestCase {
 
     func testFailedIdentityValidationDoesNotPersistToken() async throws {
         let api = StubGitHubAPI(
+            deviceResults: [.success(testAuthorization)],
             pollResults: [.success(.authorized(token: "unvalidated-token"))],
             userResults: [.failure(.malformedResponse)]
         )
@@ -73,13 +72,7 @@ final class GitHubIntegrationTests: XCTestCase {
             credentials: credentials,
             sleep: { _ in }
         )
-        let authorization = GitHubDeviceAuthorization(
-            deviceCode: "device-code",
-            userCode: "ABCD-EFGH",
-            verificationURI: URL(string: "https://github.com/login/device")!,
-            expiresIn: 900,
-            interval: 5
-        )
+        let authorization = try await integration.beginAuthorization()
 
         do {
             _ = try await integration.completeAuthorization(authorization)
@@ -107,6 +100,7 @@ final class GitHubIntegrationTests: XCTestCase {
     func testCancellationDuringCredentialPersistenceRemovesNewToken() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let api = StubGitHubAPI(
+            deviceResults: [.success(testAuthorization)],
             pollResults: [.success(.authorized(token: "new-token"))],
             userResults: [.success(account)]
         )
@@ -117,13 +111,7 @@ final class GitHubIntegrationTests: XCTestCase {
             credentials: credentials,
             sleep: { _ in }
         )
-        let authorization = GitHubDeviceAuthorization(
-            deviceCode: "device-code",
-            userCode: "ABCD-EFGH",
-            verificationURI: URL(string: "https://github.com/login/device")!,
-            expiresIn: 900,
-            interval: 5
-        )
+        let authorization = try await integration.beginAuthorization()
         let completion = Task {
             try await integration.completeAuthorization(authorization)
         }
@@ -140,6 +128,59 @@ final class GitHubIntegrationTests: XCTestCase {
         }
 
         let credentialValue = await credentials.stringValue()
+        XCTAssertNil(credentialValue)
+        XCTAssertEqual(integration.summary.connectionState, .disconnected)
+    }
+
+    func testCancellationCleanupFailureReportsNeedsAttention() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let api = StubGitHubAPI(
+            deviceResults: [.success(testAuthorization)],
+            pollResults: [.success(.authorized(token: "new-token"))],
+            userResults: [.success(account)]
+        )
+        let credentials = SuspendedCredentialStore(failRemoval: true)
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: credentials,
+            sleep: { _ in }
+        )
+        let authorization = try await integration.beginAuthorization()
+        let completion = Task {
+            try await integration.completeAuthorization(authorization)
+        }
+
+        await credentials.waitUntilSetBegins()
+        completion.cancel()
+        await credentials.finishSet()
+
+        do {
+            _ = try await completion.value
+            XCTFail("Expected credential cleanup failure")
+        } catch let error as GitHubConnectionError {
+            XCTAssertEqual(error, .credentialStorage)
+        }
+
+        XCTAssertEqual(integration.summary.connectionState, .needsAttention)
+    }
+
+    func testDisconnectPreventsStaleValidationFromRestoringConnectedState() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let api = SuspendedUserGitHubAPI(account: account)
+        let credentials = MockCredentialStore(initialValue: "stored-token")
+        let integration = GitHubIntegration(clientID: "client-id", api: api, credentials: credentials)
+        let restoration = Task {
+            try await integration.restoreAccount()
+        }
+
+        await api.waitUntilUserRequestBegins()
+        try await integration.disconnect()
+        await api.finishUserRequest()
+
+        let restoredAccount = try await restoration.value
+        let credentialValue = await credentials.stringValue()
+        XCTAssertNil(restoredAccount)
         XCTAssertNil(credentialValue)
         XCTAssertEqual(integration.summary.connectionState, .disconnected)
     }
@@ -182,6 +223,14 @@ private actor MockCredentialStore: CredentialStoring {
     }
 }
 
+private let testAuthorization = GitHubDeviceAuthorization(
+    deviceCode: "device-code",
+    userCode: "ABCD-EFGH",
+    verificationURI: URL(string: "https://github.com/login/device")!,
+    expiresIn: 900,
+    interval: 5
+)
+
 private actor StubGitHubAPI: GitHubAPIProviding {
     private var deviceResults: [Result<GitHubDeviceAuthorization, GitHubAPIError>]
     private var pollResults: [Result<GitHubTokenPollResult, GitHubAPIError>]
@@ -217,9 +266,18 @@ private actor StubGitHubAPI: GitHubAPIProviding {
 }
 
 private actor SuspendedCredentialStore: CredentialStoring {
+    enum StoreError: Error {
+        case removalFailed
+    }
+
     private var value: Data?
+    private let failRemoval: Bool
     private var setStartedWaiter: CheckedContinuation<Void, Never>?
     private var setCompletion: CheckedContinuation<Void, Never>?
+
+    init(failRemoval: Bool = false) {
+        self.failRemoval = failRemoval
+    }
 
     func set(_ data: Data, for account: String) async {
         value = data
@@ -235,7 +293,10 @@ private actor SuspendedCredentialStore: CredentialStoring {
         value
     }
 
-    func removeData(for account: String) {
+    func removeData(for account: String) throws {
+        if failRemoval {
+            throw StoreError.removalFailed
+        }
         value = nil
     }
 
@@ -254,5 +315,46 @@ private actor SuspendedCredentialStore: CredentialStoring {
 
     func stringValue() -> String? {
         value.flatMap { String(data: $0, encoding: .utf8) }
+    }
+}
+
+private actor SuspendedUserGitHubAPI: GitHubAPIProviding {
+    private let account: GitHubAccount
+    private var userRequestWaiter: CheckedContinuation<Void, Never>?
+    private var userRequestCompletion: CheckedContinuation<Void, Never>?
+
+    init(account: GitHubAccount) {
+        self.account = account
+    }
+
+    func requestDeviceAuthorization(clientID: String) throws -> GitHubDeviceAuthorization {
+        throw GitHubAPIError.malformedResponse
+    }
+
+    func pollForAccessToken(clientID: String, deviceCode: String) throws -> GitHubTokenPollResult {
+        throw GitHubAPIError.malformedResponse
+    }
+
+    func authenticatedUser(token: String) async -> GitHubAccount {
+        userRequestWaiter?.resume()
+        userRequestWaiter = nil
+
+        await withCheckedContinuation { continuation in
+            userRequestCompletion = continuation
+        }
+        return account
+    }
+
+    func waitUntilUserRequestBegins() async {
+        guard userRequestCompletion == nil else { return }
+
+        await withCheckedContinuation { continuation in
+            userRequestWaiter = continuation
+        }
+    }
+
+    func finishUserRequest() {
+        userRequestCompletion?.resume()
+        userRequestCompletion = nil
     }
 }

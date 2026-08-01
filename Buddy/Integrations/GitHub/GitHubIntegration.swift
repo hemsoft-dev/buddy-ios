@@ -19,6 +19,8 @@ actor GitHubIntegration: IntegrationProviding {
     private let credentials: any CredentialStoring
     private let sleep: @Sendable (Duration) async throws -> Void
     private let summaryStorage: LockedGitHubSummary
+    private var authorizationGeneration = 0
+    private var activeDeviceCode: String?
 
     init(
         clientID: String? = AppConfiguration.current.githubClientID,
@@ -50,13 +52,17 @@ actor GitHubIntegration: IntegrationProviding {
     }
 
     func restoreAccount() async throws -> GitHubAccount? {
+        let generation = authorizationGeneration
         let storedTokenData: Data?
         do {
             storedTokenData = try await credentials.data(for: Self.credentialAccount)
         } catch {
+            guard generation == authorizationGeneration else { return nil }
             updateSummary(detail: "Unable to read authorization", state: .needsAttention)
             throw GitHubConnectionError.credentialStorage
         }
+
+        guard generation == authorizationGeneration else { return nil }
 
         guard let tokenData = storedTokenData else {
             updateSummary(detail: "Ready to connect", state: .disconnected)
@@ -71,9 +77,11 @@ actor GitHubIntegration: IntegrationProviding {
 
         do {
             let account = try await api.authenticatedUser(token: token)
+            guard generation == authorizationGeneration else { return nil }
             updateSummary(detail: "@\(account.login)", state: .connected)
             return account
         } catch GitHubAPIError.unauthorized {
+            guard generation == authorizationGeneration else { return nil }
             try? await credentials.removeData(for: Self.credentialAccount)
             updateSummary(detail: "Authorization expired", state: .needsAttention)
             throw GitHubConnectionError.invalidToken
@@ -81,6 +89,7 @@ actor GitHubIntegration: IntegrationProviding {
             if Task.isCancelled {
                 throw CancellationError()
             }
+            guard generation == authorizationGeneration else { return nil }
             updateSummary(detail: "Unable to validate account", state: .needsAttention)
             throw map(error)
         }
@@ -92,13 +101,24 @@ actor GitHubIntegration: IntegrationProviding {
             throw GitHubConnectionError.missingClientID
         }
 
+        authorizationGeneration &+= 1
+        let generation = authorizationGeneration
+        activeDeviceCode = nil
+
         do {
             let authorization = try await api.requestDeviceAuthorization(clientID: clientID)
+            guard generation == authorizationGeneration else {
+                throw CancellationError()
+            }
+            activeDeviceCode = authorization.deviceCode
             updateSummary(detail: "Waiting for authorization", state: .disconnected)
             return authorization
         } catch {
-            if Task.isCancelled {
-                updateSummary(detail: "Ready to connect", state: .disconnected)
+            if Task.isCancelled || generation != authorizationGeneration {
+                if generation == authorizationGeneration {
+                    activeDeviceCode = nil
+                    updateSummary(detail: "Ready to connect", state: .disconnected)
+                }
                 throw CancellationError()
             }
             updateSummary(detail: "Unable to start authorization", state: .needsAttention)
@@ -112,14 +132,25 @@ actor GitHubIntegration: IntegrationProviding {
             throw GitHubConnectionError.missingClientID
         }
 
+        guard activeDeviceCode == authorization.deviceCode else {
+            throw CancellationError()
+        }
+
         let clock = ContinuousClock()
         let deadline = clock.now + .seconds(authorization.expiresIn)
+        let generation = authorizationGeneration
         var interval = authorization.interval
 
         do {
             while clock.now < deadline {
                 try Task.checkCancellation()
                 try await sleep(.seconds(interval))
+
+                guard generation == authorizationGeneration,
+                      activeDeviceCode == authorization.deviceCode
+                else {
+                    throw CancellationError()
+                }
 
                 guard clock.now < deadline else {
                     throw GitHubConnectionError.requestExpired
@@ -135,17 +166,30 @@ actor GitHubIntegration: IntegrationProviding {
                     interval = max(interval + 5, serverInterval ?? 0)
                 case let .authorized(token):
                     let account = try await api.authenticatedUser(token: token)
+                    guard generation == authorizationGeneration,
+                          activeDeviceCode == authorization.deviceCode
+                    else {
+                        throw CancellationError()
+                    }
+
                     do {
                         try await credentials.set(Data(token.utf8), for: Self.credentialAccount)
                     } catch {
                         throw GitHubConnectionError.credentialStorage
                     }
 
-                    if Task.isCancelled {
-                        try? await credentials.removeData(for: Self.credentialAccount)
+                    if Task.isCancelled ||
+                        generation != authorizationGeneration ||
+                        activeDeviceCode != authorization.deviceCode {
+                        do {
+                            try await credentials.removeData(for: Self.credentialAccount)
+                        } catch {
+                            throw GitHubConnectionError.credentialStorage
+                        }
                         throw CancellationError()
                     }
 
+                    activeDeviceCode = nil
                     updateSummary(detail: "@\(account.login)", state: .connected)
                     return account
                 }
@@ -154,29 +198,63 @@ actor GitHubIntegration: IntegrationProviding {
             updateSummary(detail: "Authorization request expired", state: .needsAttention)
             throw GitHubConnectionError.requestExpired
         } catch is CancellationError {
-            updateSummary(detail: "Ready to connect", state: .disconnected)
+            if generation == authorizationGeneration {
+                activeDeviceCode = nil
+                updateSummary(detail: "Ready to connect", state: .disconnected)
+            }
             throw CancellationError()
         } catch {
+            if let error = error as? GitHubConnectionError, error == .credentialStorage {
+                if activeDeviceCode == authorization.deviceCode {
+                    activeDeviceCode = nil
+                }
+                updateSummary(detail: error.summaryDetail, state: .needsAttention)
+                throw error
+            }
             if Task.isCancelled {
-                updateSummary(detail: "Ready to connect", state: .disconnected)
+                if generation == authorizationGeneration {
+                    activeDeviceCode = nil
+                    updateSummary(detail: "Ready to connect", state: .disconnected)
+                }
+                throw CancellationError()
+            }
+            guard generation == authorizationGeneration else {
                 throw CancellationError()
             }
             let connectionError = map(error)
+            activeDeviceCode = nil
             updateSummary(detail: connectionError.summaryDetail, state: .needsAttention)
             throw connectionError
         }
     }
 
-    func cancelAuthorization() async {
-        try? await credentials.removeData(for: Self.credentialAccount)
-        updateSummary(detail: "Ready to connect", state: .disconnected)
+    func cancelAuthorization() async throws {
+        authorizationGeneration &+= 1
+        let generation = authorizationGeneration
+        activeDeviceCode = nil
+
+        do {
+            try await credentials.removeData(for: Self.credentialAccount)
+            guard generation == authorizationGeneration else { return }
+            updateSummary(detail: "Ready to connect", state: .disconnected)
+        } catch {
+            guard generation == authorizationGeneration else { return }
+            updateSummary(detail: "Unable to remove authorization", state: .needsAttention)
+            throw GitHubConnectionError.credentialStorage
+        }
     }
 
     func disconnect() async throws {
+        authorizationGeneration &+= 1
+        let generation = authorizationGeneration
+        activeDeviceCode = nil
+
         do {
             try await credentials.removeData(for: Self.credentialAccount)
+            guard generation == authorizationGeneration else { return }
             updateSummary(detail: "Ready to connect", state: .disconnected)
         } catch {
+            guard generation == authorizationGeneration else { return }
             updateSummary(detail: "Unable to remove authorization", state: .needsAttention)
             throw GitHubConnectionError.credentialStorage
         }
