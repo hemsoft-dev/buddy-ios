@@ -52,7 +52,7 @@ safe-outputs:
     max: 1
     target: triggering
 ---
-# Deployed from: HemSoft/set-it-free-loop/deployment/workflows/sfl-pr-review.md@358e25578515d4b1ed46cacb686624897720cdab
+# Deployed from: HemSoft/set-it-free-loop/deployment/workflows/sfl-pr-review.md@235a0df0c70fded4982e8763223e7c9936242215
 # To upgrade: re-run deploy-workflow.ps1 at the desired SHA
 
 <!-- sfl:
