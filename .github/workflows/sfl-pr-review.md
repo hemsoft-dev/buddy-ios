@@ -9,6 +9,7 @@ on:
   pull_request:
     types: [labeled]
     names: [sfl-review]
+    forks: ["*"]
 
 permissions:
   contents: read
@@ -34,7 +35,6 @@ safe-outputs:
     client-id: ${{ vars.SFL_APP_CLIENT_ID }}
     private-key: ${{ secrets.SFL_APP_PRIVATE_KEY }}
   create-pull-request-review-comment:
-    side: RIGHT
     max: 20
   submit-pull-request-review:
     allowed-events: [APPROVE, REQUEST_CHANGES]
@@ -114,7 +114,9 @@ Do not report style preferences, speculative concerns, or findings without
 specific evidence from the changed code.
 
 For each finding, call `create-pull-request-review-comment` on the most precise
-changed line. The comment body must begin with one of these exact prefixes:
+changed line. Set `side` to `LEFT` for deleted lines and `RIGHT` for added or
+unchanged context lines. The comment body must begin with one of these exact
+prefixes:
 
 - `**CRITICAL Finding**`
 - `**HIGH Finding**`
