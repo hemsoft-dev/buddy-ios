@@ -1,3 +1,4 @@
+import SwiftUI
 import XCTest
 @testable import Buddy
 
@@ -185,6 +186,104 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(integration.summary.connectionState, .disconnected)
     }
 
+    func testDisconnectDuringRevokedTokenCleanupDoesNotPublishStaleFailure() async throws {
+        let api = StubGitHubAPI(userResults: [.failure(.unauthorized)])
+        let credentials = SuspendedRemovalCredentialStore(initialValue: "revoked-token")
+        let integration = GitHubIntegration(clientID: "client-id", api: api, credentials: credentials)
+        let restoration = Task {
+            try await integration.restoreAccount()
+        }
+
+        await credentials.waitUntilRemovalBegins()
+        let disconnection = Task {
+            try await integration.disconnect()
+        }
+        await credentials.finishFirstRemoval()
+
+        let restoredAccount = try await restoration.value
+        try await disconnection.value
+        XCTAssertNil(restoredAccount)
+        XCTAssertEqual(integration.summary.connectionState, .disconnected)
+    }
+
+    func testSupersededConnectionTaskCannotOverwriteNewerConnectedState() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let api = SupersededConnectionAPI(account: account)
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: MockCredentialStore(),
+            sleep: { _ in }
+        )
+        let (viewModel, openURL) = await MainActor.run {
+            (
+                GitHubViewModel(integration: integration),
+                OpenURLAction { _ in .handled }
+            )
+        }
+
+        await MainActor.run { viewModel.connect(openURL: openURL) }
+        await api.waitUntilFirstAuthorizationBegins()
+        await MainActor.run { viewModel.connect(openURL: openURL) }
+        await api.waitUntilUserValidationCompletes()
+
+        await api.finishFirstAuthorization()
+        for _ in 0..<20 {
+            await Task.yield()
+        }
+
+        let state = await MainActor.run { viewModel.state }
+        XCTAssertEqual(state, .connected(account))
+    }
+
+    func testReconnectWaitsForCancellationCleanup() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let api = StubGitHubAPI(
+            deviceResults: [.success(testAuthorization)],
+            pollResults: [.success(.authorized(token: "new-token"))],
+            userResults: [.success(account)]
+        )
+        let credentials = SuspendedRemovalCredentialStore(initialValue: "old-token")
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: credentials,
+            sleep: { _ in }
+        )
+        let (viewModel, openURL) = await MainActor.run {
+            (
+                GitHubViewModel(integration: integration),
+                OpenURLAction { _ in .handled }
+            )
+        }
+
+        await MainActor.run { viewModel.cancel() }
+        await credentials.waitUntilRemovalBegins()
+        let cancelingState = await MainActor.run { viewModel.state }
+        XCTAssertEqual(cancelingState, .loading)
+
+        await MainActor.run { viewModel.connect(openURL: openURL) }
+        for _ in 0..<20 {
+            await Task.yield()
+        }
+        let requestsBeforeCleanup = await api.deviceRequestCount()
+        XCTAssertEqual(requestsBeforeCleanup, 0)
+
+        await credentials.finishFirstRemoval()
+        for _ in 0..<100 {
+            let isConnected = await MainActor.run { viewModel.state == .connected(account) }
+            if isConnected {
+                break
+            }
+            await Task.yield()
+        }
+
+        let finalState = await MainActor.run { viewModel.state }
+        let finalRequestCount = await api.deviceRequestCount()
+        XCTAssertEqual(finalState, .connected(account))
+        XCTAssertEqual(finalRequestCount, 1)
+    }
+
     func testMissingClientIDProducesClearNeedsAttentionState() async throws {
         let integration = GitHubIntegration(clientID: nil, api: StubGitHubAPI(), credentials: MockCredentialStore())
 
@@ -236,6 +335,7 @@ private actor StubGitHubAPI: GitHubAPIProviding {
     private var pollResults: [Result<GitHubTokenPollResult, GitHubAPIError>]
     private var userResults: [Result<GitHubAccount, GitHubAPIError>]
     private var capturedUserTokens: [String] = []
+    private var capturedDeviceRequestCount = 0
 
     init(
         deviceResults: [Result<GitHubDeviceAuthorization, GitHubAPIError>] = [],
@@ -248,7 +348,8 @@ private actor StubGitHubAPI: GitHubAPIProviding {
     }
 
     func requestDeviceAuthorization(clientID: String) throws -> GitHubDeviceAuthorization {
-        try deviceResults.removeFirst().get()
+        capturedDeviceRequestCount += 1
+        return try deviceResults.removeFirst().get()
     }
 
     func pollForAccessToken(clientID: String, deviceCode: String) throws -> GitHubTokenPollResult {
@@ -262,6 +363,10 @@ private actor StubGitHubAPI: GitHubAPIProviding {
 
     func userTokens() -> [String] {
         capturedUserTokens
+    }
+
+    func deviceRequestCount() -> Int {
+        capturedDeviceRequestCount
     }
 }
 
@@ -356,5 +461,110 @@ private actor SuspendedUserGitHubAPI: GitHubAPIProviding {
     func finishUserRequest() {
         userRequestCompletion?.resume()
         userRequestCompletion = nil
+    }
+}
+
+private actor SuspendedRemovalCredentialStore: CredentialStoring {
+    private var value: Data?
+    private var didSuspendRemoval = false
+    private var removalWaiter: CheckedContinuation<Void, Never>?
+    private var removalCompletion: CheckedContinuation<Void, Never>?
+
+    init(initialValue: String) {
+        value = Data(initialValue.utf8)
+    }
+
+    func set(_ data: Data, for account: String) {
+        value = data
+    }
+
+    func data(for account: String) -> Data? {
+        value
+    }
+
+    func removeData(for account: String) async {
+        if !didSuspendRemoval {
+            didSuspendRemoval = true
+            removalWaiter?.resume()
+            removalWaiter = nil
+            await withCheckedContinuation { continuation in
+                removalCompletion = continuation
+            }
+        }
+        value = nil
+    }
+
+    func waitUntilRemovalBegins() async {
+        guard removalCompletion == nil else { return }
+        await withCheckedContinuation { continuation in
+            removalWaiter = continuation
+        }
+    }
+
+    func finishFirstRemoval() {
+        removalCompletion?.resume()
+        removalCompletion = nil
+    }
+}
+
+private actor SupersededConnectionAPI: GitHubAPIProviding {
+    private let account: GitHubAccount
+    private var authorizationRequestCount = 0
+    private var firstAuthorizationWaiter: CheckedContinuation<Void, Never>?
+    private var firstAuthorizationCompletion: CheckedContinuation<Void, Never>?
+    private var userValidationWaiter: CheckedContinuation<Void, Never>?
+    private var didValidateUser = false
+
+    init(account: GitHubAccount) {
+        self.account = account
+    }
+
+    func requestDeviceAuthorization(clientID: String) async -> GitHubDeviceAuthorization {
+        authorizationRequestCount += 1
+        if authorizationRequestCount == 1 {
+            firstAuthorizationWaiter?.resume()
+            firstAuthorizationWaiter = nil
+            await withCheckedContinuation { continuation in
+                firstAuthorizationCompletion = continuation
+            }
+            return GitHubDeviceAuthorization(
+                deviceCode: "old-device-code",
+                userCode: "OLD-CODE",
+                verificationURI: testAuthorization.verificationURI,
+                expiresIn: 900,
+                interval: 5
+            )
+        }
+        return testAuthorization
+    }
+
+    func pollForAccessToken(clientID: String, deviceCode: String) -> GitHubTokenPollResult {
+        .authorized(token: "new-token")
+    }
+
+    func authenticatedUser(token: String) -> GitHubAccount {
+        didValidateUser = true
+        userValidationWaiter?.resume()
+        userValidationWaiter = nil
+        return account
+    }
+
+    func waitUntilFirstAuthorizationBegins() async {
+        guard firstAuthorizationCompletion == nil else { return }
+        await withCheckedContinuation { continuation in
+            firstAuthorizationWaiter = continuation
+        }
+    }
+
+    func finishFirstAuthorization() {
+        firstAuthorizationCompletion?.resume()
+        firstAuthorizationCompletion = nil
+    }
+
+    func waitUntilUserValidationCompletes() async {
+        guard !didValidateUser else { return }
+        await withCheckedContinuation { continuation in
+            userValidationWaiter = continuation
+        }
     }
 }

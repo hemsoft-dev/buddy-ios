@@ -116,46 +116,68 @@ final class GitHubViewModel {
 
     private let integration: GitHubIntegration
     private var connectionTask: Task<Void, Never>?
+    private var cancellationTask: Task<Void, Error>?
     private var retryAction = RetryAction.restore
+    private var operationGeneration = 0
 
     init(integration: GitHubIntegration = IntegrationCatalog.github) {
         self.integration = integration
     }
 
     func restore() async {
+        operationGeneration &+= 1
+        let generation = operationGeneration
         connectionTask?.cancel()
         state = .loading
 
         do {
             if let account = try await integration.restoreAccount() {
+                guard generation == operationGeneration else { return }
                 state = .connected(account)
             } else {
+                guard generation == operationGeneration else { return }
                 state = .disconnected
             }
         } catch is CancellationError {
             return
         } catch {
+            guard generation == operationGeneration else { return }
             retryAction = (error as? GitHubConnectionError) == .invalidToken ? .connect : .restore
             state = .needsAttention(error.localizedDescription)
         }
     }
 
     func connect(openURL: OpenURLAction) {
+        operationGeneration &+= 1
+        let generation = operationGeneration
         connectionTask?.cancel()
         retryAction = .connect
         connectionTask = Task {
             do {
+                if let cancellationTask {
+                    try await cancellationTask.value
+                    try Task.checkCancellation()
+                    guard generation == operationGeneration else { return }
+                    self.cancellationTask = nil
+                }
+
                 let authorization = try await integration.beginAuthorization()
                 try Task.checkCancellation()
+                guard generation == operationGeneration else { return }
                 state = .authorizing(authorization)
                 openURL(authorization.verificationURI)
 
                 let account = try await integration.completeAuthorization(authorization)
                 try Task.checkCancellation()
+                guard generation == operationGeneration else { return }
                 state = .connected(account)
             } catch is CancellationError {
+                guard generation == operationGeneration else { return }
+                cancellationTask = nil
                 state = .disconnected
             } catch {
+                guard generation == operationGeneration else { return }
+                cancellationTask = nil
                 state = .needsAttention(error.localizedDescription)
             }
         }
@@ -171,13 +193,24 @@ final class GitHubViewModel {
     }
 
     func cancel() {
+        operationGeneration &+= 1
+        let generation = operationGeneration
         connectionTask?.cancel()
         connectionTask = nil
-        state = .disconnected
+        state = .loading
+        let cleanupTask = Task {
+            try await integration.cancelAuthorization()
+        }
+        cancellationTask = cleanupTask
         Task {
             do {
-                try await integration.cancelAuthorization()
+                try await cleanupTask.value
+                guard generation == operationGeneration else { return }
+                cancellationTask = nil
+                state = .disconnected
             } catch {
+                guard generation == operationGeneration else { return }
+                cancellationTask = nil
                 retryAction = .restore
                 state = .needsAttention(error.localizedDescription)
             }
@@ -185,13 +218,17 @@ final class GitHubViewModel {
     }
 
     func disconnect() async {
+        operationGeneration &+= 1
+        let generation = operationGeneration
         connectionTask?.cancel()
         connectionTask = nil
 
         do {
             try await integration.disconnect()
+            guard generation == operationGeneration else { return }
             state = .disconnected
         } catch {
+            guard generation == operationGeneration else { return }
             retryAction = .restore
             state = .needsAttention(error.localizedDescription)
         }

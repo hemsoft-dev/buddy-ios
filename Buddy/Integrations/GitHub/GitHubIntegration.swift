@@ -83,6 +83,7 @@ actor GitHubIntegration: IntegrationProviding {
         } catch GitHubAPIError.unauthorized {
             guard generation == authorizationGeneration else { return nil }
             try? await credentials.removeData(for: Self.credentialAccount)
+            guard generation == authorizationGeneration else { return nil }
             updateSummary(detail: "Authorization expired", state: .needsAttention)
             throw GitHubConnectionError.invalidToken
         } catch {
