@@ -199,6 +199,10 @@ final class GitHubViewModel {
             connect(openURL: openURL)
         case .restore:
             Task { await performRestore() }
+        case .cancel:
+            cancel()
+        case .disconnect:
+            Task { await disconnect() }
         }
     }
 
@@ -221,7 +225,7 @@ final class GitHubViewModel {
             } catch {
                 guard generation == operationGeneration else { return }
                 cancellationTask = nil
-                retryAction = .restore
+                retryAction = .cancel
                 state = .needsAttention(error.localizedDescription)
             }
         }
@@ -239,7 +243,7 @@ final class GitHubViewModel {
             state = .disconnected
         } catch {
             guard generation == operationGeneration else { return }
-            retryAction = .restore
+            retryAction = .disconnect
             state = .needsAttention(error.localizedDescription)
         }
     }
@@ -247,6 +251,8 @@ final class GitHubViewModel {
     private enum RetryAction {
         case connect
         case restore
+        case cancel
+        case disconnect
     }
 }
 

@@ -43,6 +43,37 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(capturedTokens, ["stored-token"])
     }
 
+    func testNewerRevokedRestoreSupersedesEarlierSuccessfulRestore() async throws {
+        let account = GitHubAccount(id: 7, login: "franz", name: nil, avatarURL: nil)
+        let api = SequencedSuspendedUserGitHubAPI()
+        let credentials = MockCredentialStore(initialValue: "stored-token")
+        let integration = GitHubIntegration(clientID: "client-id", api: api, credentials: credentials)
+        let earlierRestore = Task {
+            try await integration.restoreAccount()
+        }
+
+        await api.waitForRequest(count: 1)
+        let newerRestore = Task {
+            try await integration.restoreAccount()
+        }
+        await api.waitForRequest(count: 2)
+
+        await api.finishRequest(at: 1, with: .failure(.unauthorized))
+        do {
+            _ = try await newerRestore.value
+            XCTFail("Expected invalid token")
+        } catch let error as GitHubConnectionError {
+            XCTAssertEqual(error, .invalidToken)
+        }
+
+        await api.finishRequest(at: 0, with: .success(account))
+        let earlierAccount = try await earlierRestore.value
+        let credentialValue = await credentials.stringValue()
+        XCTAssertNil(earlierAccount)
+        XCTAssertNil(credentialValue)
+        XCTAssertEqual(integration.summary.connectionState, .needsAttention)
+    }
+
     func testRevokedTokenIsRemovedAndReportsNeedsAttention() async throws {
         let api = StubGitHubAPI(userResults: [.failure(.unauthorized)])
         let credentials = MockCredentialStore(initialValue: "revoked-token")
@@ -135,6 +166,41 @@ final class GitHubIntegrationTests: XCTestCase {
         let credentialValue = await credentials.stringValue()
         XCTAssertNil(credentialValue)
         XCTAssertEqual(integration.summary.connectionState, .disconnected)
+    }
+
+    func testPollingSleepIsCappedAtAuthorizationExpiration() async throws {
+        let authorization = GitHubDeviceAuthorization(
+            deviceCode: "device-code",
+            userCode: "ABCD-EFGH",
+            verificationURI: URL(string: "https://github.com/login/device")!,
+            expiresIn: 1,
+            interval: 30
+        )
+        let api = StubGitHubAPI(deviceResults: [.success(authorization)])
+        let recorder = SleepRecorder()
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: MockCredentialStore(),
+            sleep: { duration in
+                try await recorder.recordAndSleep(duration)
+            }
+        )
+        let startedAuthorization = try await integration.beginAuthorization()
+
+        do {
+            _ = try await integration.completeAuthorization(startedAuthorization)
+            XCTFail("Expected expiration")
+        } catch let error as GitHubConnectionError {
+            XCTAssertEqual(error, .requestExpired)
+        }
+
+        let duration = await recorder.duration()
+        let pollCount = await api.pollRequestCount()
+        XCTAssertNotNil(duration)
+        XCTAssertGreaterThan(duration ?? .zero, .zero)
+        XCTAssertLessThanOrEqual(duration ?? .seconds(2), .seconds(1))
+        XCTAssertEqual(pollCount, 0)
     }
 
     func testCancellationDuringCredentialPersistenceRemovesNewToken() async throws {
@@ -438,6 +504,71 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(finalState, .connected(account))
     }
 
+    func testDisconnectRetryRepeatsCredentialRemoval() async throws {
+        let credentials = FailOnceRemovalCredentialStore(initialValue: "stored-token")
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(),
+            credentials: credentials
+        )
+        let (viewModel, openURL) = await MainActor.run {
+            (
+                GitHubViewModel(integration: integration),
+                OpenURLAction { _ in .handled }
+            )
+        }
+
+        await viewModel.disconnect()
+        let failedState = await MainActor.run { viewModel.state }
+        guard case .needsAttention = failedState else {
+            return XCTFail("Expected credential removal failure")
+        }
+
+        await MainActor.run { viewModel.retry(openURL: openURL) }
+        let retryFinished = try await waitUntil {
+            await MainActor.run { viewModel.state == .disconnected }
+        }
+        XCTAssertTrue(retryFinished)
+        let attempts = await credentials.removalAttemptCount()
+        let storedValue = await credentials.stringValue()
+        XCTAssertEqual(attempts, 2)
+        XCTAssertNil(storedValue)
+    }
+
+    func testCancellationRetryRepeatsCredentialRemoval() async throws {
+        let credentials = FailOnceRemovalCredentialStore(initialValue: "stored-token")
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(),
+            credentials: credentials
+        )
+        let (viewModel, openURL) = await MainActor.run {
+            (
+                GitHubViewModel(integration: integration),
+                OpenURLAction { _ in .handled }
+            )
+        }
+
+        await MainActor.run { viewModel.cancel() }
+        let cleanupFailed = try await waitUntil {
+            await MainActor.run {
+                if case .needsAttention = viewModel.state { return true }
+                return false
+            }
+        }
+        XCTAssertTrue(cleanupFailed)
+
+        await MainActor.run { viewModel.retry(openURL: openURL) }
+        let retryFinished = try await waitUntil {
+            await MainActor.run { viewModel.state == .disconnected }
+        }
+        XCTAssertTrue(retryFinished)
+        let attempts = await credentials.removalAttemptCount()
+        let storedValue = await credentials.stringValue()
+        XCTAssertEqual(attempts, 2)
+        XCTAssertNil(storedValue)
+    }
+
     func testReconnectWaitsForCancellationCleanup() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let api = StubGitHubAPI(
@@ -536,6 +667,56 @@ private actor MockCredentialStore: CredentialStoring {
     }
 }
 
+private actor FailOnceRemovalCredentialStore: CredentialStoring {
+    enum StoreError: Error {
+        case removalFailed
+    }
+
+    private var value: Data?
+    private var removalAttempts = 0
+
+    init(initialValue: String) {
+        value = Data(initialValue.utf8)
+    }
+
+    func set(_ data: Data, for account: String) {
+        value = data
+    }
+
+    func data(for account: String) -> Data? {
+        value
+    }
+
+    func removeData(for account: String) throws {
+        removalAttempts += 1
+        if removalAttempts == 1 {
+            throw StoreError.removalFailed
+        }
+        value = nil
+    }
+
+    func removalAttemptCount() -> Int {
+        removalAttempts
+    }
+
+    func stringValue() -> String? {
+        value.flatMap { String(data: $0, encoding: .utf8) }
+    }
+}
+
+private actor SleepRecorder {
+    private var recordedDuration: Duration?
+
+    func recordAndSleep(_ duration: Duration) async throws {
+        recordedDuration = duration
+        try await Task.sleep(for: duration)
+    }
+
+    func duration() -> Duration? {
+        recordedDuration
+    }
+}
+
 private let testAuthorization = GitHubDeviceAuthorization(
     deviceCode: "device-code",
     userCode: "ABCD-EFGH",
@@ -550,6 +731,7 @@ private actor StubGitHubAPI: GitHubAPIProviding {
     private var userResults: [Result<GitHubAccount, GitHubAPIError>]
     private var capturedUserTokens: [String] = []
     private var capturedDeviceRequestCount = 0
+    private var capturedPollRequestCount = 0
 
     init(
         deviceResults: [Result<GitHubDeviceAuthorization, GitHubAPIError>] = [],
@@ -567,7 +749,8 @@ private actor StubGitHubAPI: GitHubAPIProviding {
     }
 
     func pollForAccessToken(clientID: String, deviceCode: String) throws -> GitHubTokenPollResult {
-        try pollResults.removeFirst().get()
+        capturedPollRequestCount += 1
+        return try pollResults.removeFirst().get()
     }
 
     func authenticatedUser(token: String) throws -> GitHubAccount {
@@ -581,6 +764,10 @@ private actor StubGitHubAPI: GitHubAPIProviding {
 
     func deviceRequestCount() -> Int {
         capturedDeviceRequestCount
+    }
+
+    func pollRequestCount() -> Int {
+        capturedPollRequestCount
     }
 }
 
@@ -743,6 +930,44 @@ private actor SuspendedUserGitHubAPI: GitHubAPIProviding {
     func finishUserRequest() {
         userRequestCompletion?.resume()
         userRequestCompletion = nil
+    }
+}
+
+private actor SequencedSuspendedUserGitHubAPI: GitHubAPIProviding {
+    private var requestCompletions: [CheckedContinuation<Result<GitHubAccount, GitHubAPIError>, Never>?] = []
+    private var requestWaiters: [Int: CheckedContinuation<Void, Never>] = [:]
+
+    func requestDeviceAuthorization(clientID: String) throws -> GitHubDeviceAuthorization {
+        throw GitHubAPIError.malformedResponse
+    }
+
+    func pollForAccessToken(clientID: String, deviceCode: String) throws -> GitHubTokenPollResult {
+        throw GitHubAPIError.malformedResponse
+    }
+
+    func authenticatedUser(token: String) async throws -> GitHubAccount {
+        let requestIndex = requestCompletions.count
+        requestCompletions.append(nil)
+        requestWaiters.removeValue(forKey: requestIndex + 1)?.resume()
+        let result = await withCheckedContinuation { continuation in
+            requestCompletions[requestIndex] = continuation
+        }
+        return try result.get()
+    }
+
+    func waitForRequest(count: Int) async {
+        guard requestCompletions.count < count else { return }
+        await withCheckedContinuation { continuation in
+            requestWaiters[count] = continuation
+        }
+    }
+
+    func finishRequest(
+        at index: Int,
+        with result: Result<GitHubAccount, GitHubAPIError>
+    ) {
+        requestCompletions[index]?.resume(returning: result)
+        requestCompletions[index] = nil
     }
 }
 

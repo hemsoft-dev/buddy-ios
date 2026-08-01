@@ -20,6 +20,7 @@ actor GitHubIntegration: IntegrationProviding {
     private let sleep: @Sendable (Duration) async throws -> Void
     private let summaryStorage: LockedGitHubSummary
     private var authorizationGeneration = 0
+    private var restorationGeneration = 0
     private var activeDeviceCode: String?
 
     init(
@@ -52,17 +53,25 @@ actor GitHubIntegration: IntegrationProviding {
     }
 
     func restoreAccount() async throws -> GitHubAccount? {
-        let generation = authorizationGeneration
+        restorationGeneration &+= 1
+        let authorizationGeneration = self.authorizationGeneration
+        let restorationGeneration = self.restorationGeneration
         let storedTokenData: Data?
         do {
             storedTokenData = try await credentials.data(for: Self.credentialAccount)
         } catch {
-            guard generation == authorizationGeneration else { return nil }
+            guard isCurrentRestore(
+                authorizationGeneration: authorizationGeneration,
+                restorationGeneration: restorationGeneration
+            ) else { return nil }
             updateSummary(detail: "Unable to read authorization", state: .needsAttention)
             throw GitHubConnectionError.credentialStorage
         }
 
-        guard generation == authorizationGeneration else { return nil }
+        guard isCurrentRestore(
+            authorizationGeneration: authorizationGeneration,
+            restorationGeneration: restorationGeneration
+        ) else { return nil }
 
         guard let tokenData = storedTokenData else {
             updateSummary(detail: "Ready to connect", state: .disconnected)
@@ -70,26 +79,41 @@ actor GitHubIntegration: IntegrationProviding {
         }
 
         guard let token = String(data: tokenData, encoding: .utf8), !token.isEmpty else {
-            guard try await removeInvalidCredential(generation: generation) else { return nil }
+            guard try await removeInvalidCredential(
+                authorizationGeneration: authorizationGeneration,
+                restorationGeneration: restorationGeneration
+            ) else { return nil }
             updateSummary(detail: "Stored authorization is invalid", state: .needsAttention)
             throw GitHubConnectionError.invalidToken
         }
 
         do {
             let account = try await api.authenticatedUser(token: token)
-            guard generation == authorizationGeneration else { return nil }
+            guard isCurrentRestore(
+                authorizationGeneration: authorizationGeneration,
+                restorationGeneration: restorationGeneration
+            ) else { return nil }
             updateSummary(detail: "@\(account.login)", state: .connected)
             return account
         } catch GitHubAPIError.unauthorized {
-            guard generation == authorizationGeneration else { return nil }
-            guard try await removeInvalidCredential(generation: generation) else { return nil }
+            guard isCurrentRestore(
+                authorizationGeneration: authorizationGeneration,
+                restorationGeneration: restorationGeneration
+            ) else { return nil }
+            guard try await removeInvalidCredential(
+                authorizationGeneration: authorizationGeneration,
+                restorationGeneration: restorationGeneration
+            ) else { return nil }
             updateSummary(detail: "Authorization expired", state: .needsAttention)
             throw GitHubConnectionError.invalidToken
         } catch {
             if Task.isCancelled {
                 throw CancellationError()
             }
-            guard generation == authorizationGeneration else { return nil }
+            guard isCurrentRestore(
+                authorizationGeneration: authorizationGeneration,
+                restorationGeneration: restorationGeneration
+            ) else { return nil }
             updateSummary(detail: "Unable to validate account", state: .needsAttention)
             throw map(error)
         }
@@ -144,7 +168,8 @@ actor GitHubIntegration: IntegrationProviding {
         do {
             while clock.now < deadline {
                 try Task.checkCancellation()
-                try await sleep(.seconds(interval))
+                let remainingLifetime = clock.now.duration(to: deadline)
+                try await sleep(min(.seconds(interval), remainingLifetime))
 
                 guard generation == authorizationGeneration,
                       activeDeviceCode == authorization.deviceCode
@@ -279,15 +304,32 @@ actor GitHubIntegration: IntegrationProviding {
         summaryStorage.update(detail: detail, state: state)
     }
 
-    private func removeInvalidCredential(generation: Int) async throws -> Bool {
+    private func removeInvalidCredential(
+        authorizationGeneration: Int,
+        restorationGeneration: Int
+    ) async throws -> Bool {
         do {
             try await credentials.removeData(for: Self.credentialAccount)
         } catch {
-            guard generation == authorizationGeneration else { return false }
+            guard isCurrentRestore(
+                authorizationGeneration: authorizationGeneration,
+                restorationGeneration: restorationGeneration
+            ) else { return false }
             updateSummary(detail: "Unable to remove authorization", state: .needsAttention)
             throw GitHubConnectionError.credentialStorage
         }
-        return generation == authorizationGeneration
+        return isCurrentRestore(
+            authorizationGeneration: authorizationGeneration,
+            restorationGeneration: restorationGeneration
+        )
+    }
+
+    private func isCurrentRestore(
+        authorizationGeneration: Int,
+        restorationGeneration: Int
+    ) -> Bool {
+        authorizationGeneration == self.authorizationGeneration &&
+            restorationGeneration == self.restorationGeneration
     }
 
     private func map(_ error: Error) -> GitHubConnectionError {
