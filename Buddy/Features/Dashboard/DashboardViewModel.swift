@@ -82,6 +82,7 @@ final class DashboardViewModel {
     private let integrations: [any IntegrationProviding]
     private let github: any GitHubPullRequestProviding
     private let now: @MainActor @Sendable () -> Date
+    private var githubAccountID: Int?
 
     init(
         integrations: [any IntegrationProviding],
@@ -96,8 +97,13 @@ final class DashboardViewModel {
 
     @discardableResult
     func refresh(account: GitHubAccount) async -> GitHubPullRequestFailure? {
+        if githubAccountID != account.id {
+            githubAccountID = account.id
+            githubState = .loading
+        }
         guard !githubState.isRefreshing else { return nil }
 
+        let requestedAccountID = account.id
         let previousPullRequests = githubState.pullRequests
         let previousRefreshDate = githubState.refreshedAt
         githubState = previousRefreshDate == nil && previousPullRequests.isEmpty
@@ -107,9 +113,11 @@ final class DashboardViewModel {
         do {
             let pullRequests = try await github.authoredPullRequests(for: account)
                 .sorted { $0.updatedAt > $1.updatedAt }
+            guard githubAccountID == requestedAccountID else { return nil }
             githubState = .loaded(pullRequests, refreshedAt: now())
             return nil
         } catch is CancellationError {
+            guard githubAccountID == requestedAccountID else { return nil }
             if let previousRefreshDate {
                 githubState = .loaded(previousPullRequests, refreshedAt: previousRefreshDate)
             } else {
@@ -117,6 +125,7 @@ final class DashboardViewModel {
             }
             return nil
         } catch {
+            guard githubAccountID == requestedAccountID else { return nil }
             let failure = Self.mapGitHubFailure(error)
             githubState = .failed(
                 previousPullRequests,

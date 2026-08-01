@@ -186,7 +186,7 @@ struct DashboardView: View {
                 Label("No open pull requests", systemImage: "checkmark.circle.fill")
                     .font(.headline)
                     .foregroundStyle(.green)
-                Text("@\(connectedAccountLogin) has no authored pull requests open right now.")
+                Text("@\(connectedAccountLogin) has no public authored pull requests open right now. Buddy's current GitHub authorization is limited to public repositories.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
@@ -243,10 +243,10 @@ struct DashboardView: View {
 
     private var githubHeaderSummary: String {
         let count = viewModel.githubState.pullRequests.count
-        let result = "\(count) open pull request\(count == 1 ? "" : "s")"
+        let result = "\(count) public open pull request\(count == 1 ? "" : "s")"
         switch viewModel.githubState {
         case .loading:
-            return "Loading pull requests"
+            return "Loading public pull requests"
         case .loaded:
             return result
         case .refreshing:

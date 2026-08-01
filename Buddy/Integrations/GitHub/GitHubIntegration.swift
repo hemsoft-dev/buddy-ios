@@ -138,7 +138,12 @@ actor GitHubIntegration: IntegrationProviding {
         }
 
         do {
-            return try await api.authoredPullRequests(login: account.login, token: token)
+            let pullRequests = try await api.authoredPullRequests(login: account.login, token: token)
+            try Task.checkCancellation()
+            guard generation == authorizationGeneration else {
+                throw CancellationError()
+            }
+            return pullRequests
         } catch GitHubAPIError.unauthorized {
             guard generation == authorizationGeneration else {
                 throw CancellationError()

@@ -151,6 +151,27 @@ final class DashboardViewModelTests: XCTestCase {
             .failed([], refreshedAt: nil, .authenticationRequired)
         )
     }
+
+    func testGitHubDashboardDoesNotReuseResultsAcrossAccounts() async {
+        let refreshDate = Date(timeIntervalSince1970: 4_000)
+        let firstAccountPullRequest = makePullRequest(id: 1, updatedAt: refreshDate)
+        let provider = StubPullRequestProvider(results: [
+            .success([firstAccountPullRequest]),
+            .failure(.networkUnavailable),
+        ])
+        let viewModel = DashboardViewModel(
+            integrations: [],
+            github: provider,
+            now: { refreshDate }
+        )
+        await viewModel.refresh(account: testAccount)
+        let secondAccount = GitHubAccount(id: 84, login: "hubot", name: nil, avatarURL: nil)
+
+        let failure = await viewModel.refresh(account: secondAccount)
+
+        XCTAssertEqual(failure, .offline)
+        XCTAssertEqual(viewModel.githubState, .failed([], refreshedAt: nil, .offline))
+    }
 }
 
 private let testAccount = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
