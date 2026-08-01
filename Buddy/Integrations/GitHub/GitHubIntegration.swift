@@ -71,6 +71,7 @@ actor GitHubIntegration: IntegrationProviding {
 
         guard let token = String(data: tokenData, encoding: .utf8), !token.isEmpty else {
             try? await credentials.removeData(for: Self.credentialAccount)
+            guard generation == authorizationGeneration else { return nil }
             updateSummary(detail: "Stored authorization is invalid", state: .needsAttention)
             throw GitHubConnectionError.invalidToken
         }
@@ -196,6 +197,11 @@ actor GitHubIntegration: IntegrationProviding {
                 }
             }
 
+            guard generation == authorizationGeneration,
+                  activeDeviceCode == authorization.deviceCode
+            else {
+                throw CancellationError()
+            }
             updateSummary(detail: "Authorization request expired", state: .needsAttention)
             throw GitHubConnectionError.requestExpired
         } catch is CancellationError {
