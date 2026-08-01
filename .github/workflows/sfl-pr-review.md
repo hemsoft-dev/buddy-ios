@@ -6,31 +6,25 @@ description: |
   consolidated review, and publishes the SFL Reviewer Approval check.
 
 on:
-  pull_request_target:
-    types: [labeled, synchronize]
-  roles: all
-
-checkout: false
-
-if: >
-  (github.event.action == 'labeled' && github.event.label.name == 'sfl-review') ||
-  (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'sfl-review'))
+  pull_request:
+    types: [labeled]
+    names: [sfl-review]
 
 permissions:
   contents: read
   pull-requests: read
-  copilot-requests: write
 
 engine:
-  id: copilot
+  id: codex
+  env:
+    OPENAI_BASE_URL: https://openrouter.ai/api/v1
+    OPENAI_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
-model: gpt-5.5?effort=high
+model: moonshotai/kimi-k3?effort=high
 
-network: defaults
-
-concurrency:
-  group: "gh-aw-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref || github.run_id }}-${{ github.event.action == 'synchronize' && 'sfl-review' || github.event.label.name || 'none' }}"
-  cancel-in-progress: true
+network:
+  allowed:
+    - openrouter.ai
 
 tools:
   github:
@@ -44,6 +38,7 @@ safe-outputs:
     client-id: ${{ vars.SFL_APP_CLIENT_ID }}
     private-key: ${{ secrets.SFL_APP_PRIVATE_KEY }}
   create-pull-request-review-comment:
+    side: RIGHT
     max: 20
   submit-pull-request-review:
     allowed-events: [APPROVE, REQUEST_CHANGES]
@@ -57,7 +52,7 @@ safe-outputs:
     max: 1
     target: triggering
 ---
-# Deployed from: HemSoft/set-it-free-loop/deployment/workflows/sfl-pr-review.md@380fe0edc7a87cfc7b31233a955b37df0223a3a8
+# Deployed from: HemSoft/set-it-free-loop/deployment/workflows/sfl-pr-review.md@358e25578515d4b1ed46cacb686624897720cdab
 # To upgrade: re-run deploy-workflow.ps1 at the desired SHA
 
 <!-- sfl:
@@ -123,9 +118,7 @@ Do not report style preferences, speculative concerns, or findings without
 specific evidence from the changed code.
 
 For each finding, call `create-pull-request-review-comment` on the most precise
-changed line. Set `side` to `LEFT` for deleted lines and `RIGHT` for added or
-unchanged context lines. The comment body must begin with one of these exact
-prefixes:
+changed line. The comment body must begin with one of these exact prefixes:
 
 - `**CRITICAL Finding**`
 - `**HIGH Finding**`
