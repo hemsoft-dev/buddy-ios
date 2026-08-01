@@ -403,6 +403,41 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(state, .disconnected)
     }
 
+    func testAutomaticRestoreDoesNotCancelAuthorizationPolling() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let api = SuspendedPollingGitHubAPI(account: account)
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: MockCredentialStore(),
+            sleep: { _ in }
+        )
+        let (viewModel, openURL) = await MainActor.run {
+            (
+                GitHubViewModel(integration: integration),
+                OpenURLAction { _ in .handled }
+            )
+        }
+
+        await MainActor.run { viewModel.connect(openURL: openURL) }
+        let pollingStarted = try await waitUntil {
+            await api.pollDidStart()
+        }
+        XCTAssertTrue(pollingStarted)
+
+        await viewModel.restore()
+        let stateAfterReappearance = await MainActor.run { viewModel.state }
+        XCTAssertEqual(stateAfterReappearance, .authorizing(testAuthorization))
+
+        await api.finishPoll()
+        let connectionFinished = try await waitUntil {
+            await MainActor.run { viewModel.state == .connected(account) }
+        }
+        XCTAssertTrue(connectionFinished)
+        let finalState = await MainActor.run { viewModel.state }
+        XCTAssertEqual(finalState, .connected(account))
+    }
+
     func testReconnectWaitsForCancellationCleanup() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let api = StubGitHubAPI(
@@ -803,5 +838,40 @@ private actor SuspendedAuthorizationAPI: GitHubAPIProviding {
     func finishAuthorization() {
         authorizationCompletion?.resume()
         authorizationCompletion = nil
+    }
+}
+
+private actor SuspendedPollingGitHubAPI: GitHubAPIProviding {
+    private let account: GitHubAccount
+    private var didStartPoll = false
+    private var pollCompletion: CheckedContinuation<Void, Never>?
+
+    init(account: GitHubAccount) {
+        self.account = account
+    }
+
+    func requestDeviceAuthorization(clientID: String) -> GitHubDeviceAuthorization {
+        testAuthorization
+    }
+
+    func pollForAccessToken(clientID: String, deviceCode: String) async -> GitHubTokenPollResult {
+        didStartPoll = true
+        await withCheckedContinuation { continuation in
+            pollCompletion = continuation
+        }
+        return .authorized(token: "new-token")
+    }
+
+    func authenticatedUser(token: String) -> GitHubAccount {
+        account
+    }
+
+    func pollDidStart() -> Bool {
+        didStartPoll
+    }
+
+    func finishPoll() {
+        pollCompletion?.resume()
+        pollCompletion = nil
     }
 }

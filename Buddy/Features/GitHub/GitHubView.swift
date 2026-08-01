@@ -125,6 +125,16 @@ final class GitHubViewModel {
     }
 
     func restore() async {
+        guard state == .loading,
+              connectionTask == nil,
+              cancellationTask == nil
+        else {
+            return
+        }
+        await performRestore()
+    }
+
+    private func performRestore() async {
         operationGeneration &+= 1
         let generation = operationGeneration
         connectionTask?.cancel()
@@ -188,7 +198,7 @@ final class GitHubViewModel {
         case .connect:
             connect(openURL: openURL)
         case .restore:
-            Task { await restore() }
+            Task { await performRestore() }
         }
     }
 
