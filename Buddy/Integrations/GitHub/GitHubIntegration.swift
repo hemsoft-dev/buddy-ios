@@ -13,6 +13,7 @@ actor GitHubIntegration: IntegrationProviding {
     private static let credentialAccount = "github.oauth-token"
 
     nonisolated var summary: IntegrationSummary { summaryStorage.value }
+    nonisolated let isAuthorizationConfigured: Bool
 
     private let clientID: String?
     private let api: any GitHubAPIProviding
@@ -39,6 +40,7 @@ actor GitHubIntegration: IntegrationProviding {
         }
     ) {
         self.clientID = clientID
+        isAuthorizationConfigured = clientID != nil
         self.api = api ?? GitHubAPI()
         self.credentials = credentials
         self.sleep = sleep
@@ -419,7 +421,7 @@ enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
     var errorDescription: String? {
         switch self {
         case .missingClientID:
-            "GitHub connection is not configured. Add BUDDY_GITHUB_CLIENT_ID to Config/Local.xcconfig."
+            "Buddy was built without a GitHub client ID. Set BUDDY_GITHUB_CLIENT_ID in the build configuration and rebuild the app."
         case .invalidConfiguration:
             "GitHub rejected this app's client ID. Check the local configuration and try again."
         case .deviceFlowDisabled:

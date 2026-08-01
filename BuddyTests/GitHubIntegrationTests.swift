@@ -678,6 +678,64 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(finalRequestCount, 1)
     }
 
+    func testConfiguredClientIDRestoresConnectActionAndOpensVerificationURL() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let api = SuspendedPollingGitHubAPI(account: account)
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: MockCredentialStore(),
+            sleep: { _ in }
+        )
+        let openedURLs = URLRecorder()
+        let (viewModel, openURL) = await MainActor.run {
+            (
+                GitHubViewModel(integration: integration),
+                OpenURLAction { url in
+                    openedURLs.record(url)
+                    return .handled
+                }
+            )
+        }
+
+        await viewModel.restore()
+        let restoredState = await MainActor.run { viewModel.state }
+        XCTAssertEqual(restoredState, .disconnected)
+
+        await MainActor.run { viewModel.connect(openURL: openURL) }
+        let pollingStarted = try await waitUntil {
+            await api.pollDidStart()
+        }
+        XCTAssertTrue(pollingStarted)
+
+        let authorizingState = await MainActor.run { viewModel.state }
+        XCTAssertEqual(authorizingState, .authorizing(testAuthorization))
+        XCTAssertEqual(openedURLs.values, [testAuthorization.verificationURI])
+
+        await api.finishPoll()
+        let connectionFinished = try await waitUntil {
+            await MainActor.run { viewModel.state == .connected(account) }
+        }
+        XCTAssertTrue(connectionFinished)
+    }
+
+    func testMissingClientIDRestoresConfigurationRequiredWithoutConnectAction() async {
+        let integration = GitHubIntegration(
+            clientID: nil,
+            api: StubGitHubAPI(),
+            credentials: MockCredentialStore()
+        )
+        let viewModel = await MainActor.run { GitHubViewModel(integration: integration) }
+
+        await viewModel.restore()
+
+        let state = await MainActor.run { viewModel.state }
+        XCTAssertEqual(
+            state,
+            .configurationRequired(GitHubConnectionError.missingClientID.localizedDescription)
+        )
+    }
+
     func testMissingClientIDProducesClearNeedsAttentionState() async throws {
         let integration = GitHubIntegration(clientID: nil, api: StubGitHubAPI(), credentials: MockCredentialStore())
 
@@ -704,6 +762,23 @@ final class GitHubIntegrationTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(10))
         }
         return await condition()
+    }
+}
+
+private final class URLRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedURLs: [URL] = []
+
+    func record(_ url: URL) {
+        lock.lock()
+        defer { lock.unlock() }
+        recordedURLs.append(url)
+    }
+
+    var values: [URL] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedURLs
     }
 }
 
