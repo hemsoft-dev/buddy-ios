@@ -23,6 +23,10 @@ model: gpt-5.5?effort=high
 
 network: defaults
 
+concurrency:
+  group: "gh-aw-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref || github.run_id }}-${{ github.event.label.name || 'none' }}"
+  cancel-in-progress: true
+
 tools:
   github:
     toolsets: [pull_requests, repos]
