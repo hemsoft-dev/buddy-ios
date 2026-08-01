@@ -7,10 +7,14 @@ description: |
 
 on:
   pull_request_target:
-    types: [labeled]
+    types: [labeled, synchronize]
   labels: [sfl-review]
 
 checkout: false
+
+if: >
+  (github.event.action == 'labeled' && github.event.label.name == 'sfl-review') ||
+  (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'sfl-review'))
 
 permissions:
   contents: read
@@ -25,7 +29,7 @@ model: gpt-5.5?effort=high
 network: defaults
 
 concurrency:
-  group: "gh-aw-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref || github.run_id }}-${{ github.event.label.name || 'none' }}"
+  group: "gh-aw-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref || github.run_id }}-${{ github.event.action == 'synchronize' && 'sfl-review' || github.event.label.name || 'none' }}"
   cancel-in-progress: true
 
 tools:
