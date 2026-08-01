@@ -1,6 +1,10 @@
 // Safe, source-controlled defaults. OAuth client IDs are public identifiers;
-// Local.xcconfig remains available for local overrides and is intentionally ignored.
+// Local.xcconfig remains available for private local values and is intentionally ignored.
 BUDDY_BUNDLE_IDENTIFIER = com.hemsoft.buddy
-BUDDY_GITHUB_CLIENT_ID = Ov23liGQvMatgfeDZqeH
 
 #include? "Local.xcconfig"
+
+// Keep this assignment after Local.xcconfig so a legacy blank local value cannot
+// remove the client ID from distributable builds. Command-line build settings can
+// still override xcconfig values when testing another OAuth application.
+BUDDY_GITHUB_CLIENT_ID = Ov23liGQvMatgfeDZqeH
