@@ -8,7 +8,7 @@ description: |
 on:
   pull_request_target:
     types: [labeled, synchronize]
-  labels: [sfl-review]
+  roles: all
 
 checkout: false
 
