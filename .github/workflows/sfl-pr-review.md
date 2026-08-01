@@ -6,10 +6,11 @@ description: |
   consolidated review, and publishes the SFL Reviewer Approval check.
 
 on:
-  pull_request:
+  pull_request_target:
     types: [labeled]
-    names: [sfl-review]
-    forks: ["*"]
+  labels: [sfl-review]
+
+checkout: false
 
 permissions:
   contents: read
