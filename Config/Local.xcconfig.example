@@ -1,2 +1,3 @@
-// Copy this file to Local.xcconfig and keep local values out of source control.
-BUDDY_GITHUB_CLIENT_ID =
+// Copy this file to Local.xcconfig for private local build values.
+// Keep client secrets, access tokens, and other private values out of source control.
+// The shipped GitHub client ID is intentionally set in Shared.xcconfig after this file.

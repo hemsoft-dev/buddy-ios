@@ -42,9 +42,11 @@ belong in Keychain, never SwiftData or source-controlled configuration.
 
 ## Configuration and OAuth
 
-`Config/Shared.xcconfig` contains safe defaults and optionally includes the
-gitignored `Config/Local.xcconfig`. OAuth integrations should use the system
-browser and PKCE whenever the provider supports it. Buddy's callback route is:
+`Config/Shared.xcconfig` contains safe defaults, including public OAuth client
+identifiers, and optionally includes the gitignored `Config/Local.xcconfig` for
+private local values. Client secrets and access tokens must never be placed in
+either configuration file. OAuth integrations should use the system browser and
+PKCE whenever the provider supports it. Buddy's callback route is:
 
 ```text
 buddy://oauth/<provider>
@@ -60,12 +62,22 @@ and therefore cannot keep a client secret. The app requests no OAuth scopes for
 the initial connection; this grants only the minimum access needed to validate
 the signed-in user's public identity. Tokens are stored only in iOS Keychain.
 
-To configure GitHub connection:
+Buddy's source-controlled build configuration includes the public client ID for
+the HemSoft OAuth app, whose **Device Flow** setting is enabled. OAuth client IDs
+identify an app but do not authenticate it, so distributable builds can safely
+include this value without embedding a client secret.
+
+To test with a different GitHub OAuth app:
 
 1. Register a GitHub OAuth app and enable **Device Flow** in its settings.
-2. Copy `Config/Local.xcconfig.example` to `Config/Local.xcconfig`.
-3. Set `BUDDY_GITHUB_CLIENT_ID` to the OAuth app's client ID. Do not add a
-   client secret.
+2. Pass its public client ID as a command-line build setting, for example
+   `xcodebuild ... BUDDY_GITHUB_CLIENT_ID=your-public-client-id`.
+3. Do not add a client secret.
+
+The shared client-ID assignment intentionally follows the optional local include
+so an older `Local.xcconfig` containing a blank value cannot disable connection
+in a current build. Command-line build settings retain higher precedence when a
+developer deliberately tests another OAuth app.
 
 The device flow opens GitHub in the system browser, observes GitHub's polling
 interval and expiration, and handles `slow_down` responses. The existing

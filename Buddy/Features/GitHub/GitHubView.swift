@@ -13,6 +13,8 @@ struct GitHubView: View {
                     ProgressView("Checking GitHub connection…")
                 case .disconnected:
                     disconnectedContent
+                case let .configurationRequired(message):
+                    configurationRequiredContent(message)
                 case let .authorizing(authorization):
                     authorizingContent(authorization)
                 case let .connected(account):
@@ -25,6 +27,14 @@ struct GitHubView: View {
         }
         .task {
             await viewModel.restore()
+        }
+    }
+
+    private func configurationRequiredContent(_ message: String) -> some View {
+        ContentUnavailableView {
+            Label("GitHub Isn't Configured", systemImage: "wrench.and.screwdriver.fill")
+        } description: {
+            Text(message)
         }
     }
 
@@ -145,7 +155,7 @@ final class GitHubViewModel {
                 state = .connected(account)
             } else {
                 guard generation == operationGeneration else { return }
-                state = .disconnected
+                state = disconnectedState
             }
         } catch is CancellationError {
             return
@@ -188,11 +198,15 @@ final class GitHubViewModel {
             } catch is CancellationError {
                 guard generation == operationGeneration else { return }
                 cancellationTask = nil
-                state = .disconnected
+                state = disconnectedState
             } catch {
                 guard generation == operationGeneration else { return }
                 cancellationTask = nil
-                state = .needsAttention(error.localizedDescription)
+                if (error as? GitHubConnectionError) == .missingClientID {
+                    state = disconnectedState
+                } else {
+                    state = .needsAttention(error.localizedDescription)
+                }
             }
         }
     }
@@ -225,7 +239,7 @@ final class GitHubViewModel {
                 try await cleanupTask.value
                 guard generation == operationGeneration else { return }
                 cancellationTask = nil
-                state = .disconnected
+                state = disconnectedState
             } catch {
                 guard generation == operationGeneration else { return }
                 cancellationTask = nil
@@ -244,7 +258,7 @@ final class GitHubViewModel {
         do {
             try await integration.disconnect()
             guard generation == operationGeneration else { return }
-            state = .disconnected
+            state = disconnectedState
         } catch {
             guard generation == operationGeneration else { return }
             retryAction = .disconnect
@@ -258,11 +272,19 @@ final class GitHubViewModel {
         case cancel
         case disconnect
     }
+
+    private var disconnectedState: GitHubViewState {
+        if integration.isAuthorizationConfigured {
+            return .disconnected
+        }
+        return .configurationRequired(GitHubConnectionError.missingClientID.localizedDescription)
+    }
 }
 
 enum GitHubViewState: Equatable {
     case loading
     case disconnected
+    case configurationRequired(String)
     case authorizing(GitHubDeviceAuthorization)
     case connected(GitHubAccount)
     case needsAttention(String)
