@@ -24,7 +24,7 @@ permissions:
 engine:
   id: copilot
 
-model: gpt-5.5?effort=high
+model: gpt-5.4?effort=high
 
 network: defaults
 
