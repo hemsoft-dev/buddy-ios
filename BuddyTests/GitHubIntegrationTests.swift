@@ -104,6 +104,46 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(integration.summary.connectionState, .disconnected)
     }
 
+    func testCancellationDuringCredentialPersistenceRemovesNewToken() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let api = StubGitHubAPI(
+            pollResults: [.success(.authorized(token: "new-token"))],
+            userResults: [.success(account)]
+        )
+        let credentials = SuspendedCredentialStore()
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: credentials,
+            sleep: { _ in }
+        )
+        let authorization = GitHubDeviceAuthorization(
+            deviceCode: "device-code",
+            userCode: "ABCD-EFGH",
+            verificationURI: URL(string: "https://github.com/login/device")!,
+            expiresIn: 900,
+            interval: 5
+        )
+        let completion = Task {
+            try await integration.completeAuthorization(authorization)
+        }
+
+        await credentials.waitUntilSetBegins()
+        completion.cancel()
+        await credentials.finishSet()
+
+        do {
+            _ = try await completion.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {
+            // Expected.
+        }
+
+        let credentialValue = await credentials.stringValue()
+        XCTAssertNil(credentialValue)
+        XCTAssertEqual(integration.summary.connectionState, .disconnected)
+    }
+
     func testMissingClientIDProducesClearNeedsAttentionState() async throws {
         let integration = GitHubIntegration(clientID: nil, api: StubGitHubAPI(), credentials: MockCredentialStore())
 
@@ -173,5 +213,46 @@ private actor StubGitHubAPI: GitHubAPIProviding {
 
     func userTokens() -> [String] {
         capturedUserTokens
+    }
+}
+
+private actor SuspendedCredentialStore: CredentialStoring {
+    private var value: Data?
+    private var setStartedWaiter: CheckedContinuation<Void, Never>?
+    private var setCompletion: CheckedContinuation<Void, Never>?
+
+    func set(_ data: Data, for account: String) async {
+        value = data
+        setStartedWaiter?.resume()
+        setStartedWaiter = nil
+
+        await withCheckedContinuation { continuation in
+            setCompletion = continuation
+        }
+    }
+
+    func data(for account: String) -> Data? {
+        value
+    }
+
+    func removeData(for account: String) {
+        value = nil
+    }
+
+    func waitUntilSetBegins() async {
+        guard setCompletion == nil else { return }
+
+        await withCheckedContinuation { continuation in
+            setStartedWaiter = continuation
+        }
+    }
+
+    func finishSet() {
+        setCompletion?.resume()
+        setCompletion = nil
+    }
+
+    func stringValue() -> String? {
+        value.flatMap { String(data: $0, encoding: .utf8) }
     }
 }

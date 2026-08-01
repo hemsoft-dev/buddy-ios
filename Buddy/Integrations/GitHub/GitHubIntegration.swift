@@ -140,6 +140,12 @@ actor GitHubIntegration: IntegrationProviding {
                     } catch {
                         throw GitHubConnectionError.credentialStorage
                     }
+
+                    if Task.isCancelled {
+                        try? await credentials.removeData(for: Self.credentialAccount)
+                        throw CancellationError()
+                    }
+
                     updateSummary(detail: "@\(account.login)", state: .connected)
                     return account
                 }
@@ -161,7 +167,8 @@ actor GitHubIntegration: IntegrationProviding {
         }
     }
 
-    func cancelAuthorization() {
+    func cancelAuthorization() async {
+        try? await credentials.removeData(for: Self.credentialAccount)
         updateSummary(detail: "Ready to connect", state: .disconnected)
     }
 

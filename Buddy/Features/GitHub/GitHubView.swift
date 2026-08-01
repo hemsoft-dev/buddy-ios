@@ -151,6 +151,7 @@ final class GitHubViewModel {
                 openURL(authorization.verificationURI)
 
                 let account = try await integration.completeAuthorization(authorization)
+                try Task.checkCancellation()
                 state = .connected(account)
             } catch is CancellationError {
                 state = .disconnected
