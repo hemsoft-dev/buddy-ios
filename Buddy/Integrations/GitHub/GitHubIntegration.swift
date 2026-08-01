@@ -247,9 +247,11 @@ actor GitHubIntegration: IntegrationProviding {
         do {
             try await credentials.removeData(for: Self.credentialAccount)
             guard generation == authorizationGeneration else { return }
+            authorizationGeneration &+= 1
             updateSummary(detail: "Ready to connect", state: .disconnected)
         } catch {
             guard generation == authorizationGeneration else { return }
+            authorizationGeneration &+= 1
             updateSummary(detail: "Unable to remove authorization", state: .needsAttention)
             throw GitHubConnectionError.credentialStorage
         }
@@ -263,9 +265,11 @@ actor GitHubIntegration: IntegrationProviding {
         do {
             try await credentials.removeData(for: Self.credentialAccount)
             guard generation == authorizationGeneration else { return }
+            authorizationGeneration &+= 1
             updateSummary(detail: "Ready to connect", state: .disconnected)
         } catch {
             guard generation == authorizationGeneration else { return }
+            authorizationGeneration &+= 1
             updateSummary(detail: "Unable to remove authorization", state: .needsAttention)
             throw GitHubConnectionError.credentialStorage
         }
