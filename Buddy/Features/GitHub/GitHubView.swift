@@ -3,31 +3,26 @@ import SwiftUI
 
 struct GitHubView: View {
     @Environment(\.openURL) private var openURL
-    @State private var viewModel = GitHubViewModel()
+    let viewModel: GitHubViewModel
 
     var body: some View {
-        NavigationStack {
-            Group {
-                switch viewModel.state {
-                case .loading:
-                    ProgressView("Checking GitHub connection…")
-                case .disconnected:
-                    disconnectedContent
-                case let .configurationRequired(message):
-                    configurationRequiredContent(message)
-                case let .authorizing(authorization):
-                    authorizingContent(authorization)
-                case let .connected(account):
-                    connectedContent(account)
-                case let .needsAttention(message):
-                    needsAttentionContent(message)
-                }
+        Group {
+            switch viewModel.state {
+            case .loading:
+                ProgressView("Checking GitHub connection…")
+            case .disconnected:
+                disconnectedContent
+            case let .configurationRequired(message):
+                configurationRequiredContent(message)
+            case let .authorizing(authorization):
+                authorizingContent(authorization)
+            case let .connected(account):
+                connectedContent(account)
+            case let .needsAttention(message):
+                needsAttentionContent(message)
             }
-            .navigationTitle("GitHub")
         }
-        .task {
-            await viewModel.restore()
-        }
+        .navigationTitle("GitHub")
     }
 
     private func configurationRequiredContent(_ message: String) -> some View {
@@ -291,5 +286,7 @@ enum GitHubViewState: Equatable {
 }
 
 #Preview {
-    GitHubView()
+    NavigationStack {
+        GitHubView(viewModel: GitHubViewModel())
+    }
 }

@@ -1,23 +1,30 @@
+import Observation
 import SwiftUI
 
 struct RootTabView: View {
-    @State private var selection = AppTab.home
+    @State private var navigation = AppNavigation()
+    @State private var githubViewModel = GitHubViewModel()
 
     var body: some View {
-        TabView(selection: $selection) {
+        TabView(selection: $navigation.selectedTab) {
             Tab("Home", systemImage: "rectangle.grid.2x2.fill", value: .home) {
-                DashboardView()
-            }
-
-            Tab("GitHub", systemImage: "chevron.left.forwardslash.chevron.right", value: .github) {
-                GitHubView()
+                DashboardView(
+                    githubViewModel: githubViewModel,
+                    openAccounts: navigation.openAccounts
+                )
             }
 
             Tab("Settings", systemImage: "gearshape.fill", value: .settings) {
-                SettingsView()
+                SettingsView(
+                    path: $navigation.settingsPath,
+                    githubViewModel: githubViewModel
+                )
             }
         }
         .tint(BuddyTheme.accent)
+        .task {
+            await githubViewModel.restore()
+        }
         .onOpenURL { url in
             guard let route = AppRoute(url: url) else {
                 AppLogger.routing.notice("Ignored unrecognized callback URL")
@@ -29,10 +36,21 @@ struct RootTabView: View {
     }
 }
 
-private enum AppTab: Hashable {
+enum AppTab: Hashable {
     case home
-    case github
     case settings
+}
+
+@MainActor
+@Observable
+final class AppNavigation {
+    var selectedTab = AppTab.home
+    var settingsPath: [SettingsRoute] = []
+
+    func openAccounts() {
+        settingsPath = [.accounts]
+        selectedTab = .settings
+    }
 }
 
 #Preview {
