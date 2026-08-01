@@ -327,9 +327,9 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(integration.summary.connectionState, .disconnected)
     }
 
-    func testRestoreStartedDuringDisconnectCannotRestoreConnectedState() async throws {
+    func testRestoreWaitsForCredentialRemovalBeforeValidating() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
-        let api = SuspendedUserGitHubAPI(account: account)
+        let api = StubGitHubAPI(userResults: [.success(account)])
         let credentials = SuspendedRemovalCredentialStore(initialValue: "stored-token")
         let integration = GitHubIntegration(clientID: "client-id", api: api, credentials: credentials)
         let disconnection = Task {
@@ -340,18 +340,21 @@ final class GitHubIntegrationTests: XCTestCase {
         let restoration = Task {
             try await integration.restoreAccount()
         }
-        await api.waitUntilUserRequestBegins()
+        for _ in 0..<20 {
+            await Task.yield()
+        }
+        let tokensBeforeCleanup = await api.userTokens()
+        XCTAssertEqual(tokensBeforeCleanup, [])
 
         await credentials.finishFirstRemoval()
         try await disconnection.value
-        await api.finishUserRequest()
-
         let restoredAccount = try await restoration.value
+        let capturedTokens = await api.userTokens()
         let credentialValue = await credentials.stringValue()
         XCTAssertNil(restoredAccount)
+        XCTAssertEqual(capturedTokens, [])
         XCTAssertNil(credentialValue)
         XCTAssertEqual(integration.summary.connectionState, .disconnected)
-        XCTAssertEqual(integration.summary.detail, "Ready to connect")
     }
 
     func testDisconnectDuringRevokedTokenCleanupDoesNotPublishStaleFailure() async throws {

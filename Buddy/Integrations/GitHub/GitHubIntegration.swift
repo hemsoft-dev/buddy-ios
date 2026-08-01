@@ -22,6 +22,8 @@ actor GitHubIntegration: IntegrationProviding {
     private var authorizationGeneration = 0
     private var restorationSequence = 0
     private var activeRestoration: (id: Int, task: Task<GitHubAccount?, Error>)?
+    private var cleanupSequence = 0
+    private var activeCredentialCleanup: (id: Int, task: Task<Void, Error>)?
     private var activeDeviceCode: String?
 
     init(
@@ -54,6 +56,14 @@ actor GitHubIntegration: IntegrationProviding {
     }
 
     func restoreAccount() async throws -> GitHubAccount? {
+        if let activeCredentialCleanup {
+            do {
+                try await activeCredentialCleanup.task.value
+            } catch {
+                throw GitHubConnectionError.credentialStorage
+            }
+        }
+
         if let activeRestoration {
             return try await activeRestoration.task.value
         }
@@ -272,7 +282,7 @@ actor GitHubIntegration: IntegrationProviding {
         activeDeviceCode = nil
 
         do {
-            try await credentials.removeData(for: Self.credentialAccount)
+            try await performCredentialCleanup()
             guard generation == authorizationGeneration else { return }
             authorizationGeneration &+= 1
             updateSummary(detail: "Ready to connect", state: .disconnected)
@@ -290,7 +300,7 @@ actor GitHubIntegration: IntegrationProviding {
         activeDeviceCode = nil
 
         do {
-            try await credentials.removeData(for: Self.credentialAccount)
+            try await performCredentialCleanup()
             guard generation == authorizationGeneration else { return }
             authorizationGeneration &+= 1
             updateSummary(detail: "Ready to connect", state: .disconnected)
@@ -304,6 +314,32 @@ actor GitHubIntegration: IntegrationProviding {
 
     private func updateSummary(detail: String, state: IntegrationConnectionState) {
         summaryStorage.update(detail: detail, state: state)
+    }
+
+    private func performCredentialCleanup() async throws {
+        if let activeCredentialCleanup {
+            try await activeCredentialCleanup.task.value
+            return
+        }
+
+        cleanupSequence &+= 1
+        let cleanupID = cleanupSequence
+        let task = Task {
+            try await credentials.removeData(for: Self.credentialAccount)
+        }
+        activeCredentialCleanup = (cleanupID, task)
+
+        do {
+            try await task.value
+            if activeCredentialCleanup?.id == cleanupID {
+                activeCredentialCleanup = nil
+            }
+        } catch {
+            if activeCredentialCleanup?.id == cleanupID {
+                activeCredentialCleanup = nil
+            }
+            throw error
+        }
     }
 
     private func removeInvalidCredential(generation: Int) async throws -> Bool {
