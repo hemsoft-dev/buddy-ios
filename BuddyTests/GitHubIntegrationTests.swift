@@ -72,6 +72,38 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(integration.summary.connectionState, .connected)
     }
 
+    func testRestoreAfterReconnectDoesNotJoinOldValidation() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let api = ReconnectionGitHubAPI(account: account)
+        let credentials = MockCredentialStore(initialValue: "old-token")
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: credentials,
+            sleep: { _ in }
+        )
+        let oldRestoration = Task {
+            try await integration.restoreAccount()
+        }
+
+        await api.waitUntilOldValidationBegins()
+        try await integration.disconnect()
+        let authorization = try await integration.beginAuthorization()
+        let reconnectedAccount = try await integration.completeAuthorization(authorization)
+        XCTAssertEqual(reconnectedAccount, account)
+
+        let restoredAccount = try await integration.restoreAccount()
+        XCTAssertEqual(restoredAccount, account)
+
+        await api.finishOldValidation()
+        let oldAccount = try await oldRestoration.value
+        XCTAssertNil(oldAccount)
+
+        let credentialValue = await credentials.stringValue()
+        XCTAssertEqual(credentialValue, "new-token")
+        XCTAssertEqual(integration.summary.connectionState, .connected)
+    }
+
     func testRevokedTokenIsRemovedAndReportsNeedsAttention() async throws {
         let api = StubGitHubAPI(userResults: [.failure(.unauthorized)])
         let credentials = MockCredentialStore(initialValue: "revoked-token")
@@ -348,10 +380,14 @@ final class GitHubIntegrationTests: XCTestCase {
 
         await credentials.finishFirstRemoval()
         try await disconnection.value
-        let restoredAccount = try await restoration.value
+        do {
+            let restoredAccount = try await restoration.value
+            XCTAssertNil(restoredAccount)
+        } catch is CancellationError {
+            // Cleanup's final generation invalidation may supersede the waiting restore.
+        }
         let capturedTokens = await api.userTokens()
         let credentialValue = await credentials.stringValue()
-        XCTAssertNil(restoredAccount)
         XCTAssertEqual(capturedTokens, [])
         XCTAssertNil(credentialValue)
         XCTAssertEqual(integration.summary.connectionState, .disconnected)
@@ -958,6 +994,47 @@ private actor SuspendedUserGitHubAPI: GitHubAPIProviding {
     func finishUserRequest() {
         userRequestCompletion?.resume()
         userRequestCompletion = nil
+    }
+}
+
+private actor ReconnectionGitHubAPI: GitHubAPIProviding {
+    private let account: GitHubAccount
+    private var oldValidationWaiter: CheckedContinuation<Void, Never>?
+    private var oldValidationCompletion: CheckedContinuation<Void, Never>?
+
+    init(account: GitHubAccount) {
+        self.account = account
+    }
+
+    func requestDeviceAuthorization(clientID: String) -> GitHubDeviceAuthorization {
+        testAuthorization
+    }
+
+    func pollForAccessToken(clientID: String, deviceCode: String) -> GitHubTokenPollResult {
+        .authorized(token: "new-token")
+    }
+
+    func authenticatedUser(token: String) async -> GitHubAccount {
+        guard token == "old-token" else { return account }
+
+        oldValidationWaiter?.resume()
+        oldValidationWaiter = nil
+        await withCheckedContinuation { continuation in
+            oldValidationCompletion = continuation
+        }
+        return account
+    }
+
+    func waitUntilOldValidationBegins() async {
+        guard oldValidationCompletion == nil else { return }
+        await withCheckedContinuation { continuation in
+            oldValidationWaiter = continuation
+        }
+    }
+
+    func finishOldValidation() {
+        oldValidationCompletion?.resume()
+        oldValidationCompletion = nil
     }
 }
 

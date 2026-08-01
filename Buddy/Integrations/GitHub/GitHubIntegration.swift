@@ -21,7 +21,11 @@ actor GitHubIntegration: IntegrationProviding {
     private let summaryStorage: LockedGitHubSummary
     private var authorizationGeneration = 0
     private var restorationSequence = 0
-    private var activeRestoration: (id: Int, task: Task<GitHubAccount?, Error>)?
+    private var activeRestoration: (
+        id: Int,
+        authorizationGeneration: Int,
+        task: Task<GitHubAccount?, Error>
+    )?
     private var cleanupSequence = 0
     private var activeCredentialCleanup: (id: Int, task: Task<Void, Error>)?
     private var activeDeviceCode: String?
@@ -64,17 +68,32 @@ actor GitHubIntegration: IntegrationProviding {
             }
         }
 
-        if let activeRestoration {
-            return try await activeRestoration.task.value
+        let authorizationGeneration = self.authorizationGeneration
+        if let activeRestoration,
+           activeRestoration.authorizationGeneration == authorizationGeneration {
+            let account = try await activeRestoration.task.value
+            guard authorizationGeneration == self.authorizationGeneration else {
+                return nil
+            }
+            return account
+        } else if let activeRestoration {
+            activeRestoration.task.cancel()
+            self.activeRestoration = nil
         }
 
         restorationSequence &+= 1
         let restorationID = restorationSequence
         let task = Task { try await self.performRestoreAccount() }
-        activeRestoration = (restorationID, task)
+        activeRestoration = (restorationID, authorizationGeneration, task)
 
         do {
             let account = try await task.value
+            guard authorizationGeneration == self.authorizationGeneration else {
+                if activeRestoration?.id == restorationID {
+                    activeRestoration = nil
+                }
+                return nil
+            }
             if activeRestoration?.id == restorationID {
                 activeRestoration = nil
             }
