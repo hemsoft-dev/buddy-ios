@@ -43,7 +43,7 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(capturedTokens, ["stored-token"])
     }
 
-    func testNewerRevokedRestoreSupersedesEarlierSuccessfulRestore() async throws {
+    func testConcurrentRestoresShareOneValidationResult() async throws {
         let account = GitHubAccount(id: 7, login: "franz", name: nil, avatarURL: nil)
         let api = SequencedSuspendedUserGitHubAPI()
         let credentials = MockCredentialStore(initialValue: "stored-token")
@@ -56,22 +56,20 @@ final class GitHubIntegrationTests: XCTestCase {
         let newerRestore = Task {
             try await integration.restoreAccount()
         }
-        await api.waitForRequest(count: 2)
-
-        await api.finishRequest(at: 1, with: .failure(.unauthorized))
-        do {
-            _ = try await newerRestore.value
-            XCTFail("Expected invalid token")
-        } catch let error as GitHubConnectionError {
-            XCTAssertEqual(error, .invalidToken)
+        for _ in 0..<20 {
+            await Task.yield()
         }
+        let requestCount = await api.requestCount()
+        XCTAssertEqual(requestCount, 1)
 
         await api.finishRequest(at: 0, with: .success(account))
         let earlierAccount = try await earlierRestore.value
+        let newerAccount = try await newerRestore.value
         let credentialValue = await credentials.stringValue()
-        XCTAssertNil(earlierAccount)
-        XCTAssertNil(credentialValue)
-        XCTAssertEqual(integration.summary.connectionState, .needsAttention)
+        XCTAssertEqual(earlierAccount, account)
+        XCTAssertEqual(newerAccount, account)
+        XCTAssertEqual(credentialValue, "stored-token")
+        XCTAssertEqual(integration.summary.connectionState, .connected)
     }
 
     func testRevokedTokenIsRemovedAndReportsNeedsAttention() async throws {
@@ -502,6 +500,33 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertTrue(connectionFinished)
         let finalState = await MainActor.run { viewModel.state }
         XCTAssertEqual(finalState, .connected(account))
+    }
+
+    func testAutomaticRestoreRevalidatesStateAfterExternalCredentialRemoval() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let api = StubGitHubAPI(userResults: [.success(account), .failure(.unauthorized)])
+        let credentials = MockCredentialStore(initialValue: "stored-token")
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: credentials
+        )
+        let viewModel = await MainActor.run { GitHubViewModel(integration: integration) }
+
+        await viewModel.restore()
+        let connectedState = await MainActor.run { viewModel.state }
+        XCTAssertEqual(connectedState, .connected(account))
+
+        do {
+            _ = try await integration.restoreAccount()
+            XCTFail("Expected invalid token")
+        } catch let error as GitHubConnectionError {
+            XCTAssertEqual(error, .invalidToken)
+        }
+
+        await viewModel.restore()
+        let refreshedState = await MainActor.run { viewModel.state }
+        XCTAssertEqual(refreshedState, .disconnected)
     }
 
     func testDisconnectRetryRepeatsCredentialRemoval() async throws {
@@ -960,6 +985,10 @@ private actor SequencedSuspendedUserGitHubAPI: GitHubAPIProviding {
         await withCheckedContinuation { continuation in
             requestWaiters[count] = continuation
         }
+    }
+
+    func requestCount() -> Int {
+        requestCompletions.count
     }
 
     func finishRequest(

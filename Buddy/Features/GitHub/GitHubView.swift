@@ -125,8 +125,7 @@ final class GitHubViewModel {
     }
 
     func restore() async {
-        guard state == .loading,
-              connectionTask == nil,
+        guard connectionTask == nil,
               cancellationTask == nil
         else {
             return
@@ -163,6 +162,11 @@ final class GitHubViewModel {
         connectionTask?.cancel()
         retryAction = .connect
         connectionTask = Task {
+            defer {
+                if generation == operationGeneration {
+                    connectionTask = nil
+                }
+            }
             do {
                 if let cancellationTask {
                     try await cancellationTask.value

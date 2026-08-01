@@ -20,7 +20,8 @@ actor GitHubIntegration: IntegrationProviding {
     private let sleep: @Sendable (Duration) async throws -> Void
     private let summaryStorage: LockedGitHubSummary
     private var authorizationGeneration = 0
-    private var restorationGeneration = 0
+    private var restorationSequence = 0
+    private var activeRestoration: (id: Int, task: Task<GitHubAccount?, Error>)?
     private var activeDeviceCode: String?
 
     init(
@@ -53,25 +54,41 @@ actor GitHubIntegration: IntegrationProviding {
     }
 
     func restoreAccount() async throws -> GitHubAccount? {
-        restorationGeneration &+= 1
-        let authorizationGeneration = self.authorizationGeneration
-        let restorationGeneration = self.restorationGeneration
+        if let activeRestoration {
+            return try await activeRestoration.task.value
+        }
+
+        restorationSequence &+= 1
+        let restorationID = restorationSequence
+        let task = Task { try await self.performRestoreAccount() }
+        activeRestoration = (restorationID, task)
+
+        do {
+            let account = try await task.value
+            if activeRestoration?.id == restorationID {
+                activeRestoration = nil
+            }
+            return account
+        } catch {
+            if activeRestoration?.id == restorationID {
+                activeRestoration = nil
+            }
+            throw error
+        }
+    }
+
+    private func performRestoreAccount() async throws -> GitHubAccount? {
+        let generation = authorizationGeneration
         let storedTokenData: Data?
         do {
             storedTokenData = try await credentials.data(for: Self.credentialAccount)
         } catch {
-            guard isCurrentRestore(
-                authorizationGeneration: authorizationGeneration,
-                restorationGeneration: restorationGeneration
-            ) else { return nil }
+            guard generation == authorizationGeneration else { return nil }
             updateSummary(detail: "Unable to read authorization", state: .needsAttention)
             throw GitHubConnectionError.credentialStorage
         }
 
-        guard isCurrentRestore(
-            authorizationGeneration: authorizationGeneration,
-            restorationGeneration: restorationGeneration
-        ) else { return nil }
+        guard generation == authorizationGeneration else { return nil }
 
         guard let tokenData = storedTokenData else {
             updateSummary(detail: "Ready to connect", state: .disconnected)
@@ -79,41 +96,26 @@ actor GitHubIntegration: IntegrationProviding {
         }
 
         guard let token = String(data: tokenData, encoding: .utf8), !token.isEmpty else {
-            guard try await removeInvalidCredential(
-                authorizationGeneration: authorizationGeneration,
-                restorationGeneration: restorationGeneration
-            ) else { return nil }
+            guard try await removeInvalidCredential(generation: generation) else { return nil }
             updateSummary(detail: "Stored authorization is invalid", state: .needsAttention)
             throw GitHubConnectionError.invalidToken
         }
 
         do {
             let account = try await api.authenticatedUser(token: token)
-            guard isCurrentRestore(
-                authorizationGeneration: authorizationGeneration,
-                restorationGeneration: restorationGeneration
-            ) else { return nil }
+            guard generation == authorizationGeneration else { return nil }
             updateSummary(detail: "@\(account.login)", state: .connected)
             return account
         } catch GitHubAPIError.unauthorized {
-            guard isCurrentRestore(
-                authorizationGeneration: authorizationGeneration,
-                restorationGeneration: restorationGeneration
-            ) else { return nil }
-            guard try await removeInvalidCredential(
-                authorizationGeneration: authorizationGeneration,
-                restorationGeneration: restorationGeneration
-            ) else { return nil }
+            guard generation == authorizationGeneration else { return nil }
+            guard try await removeInvalidCredential(generation: generation) else { return nil }
             updateSummary(detail: "Authorization expired", state: .needsAttention)
             throw GitHubConnectionError.invalidToken
         } catch {
             if Task.isCancelled {
                 throw CancellationError()
             }
-            guard isCurrentRestore(
-                authorizationGeneration: authorizationGeneration,
-                restorationGeneration: restorationGeneration
-            ) else { return nil }
+            guard generation == authorizationGeneration else { return nil }
             updateSummary(detail: "Unable to validate account", state: .needsAttention)
             throw map(error)
         }
@@ -304,32 +306,15 @@ actor GitHubIntegration: IntegrationProviding {
         summaryStorage.update(detail: detail, state: state)
     }
 
-    private func removeInvalidCredential(
-        authorizationGeneration: Int,
-        restorationGeneration: Int
-    ) async throws -> Bool {
+    private func removeInvalidCredential(generation: Int) async throws -> Bool {
         do {
             try await credentials.removeData(for: Self.credentialAccount)
         } catch {
-            guard isCurrentRestore(
-                authorizationGeneration: authorizationGeneration,
-                restorationGeneration: restorationGeneration
-            ) else { return false }
+            guard generation == authorizationGeneration else { return false }
             updateSummary(detail: "Unable to remove authorization", state: .needsAttention)
             throw GitHubConnectionError.credentialStorage
         }
-        return isCurrentRestore(
-            authorizationGeneration: authorizationGeneration,
-            restorationGeneration: restorationGeneration
-        )
-    }
-
-    private func isCurrentRestore(
-        authorizationGeneration: Int,
-        restorationGeneration: Int
-    ) -> Bool {
-        authorizationGeneration == self.authorizationGeneration &&
-            restorationGeneration == self.restorationGeneration
+        return generation == authorizationGeneration
     }
 
     private func map(_ error: Error) -> GitHubConnectionError {
