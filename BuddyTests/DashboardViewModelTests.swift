@@ -24,7 +24,7 @@ final class DashboardViewModelTests: XCTestCase {
             DashboardPresentation(githubState: .authorizing(authorization)),
             .authorizing
         )
-        XCTAssertEqual(DashboardPresentation(githubState: .connected(account)), .connected)
+        XCTAssertEqual(DashboardPresentation(githubState: .connected(account)), .connected(account))
         XCTAssertEqual(
             DashboardPresentation(githubState: .needsAttention("Authorization expired")),
             .needsAttention("Authorization expired")
@@ -83,6 +83,99 @@ final class DashboardViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.cards.first?.state, .disconnected)
         let refreshCount = await integration.refreshCount()
         XCTAssertEqual(refreshCount, 2)
+    }
+
+    func testGitHubDashboardLoadsConnectedResultsInRecentActivityOrder() async {
+        let refreshDate = Date(timeIntervalSince1970: 1_000)
+        let older = makePullRequest(id: 1, updatedAt: Date(timeIntervalSince1970: 100))
+        let newer = makePullRequest(id: 2, updatedAt: Date(timeIntervalSince1970: 200))
+        let provider = StubPullRequestProvider(results: [.success([older, newer])])
+        let viewModel = DashboardViewModel(
+            integrations: [],
+            github: provider,
+            now: { refreshDate }
+        )
+
+        let failure = await viewModel.refresh(account: testAccount)
+
+        XCTAssertNil(failure)
+        XCTAssertEqual(viewModel.githubState, .loaded([newer, older], refreshedAt: refreshDate))
+    }
+
+    func testGitHubDashboardRepresentsConnectedEmptyState() async {
+        let refreshDate = Date(timeIntervalSince1970: 2_000)
+        let provider = StubPullRequestProvider(results: [.success([])])
+        let viewModel = DashboardViewModel(
+            integrations: [],
+            github: provider,
+            now: { refreshDate }
+        )
+
+        await viewModel.refresh(account: testAccount)
+
+        XCTAssertEqual(viewModel.githubState, .loaded([], refreshedAt: refreshDate))
+    }
+
+    func testGitHubDashboardRefreshFailurePreservesPreviouslyLoadedResults() async {
+        let refreshDate = Date(timeIntervalSince1970: 3_000)
+        let pullRequest = makePullRequest(id: 1, updatedAt: refreshDate)
+        let provider = StubPullRequestProvider(results: [
+            .success([pullRequest]),
+            .failure(.networkUnavailable),
+        ])
+        let viewModel = DashboardViewModel(
+            integrations: [],
+            github: provider,
+            now: { refreshDate }
+        )
+        await viewModel.refresh(account: testAccount)
+
+        let failure = await viewModel.refresh(account: testAccount)
+
+        XCTAssertEqual(failure, .offline)
+        XCTAssertEqual(
+            viewModel.githubState,
+            .failed([pullRequest], refreshedAt: refreshDate, .offline)
+        )
+    }
+
+    func testGitHubDashboardMapsUnauthorizedRefreshToRecoveryState() async {
+        let provider = StubPullRequestProvider(results: [.failure(.invalidToken)])
+        let viewModel = DashboardViewModel(integrations: [], github: provider)
+
+        let failure = await viewModel.refresh(account: testAccount)
+
+        XCTAssertEqual(failure, .authenticationRequired)
+        XCTAssertEqual(
+            viewModel.githubState,
+            .failed([], refreshedAt: nil, .authenticationRequired)
+        )
+    }
+}
+
+private let testAccount = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+
+private func makePullRequest(id: Int, updatedAt: Date) -> GitHubPullRequest {
+    GitHubPullRequest(
+        id: id,
+        repository: "HemSoft/Buddy",
+        number: id,
+        title: "Pull request \(id)",
+        isDraft: false,
+        updatedAt: updatedAt,
+        url: URL(string: "https://github.com/HemSoft/Buddy/pull/\(id)")!
+    )
+}
+
+private actor StubPullRequestProvider: GitHubPullRequestProviding {
+    private var results: [Result<[GitHubPullRequest], GitHubConnectionError>]
+
+    init(results: [Result<[GitHubPullRequest], GitHubConnectionError>]) {
+        self.results = results
+    }
+
+    func authoredPullRequests(for _: GitHubAccount) throws -> [GitHubPullRequest] {
+        try results.removeFirst().get()
     }
 }
 

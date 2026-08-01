@@ -108,6 +108,57 @@ actor GitHubIntegration: IntegrationProviding {
         }
     }
 
+    func authoredPullRequests(for account: GitHubAccount) async throws -> [GitHubPullRequest] {
+        if let activeCredentialCleanup {
+            do {
+                try await activeCredentialCleanup.task.value
+            } catch {
+                throw GitHubConnectionError.credentialStorage
+            }
+        }
+
+        let generation = authorizationGeneration
+        let tokenData: Data?
+        do {
+            tokenData = try await credentials.data(for: Self.credentialAccount)
+        } catch {
+            throw GitHubConnectionError.credentialStorage
+        }
+
+        guard generation == authorizationGeneration else {
+            throw CancellationError()
+        }
+
+        guard let tokenData,
+              let token = String(data: tokenData, encoding: .utf8),
+              !token.isEmpty
+        else {
+            updateSummary(detail: "Authorization expired", state: .needsAttention)
+            throw GitHubConnectionError.invalidToken
+        }
+
+        do {
+            return try await api.authoredPullRequests(login: account.login, token: token)
+        } catch GitHubAPIError.unauthorized {
+            guard generation == authorizationGeneration else {
+                throw CancellationError()
+            }
+            guard try await removeInvalidCredential(generation: generation) else {
+                throw CancellationError()
+            }
+            updateSummary(detail: "Authorization expired", state: .needsAttention)
+            throw GitHubConnectionError.invalidToken
+        } catch {
+            if Task.isCancelled {
+                throw CancellationError()
+            }
+            guard generation == authorizationGeneration else {
+                throw CancellationError()
+            }
+            throw map(error)
+        }
+    }
+
     private func performRestoreAccount() async throws -> GitHubAccount? {
         let generation = authorizationGeneration
         let storedTokenData: Data?
@@ -393,6 +444,8 @@ actor GitHubIntegration: IntegrationProviding {
                 return .deviceFlowDisabled
             case .incorrectClientCredentials:
                 return .invalidConfiguration
+            case .rateLimited:
+                return .rateLimited
             case let .server(statusCode):
                 return .server(statusCode)
             }
@@ -415,6 +468,7 @@ enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
     case invalidToken
     case networkUnavailable
     case malformedResponse
+    case rateLimited
     case server(Int)
     case credentialStorage
 
@@ -436,6 +490,8 @@ enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
             "Buddy couldn't reach GitHub. Check your connection and try again."
         case .malformedResponse:
             "GitHub returned an unexpected response. Try again in a moment."
+        case .rateLimited:
+            "GitHub's request limit was reached. Wait a little while, then refresh again."
         case let .server(statusCode):
             "GitHub returned an error (\(statusCode)). Try again later."
         case .credentialStorage:
@@ -453,6 +509,7 @@ enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
         case .invalidToken: "Authorization expired"
         case .networkUnavailable: "Unable to reach GitHub"
         case .malformedResponse: "Unexpected response from GitHub"
+        case .rateLimited: "GitHub request limit reached"
         case .server: "GitHub is unavailable"
         case .credentialStorage: "Keychain update failed"
         }

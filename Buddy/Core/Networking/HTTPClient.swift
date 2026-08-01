@@ -13,6 +13,14 @@ struct URLSessionHTTPClient: HTTPClient {
         }
 
         guard 200..<300 ~= response.statusCode else {
+            let isRateLimited = response.statusCode == 429 ||
+                (response.statusCode == 403 && (
+                    response.value(forHTTPHeaderField: "X-RateLimit-Remaining") == "0" ||
+                        response.value(forHTTPHeaderField: "Retry-After") != nil
+                ))
+            if isRateLimited {
+                throw HTTPClientError.rateLimited
+            }
             throw HTTPClientError.unacceptableStatus(response.statusCode)
         }
 
@@ -22,5 +30,6 @@ struct URLSessionHTTPClient: HTTPClient {
 
 enum HTTPClientError: Error, Equatable {
     case invalidResponse
+    case rateLimited
     case unacceptableStatus(Int)
 }

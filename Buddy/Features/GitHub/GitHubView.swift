@@ -261,6 +261,14 @@ final class GitHubViewModel {
         }
     }
 
+    func reportDashboardAuthenticationFailure() {
+        operationGeneration &+= 1
+        connectionTask?.cancel()
+        connectionTask = nil
+        retryAction = .connect
+        state = .needsAttention(GitHubConnectionError.invalidToken.localizedDescription)
+    }
+
     private enum RetryAction {
         case connect
         case restore

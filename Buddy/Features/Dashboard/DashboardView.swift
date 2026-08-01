@@ -4,6 +4,8 @@ struct DashboardView: View {
     @State private var viewModel = DashboardViewModel(
         integrations: IntegrationCatalog.defaultIntegrations
     )
+    @AppStorage("dashboard.github.account-card.expanded") private var isGitHubCardExpanded = true
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let githubViewModel: GitHubViewModel
     let openAccounts: () -> Void
 
@@ -19,8 +21,8 @@ struct DashboardView: View {
                     configurationRequiredContent
                 case .authorizing:
                     authorizingContent
-                case .connected:
-                    connectedContent
+                case let .connected(account):
+                    connectedContent(account)
                 case let .needsAttention(message):
                     needsAttentionContent(message)
                 }
@@ -28,14 +30,14 @@ struct DashboardView: View {
             .background(BuddyTheme.background)
             .navigationTitle("Buddy")
             .toolbar {
-                if DashboardPresentation(githubState: githubViewModel.state) == .connected {
+                if case let .connected(account) = githubViewModel.state {
                     ToolbarItem(placement: .topBarTrailing) {
-                        if viewModel.isRefreshing {
+                        if viewModel.githubState.isRefreshing {
                             ProgressView()
-                                .accessibilityLabel("Refreshing dashboards")
+                                .accessibilityLabel("Refreshing GitHub pull requests")
                         } else {
                             Button("Refresh", systemImage: "arrow.clockwise") {
-                                Task { await viewModel.refresh() }
+                                Task { await refreshPullRequests(for: account) }
                             }
                         }
                     }
@@ -43,26 +45,235 @@ struct DashboardView: View {
             }
         }
         .task(id: DashboardPresentation(githubState: githubViewModel.state)) {
-            guard DashboardPresentation(githubState: githubViewModel.state) == .connected else {
+            guard case let .connected(account) = githubViewModel.state else {
                 return
             }
-            await viewModel.refresh()
+            await refreshPullRequests(for: account)
         }
     }
 
-    private var connectedContent: some View {
+    private func connectedContent(_ account: GitHubAccount) -> some View {
         ScrollView {
             LazyVStack(spacing: BuddyTheme.Spacing.medium) {
                 welcomeCard
 
-                ForEach(viewModel.cards) { card in
+                githubAccountCard(account)
+
+                ForEach(viewModel.cards.filter { $0.id != "github" }) { card in
                     DashboardCardView(card: card)
                 }
             }
             .padding(BuddyTheme.Spacing.medium)
         }
         .refreshable {
-            await viewModel.refresh()
+            await refreshPullRequests(for: account)
+        }
+    }
+
+    private func githubAccountCard(_ account: GitHubAccount) -> some View {
+        VStack(alignment: .leading, spacing: BuddyTheme.Spacing.medium) {
+            Button {
+                withAnimation(reduceMotion ? nil : .snappy) {
+                    isGitHubCardExpanded.toggle()
+                }
+            } label: {
+                HStack(alignment: .top, spacing: BuddyTheme.Spacing.medium) {
+                    Image(systemName: "chevron.left.forwardslash.chevron.right")
+                        .font(.title2.weight(.semibold))
+                        .foregroundStyle(BuddyTheme.accent)
+                        .frame(width: 44, height: 44)
+                        .background(BuddyTheme.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+                        .accessibilityHidden(true)
+
+                    VStack(alignment: .leading, spacing: BuddyTheme.Spacing.xSmall) {
+                        Text(account.name.flatMap { $0.isEmpty ? nil : $0 } ?? "GitHub")
+                            .font(.headline)
+
+                        Text("@\(account.login)")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+
+                        Text(githubHeaderSummary)
+                            .font(.caption)
+                            .foregroundStyle(githubHeaderSummaryColor)
+
+                        if let refreshedAt = viewModel.githubState.refreshedAt {
+                            Text("Updated \(refreshedAt, style: .relative) ago")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+
+                    Spacer(minLength: BuddyTheme.Spacing.small)
+
+                    Image(systemName: "chevron.down")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isGitHubCardExpanded ? 0 : -90))
+                        .accessibilityHidden(true)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("GitHub account @\(account.login)")
+            .accessibilityValue(isGitHubCardExpanded ? "Expanded, \(githubHeaderSummary)" : "Collapsed, \(githubHeaderSummary)")
+            .accessibilityHint(isGitHubCardExpanded ? "Collapses pull requests" : "Expands pull requests")
+
+            if isGitHubCardExpanded {
+                Divider()
+                githubAccountBody(account)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .buddyCard()
+        .animation(reduceMotion ? nil : .snappy, value: isGitHubCardExpanded)
+    }
+
+    @ViewBuilder
+    private func githubAccountBody(_ account: GitHubAccount) -> some View {
+        switch viewModel.githubState {
+        case .loading:
+            HStack(spacing: BuddyTheme.Spacing.small) {
+                ProgressView()
+                Text("Loading authored pull requests…")
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+        case let .loaded(pullRequests, _):
+            pullRequestContent(pullRequests)
+
+        case let .refreshing(pullRequests, _):
+            VStack(alignment: .leading, spacing: BuddyTheme.Spacing.medium) {
+                HStack(spacing: BuddyTheme.Spacing.small) {
+                    ProgressView()
+                    Text("Refreshing pull requests…")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                if !pullRequests.isEmpty {
+                    pullRequestList(pullRequests)
+                }
+            }
+
+        case let .failed(pullRequests, _, failure):
+            VStack(alignment: .leading, spacing: BuddyTheme.Spacing.medium) {
+                Label(failure.message, systemImage: "exclamationmark.triangle.fill")
+                    .font(.subheadline)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Button(failure == .authenticationRequired ? "Reconnect in Settings" : "Try Again") {
+                    if failure == .authenticationRequired {
+                        openAccounts()
+                    } else {
+                        Task { await refreshPullRequests(for: account) }
+                    }
+                }
+                .buttonStyle(.bordered)
+
+                if !pullRequests.isEmpty {
+                    pullRequestList(pullRequests)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func pullRequestContent(_ pullRequests: [GitHubPullRequest]) -> some View {
+        if pullRequests.isEmpty {
+            VStack(alignment: .leading, spacing: BuddyTheme.Spacing.small) {
+                Label("No open pull requests", systemImage: "checkmark.circle.fill")
+                    .font(.headline)
+                    .foregroundStyle(.green)
+                Text("@\(connectedAccountLogin) has no authored pull requests open right now.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            pullRequestList(pullRequests)
+        }
+    }
+
+    private func pullRequestList(_ pullRequests: [GitHubPullRequest]) -> some View {
+        LazyVStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(pullRequests.enumerated()), id: \.element.id) { index, pullRequest in
+                if index > 0 {
+                    Divider()
+                }
+                pullRequestRow(pullRequest)
+                    .padding(.vertical, BuddyTheme.Spacing.small)
+            }
+        }
+    }
+
+    private func pullRequestRow(_ pullRequest: GitHubPullRequest) -> some View {
+        Link(destination: pullRequest.url) {
+            HStack(alignment: .top, spacing: BuddyTheme.Spacing.small) {
+                VStack(alignment: .leading, spacing: BuddyTheme.Spacing.xSmall) {
+                    Text("\(pullRequest.repository) #\(pullRequest.number)")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+
+                    Text(pullRequest.title)
+                        .font(.body.weight(.medium))
+                        .foregroundStyle(.primary)
+                        .multilineTextAlignment(.leading)
+
+                    HStack(spacing: BuddyTheme.Spacing.small) {
+                        Label(pullRequest.isDraft ? "Draft" : "Open", systemImage: pullRequest.isDraft ? "pencil.circle" : "arrow.triangle.pull")
+                        Text("Updated \(pullRequest.updatedAt, style: .relative) ago")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: BuddyTheme.Spacing.small)
+
+                Image(systemName: "arrow.up.right.square")
+                    .foregroundStyle(BuddyTheme.accent)
+                    .accessibilityHidden(true)
+            }
+            .contentShape(Rectangle())
+        }
+        .accessibilityLabel("\(pullRequest.repository) pull request \(pullRequest.number), \(pullRequest.title), \(pullRequest.isDraft ? "draft" : "open")")
+        .accessibilityHint("Opens on GitHub")
+    }
+
+    private var githubHeaderSummary: String {
+        let count = viewModel.githubState.pullRequests.count
+        let result = "\(count) open pull request\(count == 1 ? "" : "s")"
+        switch viewModel.githubState {
+        case .loading:
+            return "Loading pull requests"
+        case .loaded:
+            return result
+        case .refreshing:
+            return "Refreshing · \(result)"
+        case .failed(_, _, .authenticationRequired):
+            return "Reconnect required · \(result)"
+        case .failed:
+            return "Refresh warning · \(result)"
+        }
+    }
+
+    private var githubHeaderSummaryColor: Color {
+        if case .failed = viewModel.githubState { return .orange }
+        return .secondary
+    }
+
+    private var connectedAccountLogin: String {
+        if case let .connected(account) = githubViewModel.state {
+            return account.login
+        }
+        return "your account"
+    }
+
+    private func refreshPullRequests(for account: GitHubAccount) async {
+        let failure = await viewModel.refresh(account: account)
+        if failure == .authenticationRequired {
+            githubViewModel.reportDashboardAuthenticationFailure()
         }
     }
 
@@ -143,7 +354,7 @@ enum DashboardPresentation: Hashable {
     case onboarding
     case configurationRequired
     case authorizing
-    case connected
+    case connected(GitHubAccount)
     case needsAttention(String)
 
     init(githubState: GitHubViewState) {
@@ -156,8 +367,8 @@ enum DashboardPresentation: Hashable {
             self = .configurationRequired
         case .authorizing:
             self = .authorizing
-        case .connected:
-            self = .connected
+        case let .connected(account):
+            self = .connected(account)
         case let .needsAttention(message):
             self = .needsAttention(message)
         }
