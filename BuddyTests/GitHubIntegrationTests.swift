@@ -60,6 +60,45 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(integration.summary.connectionState, .needsAttention)
     }
 
+    func testRevokedTokenRemovalFailureReportsCredentialStorageError() async throws {
+        let api = StubGitHubAPI(userResults: [.failure(.unauthorized)])
+        let credentials = FailingRemovalCredentialStore(initialValue: "revoked-token")
+        let integration = GitHubIntegration(clientID: "client-id", api: api, credentials: credentials)
+
+        do {
+            _ = try await integration.restoreAccount()
+            XCTFail("Expected credential storage error")
+        } catch let error as GitHubConnectionError {
+            XCTAssertEqual(error, .credentialStorage)
+        }
+
+        let credentialValue = await credentials.stringValue()
+        XCTAssertEqual(credentialValue, "revoked-token")
+        XCTAssertEqual(integration.summary.connectionState, .needsAttention)
+        XCTAssertEqual(integration.summary.detail, "Unable to remove authorization")
+    }
+
+    func testMalformedTokenRemovalFailureReportsCredentialStorageError() async throws {
+        let credentials = FailingRemovalCredentialStore(initialData: Data([0xFF]))
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(),
+            credentials: credentials
+        )
+
+        do {
+            _ = try await integration.restoreAccount()
+            XCTFail("Expected credential storage error")
+        } catch let error as GitHubConnectionError {
+            XCTAssertEqual(error, .credentialStorage)
+        }
+
+        let credentialData = await credentials.storedData()
+        XCTAssertEqual(credentialData, Data([0xFF]))
+        XCTAssertEqual(integration.summary.connectionState, .needsAttention)
+        XCTAssertEqual(integration.summary.detail, "Unable to remove authorization")
+    }
+
     func testFailedIdentityValidationDoesNotPersistToken() async throws {
         let api = StubGitHubAPI(
             deviceResults: [.success(testAuthorization)],
@@ -166,6 +205,44 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(integration.summary.connectionState, .needsAttention)
     }
 
+    func testSupersededCredentialPersistenceFailureDoesNotPublishNeedsAttention() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let api = StubGitHubAPI(
+            deviceResults: [.success(testAuthorization)],
+            pollResults: [.success(.authorized(token: "new-token"))],
+            userResults: [.success(account)]
+        )
+        let credentials = SuspendedFailingSetCredentialStore()
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: credentials,
+            sleep: { _ in }
+        )
+        let authorization = try await integration.beginAuthorization()
+        let completion = Task {
+            try await integration.completeAuthorization(authorization)
+        }
+
+        let persistenceStarted = try await waitUntil {
+            await credentials.setDidStart()
+        }
+        XCTAssertTrue(persistenceStarted)
+
+        try await integration.disconnect()
+        await credentials.finishSet()
+
+        do {
+            _ = try await completion.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {
+            // Expected: the disconnect superseded the failed persistence operation.
+        }
+
+        XCTAssertEqual(integration.summary.connectionState, .disconnected)
+        XCTAssertEqual(integration.summary.detail, "Ready to connect")
+    }
+
     func testDisconnectPreventsStaleValidationFromRestoringConnectedState() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let api = SuspendedUserGitHubAPI(account: account)
@@ -198,12 +275,44 @@ final class GitHubIntegrationTests: XCTestCase {
         let disconnection = Task {
             try await integration.disconnect()
         }
+        let disconnectRemovalStarted = try await waitUntil {
+            await credentials.removalAttemptCount() == 2
+        }
+        XCTAssertTrue(disconnectRemovalStarted)
         await credentials.finishFirstRemoval()
 
         let restoredAccount = try await restoration.value
         try await disconnection.value
         XCTAssertNil(restoredAccount)
         XCTAssertEqual(integration.summary.connectionState, .disconnected)
+    }
+
+    func testDisconnectSupersedesRevokedTokenRemovalFailure() async throws {
+        let api = StubGitHubAPI(userResults: [.failure(.unauthorized)])
+        let credentials = SuspendedRemovalCredentialStore(
+            initialValue: "revoked-token",
+            failFirstRemoval: true
+        )
+        let integration = GitHubIntegration(clientID: "client-id", api: api, credentials: credentials)
+        let restoration = Task {
+            try await integration.restoreAccount()
+        }
+
+        await credentials.waitUntilRemovalBegins()
+        let disconnection = Task {
+            try await integration.disconnect()
+        }
+        let disconnectRemovalStarted = try await waitUntil {
+            await credentials.removalAttemptCount() == 2
+        }
+        XCTAssertTrue(disconnectRemovalStarted)
+        await credentials.finishFirstRemoval()
+
+        let restoredAccount = try await restoration.value
+        try await disconnection.value
+        XCTAssertNil(restoredAccount)
+        XCTAssertEqual(integration.summary.connectionState, .disconnected)
+        XCTAssertEqual(integration.summary.detail, "Ready to connect")
     }
 
     func testDisconnectDuringMalformedTokenCleanupDoesNotPublishStaleFailure() async throws {
@@ -221,6 +330,10 @@ final class GitHubIntegrationTests: XCTestCase {
         let disconnection = Task {
             try await integration.disconnect()
         }
+        let disconnectRemovalStarted = try await waitUntil {
+            await credentials.removalAttemptCount() == 2
+        }
+        XCTAssertTrue(disconnectRemovalStarted)
         await credentials.finishFirstRemoval()
 
         let restoredAccount = try await restoration.value
@@ -462,6 +575,74 @@ private actor SuspendedCredentialStore: CredentialStoring {
     }
 }
 
+private actor FailingRemovalCredentialStore: CredentialStoring {
+    enum StoreError: Error {
+        case removalFailed
+    }
+
+    private var value: Data?
+
+    init(initialValue: String) {
+        value = Data(initialValue.utf8)
+    }
+
+    init(initialData: Data) {
+        value = initialData
+    }
+
+    func set(_ data: Data, for account: String) {
+        value = data
+    }
+
+    func data(for account: String) -> Data? {
+        value
+    }
+
+    func removeData(for account: String) throws {
+        throw StoreError.removalFailed
+    }
+
+    func storedData() -> Data? {
+        value
+    }
+
+    func stringValue() -> String? {
+        value.flatMap { String(data: $0, encoding: .utf8) }
+    }
+}
+
+private actor SuspendedFailingSetCredentialStore: CredentialStoring {
+    enum StoreError: Error {
+        case persistenceFailed
+    }
+
+    private var didStartSet = false
+    private var setCompletion: CheckedContinuation<Void, Never>?
+
+    func set(_ data: Data, for account: String) async throws {
+        didStartSet = true
+        await withCheckedContinuation { continuation in
+            setCompletion = continuation
+        }
+        throw StoreError.persistenceFailed
+    }
+
+    func data(for account: String) -> Data? {
+        nil
+    }
+
+    func removeData(for account: String) {}
+
+    func setDidStart() -> Bool {
+        didStartSet
+    }
+
+    func finishSet() {
+        setCompletion?.resume()
+        setCompletion = nil
+    }
+}
+
 private actor SuspendedUserGitHubAPI: GitHubAPIProviding {
     private let account: GitHubAccount
     private var userRequestWaiter: CheckedContinuation<Void, Never>?
@@ -504,17 +685,24 @@ private actor SuspendedUserGitHubAPI: GitHubAPIProviding {
 }
 
 private actor SuspendedRemovalCredentialStore: CredentialStoring {
+    enum StoreError: Error {
+        case removalFailed
+    }
+
     private var value: Data?
-    private var didSuspendRemoval = false
+    private let failFirstRemoval: Bool
+    private var removalAttempts = 0
     private var removalWaiter: CheckedContinuation<Void, Never>?
     private var removalCompletion: CheckedContinuation<Void, Never>?
 
-    init(initialValue: String) {
+    init(initialValue: String, failFirstRemoval: Bool = false) {
         value = Data(initialValue.utf8)
+        self.failFirstRemoval = failFirstRemoval
     }
 
-    init(initialData: Data) {
+    init(initialData: Data, failFirstRemoval: Bool = false) {
         value = initialData
+        self.failFirstRemoval = failFirstRemoval
     }
 
     func set(_ data: Data, for account: String) {
@@ -525,13 +713,16 @@ private actor SuspendedRemovalCredentialStore: CredentialStoring {
         value
     }
 
-    func removeData(for account: String) async {
-        if !didSuspendRemoval {
-            didSuspendRemoval = true
+    func removeData(for account: String) async throws {
+        removalAttempts += 1
+        if removalAttempts == 1 {
             removalWaiter?.resume()
             removalWaiter = nil
             await withCheckedContinuation { continuation in
                 removalCompletion = continuation
+            }
+            if failFirstRemoval {
+                throw StoreError.removalFailed
             }
         }
         value = nil
@@ -547,6 +738,10 @@ private actor SuspendedRemovalCredentialStore: CredentialStoring {
     func finishFirstRemoval() {
         removalCompletion?.resume()
         removalCompletion = nil
+    }
+
+    func removalAttemptCount() -> Int {
+        removalAttempts
     }
 }
 
