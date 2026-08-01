@@ -719,6 +719,49 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertTrue(connectionFinished)
     }
 
+    func testDashboardPresentationTracksFirstConnectionAndLastDisconnection() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let api = StubGitHubAPI(
+            deviceResults: [.success(testAuthorization)],
+            pollResults: [.success(.authorized(token: "access-token"))],
+            userResults: [.success(account)]
+        )
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: MockCredentialStore(),
+            sleep: { _ in }
+        )
+        let (viewModel, openURL) = await MainActor.run {
+            (
+                GitHubViewModel(integration: integration),
+                OpenURLAction { _ in .handled }
+            )
+        }
+
+        await viewModel.restore()
+        let firstLaunchPresentation = await MainActor.run {
+            DashboardPresentation(githubState: viewModel.state)
+        }
+        XCTAssertEqual(firstLaunchPresentation, .onboarding)
+
+        await MainActor.run { viewModel.connect(openURL: openURL) }
+        let connected = try await waitUntil {
+            await MainActor.run { viewModel.state == .connected(account) }
+        }
+        XCTAssertTrue(connected)
+        let connectedPresentation = await MainActor.run {
+            DashboardPresentation(githubState: viewModel.state)
+        }
+        XCTAssertEqual(connectedPresentation, .connected)
+
+        await viewModel.disconnect()
+        let disconnectedPresentation = await MainActor.run {
+            DashboardPresentation(githubState: viewModel.state)
+        }
+        XCTAssertEqual(disconnectedPresentation, .onboarding)
+    }
+
     func testMissingClientIDRestoresConfigurationRequiredWithoutConnectAction() async {
         let integration = GitHubIntegration(
             clientID: nil,
