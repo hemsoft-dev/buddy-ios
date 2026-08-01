@@ -53,6 +53,25 @@ buddy://oauth/<provider>
 Each provider's exact authorization requirements should be verified when its
 integration is implemented.
 
+### GitHub
+
+Buddy uses GitHub's OAuth device flow because it is a native, backend-free app
+and therefore cannot keep a client secret. The app requests no OAuth scopes for
+the initial connection; this grants only the minimum access needed to validate
+the signed-in user's public identity. Tokens are stored only in iOS Keychain.
+
+To configure GitHub connection:
+
+1. Register a GitHub OAuth app and enable **Device Flow** in its settings.
+2. Copy `Config/Local.xcconfig.example` to `Config/Local.xcconfig`.
+3. Set `BUDDY_GITHUB_CLIENT_ID` to the OAuth app's client ID. Do not add a
+   client secret.
+
+The device flow opens GitHub in the system browser, observes GitHub's polling
+interval and expiration, and handles `slow_down` responses. The existing
+`buddy://oauth/github` route remains available for future providers that use a
+redirect-based authorization flow.
+
 ## Verification
 
 From the repository root:

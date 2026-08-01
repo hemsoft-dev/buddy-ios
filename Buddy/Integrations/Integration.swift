@@ -45,5 +45,6 @@ enum IntegrationConnectionState: String, Equatable, Sendable {
 }
 
 enum IntegrationCatalog {
-    static let defaultIntegrations: [any IntegrationProviding] = [GitHubIntegration()]
+    static let github = GitHubIntegration()
+    static let defaultIntegrations: [any IntegrationProviding] = [github]
 }
