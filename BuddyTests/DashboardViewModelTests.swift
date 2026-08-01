@@ -89,7 +89,7 @@ final class DashboardViewModelTests: XCTestCase {
         let refreshDate = Date(timeIntervalSince1970: 1_000)
         let older = makePullRequest(id: 1, updatedAt: Date(timeIntervalSince1970: 100))
         let newer = makePullRequest(id: 2, updatedAt: Date(timeIntervalSince1970: 200))
-        let provider = StubPullRequestProvider(results: [.success([older, newer])])
+        let provider = StubPullRequestProvider(results: [.success(collection([older, newer], totalCount: 72))])
         let viewModel = DashboardViewModel(
             integrations: [],
             github: provider,
@@ -100,11 +100,12 @@ final class DashboardViewModelTests: XCTestCase {
 
         XCTAssertNil(failure)
         XCTAssertEqual(viewModel.githubState, .loaded([newer, older], refreshedAt: refreshDate))
+        XCTAssertEqual(viewModel.githubTotalCount, 72)
     }
 
     func testGitHubDashboardRepresentsConnectedEmptyState() async {
         let refreshDate = Date(timeIntervalSince1970: 2_000)
-        let provider = StubPullRequestProvider(results: [.success([])])
+        let provider = StubPullRequestProvider(results: [.success(collection([]))])
         let viewModel = DashboardViewModel(
             integrations: [],
             github: provider,
@@ -120,7 +121,7 @@ final class DashboardViewModelTests: XCTestCase {
         let refreshDate = Date(timeIntervalSince1970: 3_000)
         let pullRequest = makePullRequest(id: 1, updatedAt: refreshDate)
         let provider = StubPullRequestProvider(results: [
-            .success([pullRequest]),
+            .success(collection([pullRequest])),
             .failure(.networkUnavailable),
         ])
         let viewModel = DashboardViewModel(
@@ -156,7 +157,7 @@ final class DashboardViewModelTests: XCTestCase {
         let refreshDate = Date(timeIntervalSince1970: 4_000)
         let firstAccountPullRequest = makePullRequest(id: 1, updatedAt: refreshDate)
         let provider = StubPullRequestProvider(results: [
-            .success([firstAccountPullRequest]),
+            .success(collection([firstAccountPullRequest])),
             .failure(.networkUnavailable),
         ])
         let viewModel = DashboardViewModel(
@@ -171,6 +172,29 @@ final class DashboardViewModelTests: XCTestCase {
 
         XCTAssertEqual(failure, .offline)
         XCTAssertEqual(viewModel.githubState, .failed([], refreshedAt: nil, .offline))
+        XCTAssertEqual(viewModel.githubTotalCount, 0)
+    }
+
+    func testGitHubDashboardBlocksDuplicateInitialRefreshes() async {
+        let pullRequest = makePullRequest(id: 1, updatedAt: Date(timeIntervalSince1970: 5_000))
+        let provider = SuspendedPullRequestProvider()
+        let viewModel = DashboardViewModel(integrations: [], github: provider)
+        let initialRefresh = Task {
+            await viewModel.refresh(account: testAccount)
+        }
+        await provider.waitUntilRequested()
+
+        let duplicateFailure = await viewModel.refresh(account: testAccount)
+
+        XCTAssertNil(duplicateFailure)
+        XCTAssertTrue(viewModel.isGitHubRefreshInFlight)
+        let requestCount = await provider.requestCount()
+        XCTAssertEqual(requestCount, 1)
+
+        await provider.finish(with: collection([pullRequest]))
+        _ = await initialRefresh.value
+        XCTAssertFalse(viewModel.isGitHubRefreshInFlight)
+        XCTAssertEqual(viewModel.githubState.pullRequests, [pullRequest])
     }
 }
 
@@ -188,15 +212,56 @@ private func makePullRequest(id: Int, updatedAt: Date) -> GitHubPullRequest {
     )
 }
 
-private actor StubPullRequestProvider: GitHubPullRequestProviding {
-    private var results: [Result<[GitHubPullRequest], GitHubConnectionError>]
+private func collection(
+    _ pullRequests: [GitHubPullRequest],
+    totalCount: Int? = nil
+) -> GitHubPullRequestCollection {
+    GitHubPullRequestCollection(
+        pullRequests: pullRequests,
+        totalCount: totalCount ?? pullRequests.count
+    )
+}
 
-    init(results: [Result<[GitHubPullRequest], GitHubConnectionError>]) {
+private actor StubPullRequestProvider: GitHubPullRequestProviding {
+    private var results: [Result<GitHubPullRequestCollection, GitHubConnectionError>]
+
+    init(results: [Result<GitHubPullRequestCollection, GitHubConnectionError>]) {
         self.results = results
     }
 
-    func authoredPullRequests(for _: GitHubAccount) throws -> [GitHubPullRequest] {
+    func authoredPullRequests(for _: GitHubAccount) throws -> GitHubPullRequestCollection {
         try results.removeFirst().get()
+    }
+}
+
+private actor SuspendedPullRequestProvider: GitHubPullRequestProviding {
+    private var capturedRequestCount = 0
+    private var requestWaiter: CheckedContinuation<Void, Never>?
+    private var completion: CheckedContinuation<GitHubPullRequestCollection, Never>?
+
+    func authoredPullRequests(for _: GitHubAccount) async -> GitHubPullRequestCollection {
+        capturedRequestCount += 1
+        requestWaiter?.resume()
+        requestWaiter = nil
+        return await withCheckedContinuation { continuation in
+            completion = continuation
+        }
+    }
+
+    func waitUntilRequested() async {
+        guard capturedRequestCount == 0 else { return }
+        await withCheckedContinuation { continuation in
+            requestWaiter = continuation
+        }
+    }
+
+    func finish(with result: GitHubPullRequestCollection) {
+        completion?.resume(returning: result)
+        completion = nil
+    }
+
+    func requestCount() -> Int {
+        capturedRequestCount
     }
 }
 

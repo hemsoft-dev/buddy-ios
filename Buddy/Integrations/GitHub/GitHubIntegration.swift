@@ -108,7 +108,7 @@ actor GitHubIntegration: IntegrationProviding {
         }
     }
 
-    func authoredPullRequests(for account: GitHubAccount) async throws -> [GitHubPullRequest] {
+    func authoredPullRequests(for account: GitHubAccount) async throws -> GitHubPullRequestCollection {
         if let activeCredentialCleanup {
             do {
                 try await activeCredentialCleanup.task.value

@@ -104,14 +104,16 @@ final class GitHubAPITests: XCTestCase {
     func testAuthoredPullRequestsUsesVersionedEncodedBoundedSearchAndSortsResults() async throws {
         let httpClient = MockHTTPClient(responses: [
             .success(
-                #"{"items":[{"id":1,"number":7,"title":"Older","draft":false,"updated_at":"2026-07-31T12:00:00Z","html_url":"https://github.com/HemSoft/Buddy/pull/7","repository_url":"https://api.github.com/repos/HemSoft/Buddy"},{"id":2,"number":9,"title":"Newer","draft":true,"updated_at":"2026-08-01T12:00:00Z","html_url":"https://github.com/HemSoft/Other/pull/9","repository_url":"https://api.github.com/repos/HemSoft/Other"}]}"#,
+                #"{"total_count":72,"items":[{"id":1,"number":7,"title":"Older","draft":false,"updated_at":"2026-07-31T12:00:00Z","html_url":"https://github.com/HemSoft/Buddy/pull/7","repository_url":"https://api.github.com/repos/HemSoft/Buddy"},{"id":2,"number":9,"title":"Newer","draft":true,"updated_at":"2026-08-01T12:00:00Z","html_url":"https://github.com/HemSoft/Other/pull/9","repository_url":"https://api.github.com/repos/HemSoft/Other"}]}"#,
                 statusCode: 200
             ),
         ])
         let api = GitHubAPI(httpClient: httpClient)
 
-        let pullRequests = try await api.authoredPullRequests(login: "franz-test", token: "secret-token")
+        let collection = try await api.authoredPullRequests(login: "franz-test", token: "secret-token")
+        let pullRequests = collection.pullRequests
 
+        XCTAssertEqual(collection.totalCount, 72)
         XCTAssertEqual(pullRequests.map(\.id), [2, 1])
         XCTAssertEqual(pullRequests.first?.repository, "HemSoft/Other")
         XCTAssertEqual(pullRequests.first?.number, 9)
@@ -134,12 +136,12 @@ final class GitHubAPITests: XCTestCase {
     }
 
     func testAuthoredPullRequestsSupportsEmptyResults() async throws {
-        let httpClient = MockHTTPClient(responses: [.success(#"{"items":[]}"#, statusCode: 200)])
+        let httpClient = MockHTTPClient(responses: [.success(#"{"total_count":0,"items":[]}"#, statusCode: 200)])
 
-        let pullRequests = try await GitHubAPI(httpClient: httpClient)
+        let collection = try await GitHubAPI(httpClient: httpClient)
             .authoredPullRequests(login: "octocat", token: "token")
 
-        XCTAssertEqual(pullRequests, [])
+        XCTAssertEqual(collection, GitHubPullRequestCollection(pullRequests: [], totalCount: 0))
     }
 
     func testAuthoredPullRequestsRejectsUnsafeLoginAndMalformedItems() async throws {
@@ -154,7 +156,7 @@ final class GitHubAPITests: XCTestCase {
 
         let malformedClient = MockHTTPClient(responses: [
             .success(
-                #"{"items":[{"id":1,"number":1,"title":"PR","updated_at":"2026-08-01T12:00:00Z","html_url":"http://example.com/pr/1","repository_url":"https://api.github.com/repos/HemSoft/Buddy"}]}"#,
+                #"{"total_count":1,"items":[{"id":1,"number":1,"title":"PR","updated_at":"2026-08-01T12:00:00Z","html_url":"http://example.com/pr/1","repository_url":"https://api.github.com/repos/HemSoft/Buddy"}]}"#,
                 statusCode: 200
             ),
         ])

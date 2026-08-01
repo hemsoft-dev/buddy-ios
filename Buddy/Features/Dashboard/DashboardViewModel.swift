@@ -2,7 +2,7 @@ import Foundation
 import Observation
 
 protocol GitHubPullRequestProviding: Sendable {
-    func authoredPullRequests(for account: GitHubAccount) async throws -> [GitHubPullRequest]
+    func authoredPullRequests(for account: GitHubAccount) async throws -> GitHubPullRequestCollection
 }
 
 extension GitHubIntegration: GitHubPullRequestProviding {}
@@ -65,10 +65,6 @@ enum GitHubPullRequestDashboardState: Equatable, Sendable {
         }
     }
 
-    var isRefreshing: Bool {
-        if case .refreshing = self { return true }
-        return false
-    }
 }
 
 @MainActor
@@ -78,11 +74,14 @@ final class DashboardViewModel {
     private(set) var isRefreshing = false
     private(set) var lastUpdated: Date?
     private(set) var githubState = GitHubPullRequestDashboardState.loading
+    private(set) var githubTotalCount = 0
+    private(set) var isGitHubRefreshInFlight = false
 
     private let integrations: [any IntegrationProviding]
     private let github: any GitHubPullRequestProviding
     private let now: @MainActor @Sendable () -> Date
     private var githubAccountID: Int?
+    private var githubRefreshGeneration = 0
 
     init(
         integrations: [any IntegrationProviding],
@@ -97,13 +96,23 @@ final class DashboardViewModel {
 
     @discardableResult
     func refresh(account: GitHubAccount) async -> GitHubPullRequestFailure? {
-        if githubAccountID != account.id {
+        let accountChanged = githubAccountID != account.id
+        if accountChanged {
             githubAccountID = account.id
             githubState = .loading
+            githubTotalCount = 0
         }
-        guard !githubState.isRefreshing else { return nil }
+        guard !isGitHubRefreshInFlight || accountChanged else { return nil }
 
         let requestedAccountID = account.id
+        githubRefreshGeneration &+= 1
+        let refreshGeneration = githubRefreshGeneration
+        isGitHubRefreshInFlight = true
+        defer {
+            if githubRefreshGeneration == refreshGeneration {
+                isGitHubRefreshInFlight = false
+            }
+        }
         let previousPullRequests = githubState.pullRequests
         let previousRefreshDate = githubState.refreshedAt
         githubState = previousRefreshDate == nil && previousPullRequests.isEmpty
@@ -111,13 +120,19 @@ final class DashboardViewModel {
             : .refreshing(previousPullRequests, refreshedAt: previousRefreshDate)
 
         do {
-            let pullRequests = try await github.authoredPullRequests(for: account)
+            let collection = try await github.authoredPullRequests(for: account)
+            let pullRequests = collection.pullRequests
                 .sorted { $0.updatedAt > $1.updatedAt }
-            guard githubAccountID == requestedAccountID else { return nil }
+            guard githubAccountID == requestedAccountID,
+                  githubRefreshGeneration == refreshGeneration
+            else { return nil }
+            githubTotalCount = collection.totalCount
             githubState = .loaded(pullRequests, refreshedAt: now())
             return nil
         } catch is CancellationError {
-            guard githubAccountID == requestedAccountID else { return nil }
+            guard githubAccountID == requestedAccountID,
+                  githubRefreshGeneration == refreshGeneration
+            else { return nil }
             if let previousRefreshDate {
                 githubState = .loaded(previousPullRequests, refreshedAt: previousRefreshDate)
             } else {
@@ -125,7 +140,9 @@ final class DashboardViewModel {
             }
             return nil
         } catch {
-            guard githubAccountID == requestedAccountID else { return nil }
+            guard githubAccountID == requestedAccountID,
+                  githubRefreshGeneration == refreshGeneration
+            else { return nil }
             let failure = Self.mapGitHubFailure(error)
             githubState = .failed(
                 previousPullRequests,

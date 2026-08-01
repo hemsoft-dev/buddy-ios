@@ -25,6 +25,11 @@ struct GitHubPullRequest: Identifiable, Equatable, Sendable {
     let url: URL
 }
 
+struct GitHubPullRequestCollection: Equatable, Sendable {
+    let pullRequests: [GitHubPullRequest]
+    let totalCount: Int
+}
+
 enum GitHubTokenPollResult: Equatable, Sendable {
     case pending
     case slowDown(interval: Int?)
@@ -35,11 +40,11 @@ protocol GitHubAPIProviding: Sendable {
     func requestDeviceAuthorization(clientID: String) async throws -> GitHubDeviceAuthorization
     func pollForAccessToken(clientID: String, deviceCode: String) async throws -> GitHubTokenPollResult
     func authenticatedUser(token: String) async throws -> GitHubAccount
-    func authoredPullRequests(login: String, token: String) async throws -> [GitHubPullRequest]
+    func authoredPullRequests(login: String, token: String) async throws -> GitHubPullRequestCollection
 }
 
 extension GitHubAPIProviding {
-    func authoredPullRequests(login _: String, token _: String) async throws -> [GitHubPullRequest] {
+    func authoredPullRequests(login _: String, token _: String) async throws -> GitHubPullRequestCollection {
         throw GitHubAPIError.malformedResponse
     }
 }
@@ -162,7 +167,7 @@ struct GitHubAPI: GitHubAPIProviding {
 
     /// Returns the 50 most recently active open pull requests authored by `login`.
     /// This intentionally bounded first page keeps the initial dashboard request predictable.
-    func authoredPullRequests(login: String, token: String) async throws -> [GitHubPullRequest] {
+    func authoredPullRequests(login: String, token: String) async throws -> GitHubPullRequestCollection {
         guard isValidLogin(login),
               var components = URLComponents(string: "https://api.github.com/search/issues")
         else {
@@ -217,10 +222,17 @@ struct GitHubAPI: GitHubAPIProviding {
             )
         }
 
-        return pullRequests
+        let boundedPullRequests = pullRequests
             .sorted { $0.updatedAt > $1.updatedAt }
             .prefix(50)
             .map { $0 }
+        guard response.totalCount >= boundedPullRequests.count else {
+            throw GitHubAPIError.malformedResponse
+        }
+        return GitHubPullRequestCollection(
+            pullRequests: boundedPullRequests,
+            totalCount: response.totalCount
+        )
     }
 
     private func formRequest(url urlString: String, fields: [String: String]) throws -> URLRequest {
@@ -366,7 +378,13 @@ private struct UserResponse: Decodable {
 }
 
 private struct PullRequestSearchResponse: Decodable {
+    let totalCount: Int
     let items: [PullRequestSearchItem]
+
+    enum CodingKeys: String, CodingKey {
+        case totalCount = "total_count"
+        case items
+    }
 }
 
 private struct PullRequestSearchItem: Decodable {

@@ -53,7 +53,11 @@ final class GitHubIntegrationTests: XCTestCase {
             updatedAt: Date(timeIntervalSince1970: 1_000),
             url: URL(string: "https://github.com/HemSoft/Buddy/pull/9")!
         )
-        let api = StubGitHubAPI(pullRequestResults: [.success([pullRequest])])
+        let expectedCollection = GitHubPullRequestCollection(
+            pullRequests: [pullRequest],
+            totalCount: 1
+        )
+        let api = StubGitHubAPI(pullRequestResults: [.success(expectedCollection)])
         let integration = GitHubIntegration(
             clientID: "client-id",
             api: api,
@@ -61,9 +65,9 @@ final class GitHubIntegrationTests: XCTestCase {
         )
         let account = GitHubAccount(id: 7, login: "franz", name: nil, avatarURL: nil)
 
-        let pullRequests = try await integration.authoredPullRequests(for: account)
+        let collection = try await integration.authoredPullRequests(for: account)
 
-        XCTAssertEqual(pullRequests, [pullRequest])
+        XCTAssertEqual(collection, expectedCollection)
         let requests = await api.pullRequestRequests()
         XCTAssertEqual(requests, [PullRequestRequest(login: "franz", token: "stored-token")])
     }
@@ -960,7 +964,7 @@ private actor StubGitHubAPI: GitHubAPIProviding {
     private var deviceResults: [Result<GitHubDeviceAuthorization, GitHubAPIError>]
     private var pollResults: [Result<GitHubTokenPollResult, GitHubAPIError>]
     private var userResults: [Result<GitHubAccount, GitHubAPIError>]
-    private var pullRequestResults: [Result<[GitHubPullRequest], GitHubAPIError>]
+    private var pullRequestResults: [Result<GitHubPullRequestCollection, GitHubAPIError>]
     private var capturedUserTokens: [String] = []
     private var capturedPullRequestRequests: [PullRequestRequest] = []
     private var capturedDeviceRequestCount = 0
@@ -970,7 +974,7 @@ private actor StubGitHubAPI: GitHubAPIProviding {
         deviceResults: [Result<GitHubDeviceAuthorization, GitHubAPIError>] = [],
         pollResults: [Result<GitHubTokenPollResult, GitHubAPIError>] = [],
         userResults: [Result<GitHubAccount, GitHubAPIError>] = [],
-        pullRequestResults: [Result<[GitHubPullRequest], GitHubAPIError>] = []
+        pullRequestResults: [Result<GitHubPullRequestCollection, GitHubAPIError>] = []
     ) {
         self.deviceResults = deviceResults
         self.pollResults = pollResults
@@ -993,7 +997,7 @@ private actor StubGitHubAPI: GitHubAPIProviding {
         return try userResults.removeFirst().get()
     }
 
-    func authoredPullRequests(login: String, token: String) throws -> [GitHubPullRequest] {
+    func authoredPullRequests(login: String, token: String) throws -> GitHubPullRequestCollection {
         capturedPullRequestRequests.append(PullRequestRequest(login: login, token: token))
         return try pullRequestResults.removeFirst().get()
     }

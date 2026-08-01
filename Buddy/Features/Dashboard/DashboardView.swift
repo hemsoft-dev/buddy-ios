@@ -32,7 +32,7 @@ struct DashboardView: View {
             .toolbar {
                 if case let .connected(account) = githubViewModel.state {
                     ToolbarItem(placement: .topBarTrailing) {
-                        if viewModel.githubState.isRefreshing {
+                        if viewModel.isGitHubRefreshInFlight {
                             ProgressView()
                                 .accessibilityLabel("Refreshing GitHub pull requests")
                         } else {
@@ -243,7 +243,10 @@ struct DashboardView: View {
 
     private var githubHeaderSummary: String {
         let count = viewModel.githubState.pullRequests.count
-        let result = "\(count) public open pull request\(count == 1 ? "" : "s")"
+        let totalCount = viewModel.githubTotalCount
+        let result = totalCount > count
+            ? "\(count) of \(totalCount) public open pull requests"
+            : "\(count) public open pull request\(count == 1 ? "" : "s")"
         switch viewModel.githubState {
         case .loading:
             return "Loading public pull requests"
