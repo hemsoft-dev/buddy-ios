@@ -8,29 +8,60 @@ description: |
 on:
   pull_request_target:
     types: [labeled, synchronize]
+  labels: [sfl-review]
   roles: all
-
-checkout: false
+  permissions:
+    contents: read
+  steps:
+    - name: Authorize label requester
+      if: github.event.action == 'labeled'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            username: context.actor,
+          });
+          const allowed = new Set(["admin", "maintain", "write"]);
+          if (!allowed.has(data.permission)) {
+            core.setFailed(`Actor ${context.actor} cannot request an SFL review`);
+          }
 
 if: >
   (github.event.action == 'labeled' && github.event.label.name == 'sfl-review') ||
   (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'sfl-review'))
 
+concurrency:
+  group: "gh-aw-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}"
+  cancel-in-progress: true
+
+checkout: false
+
 permissions:
   contents: read
   pull-requests: read
-  copilot-requests: write
+
+models:
+  default-ai-credits-pricing:
+    input: 3
+    output: 15
 
 engine:
   id: copilot
+  env:
+    COPILOT_PROVIDER_BASE_URL: https://openrouter.ai/api/v1
+    COPILOT_PROVIDER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    COPILOT_PROVIDER_TYPE: openai
+    COPILOT_PROVIDER_WIRE_API: responses
+    COPILOT_MODEL: moonshotai/kimi-k3
 
-model: gpt-5.4?effort=high
+model: moonshotai/kimi-k3
 
-network: defaults
-
-concurrency:
-  group: "gh-aw-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref || github.run_id }}-${{ github.event.action == 'synchronize' && 'sfl-review' || github.event.label.name || 'none' }}"
-  cancel-in-progress: true
+network:
+  allowed:
+    - openrouter.ai
 
 tools:
   github:
@@ -39,10 +70,32 @@ tools:
       client-id: ${{ vars.SFL_APP_CLIENT_ID }}
       private-key: ${{ secrets.SFL_APP_PRIVATE_KEY }}
 
+jobs:
+  conclusion:
+    pre-steps:
+      - name: Consume sfl-review label
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                name: "sfl-review",
+              });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+
 safe-outputs:
   github-app:
     client-id: ${{ vars.SFL_APP_CLIENT_ID }}
     private-key: ${{ secrets.SFL_APP_PRIVATE_KEY }}
+  # The generated lock intentionally removes gh-aw's RIGHT-side default so the
+  # agent's explicit `side` input can target either additions or deletions.
   create-pull-request-review-comment:
     max: 20
   submit-pull-request-review:
@@ -52,12 +105,8 @@ safe-outputs:
   create-check-run:
     max: 1
     name: "SFL Reviewer Approval"
-  remove-labels:
-    allowed: [sfl-review]
-    max: 1
-    target: triggering
 ---
-# Deployed from: HemSoft/set-it-free-loop/deployment/workflows/sfl-pr-review.md@380fe0edc7a87cfc7b31233a955b37df0223a3a8
+# Deployed from: HemSoft/set-it-free-loop/deployment/workflows/sfl-pr-review.md@78483bbf7edf0a4f8d3bf2f68e58678da36044ae
 # To upgrade: re-run deploy-workflow.ps1 at the desired SHA
 
 <!-- sfl:
@@ -71,7 +120,7 @@ safe-outputs:
     one inline thread per finding, and an SFL Reviewer Approval check.
   acceptance-criteria:
     - The sfl-review label triggers exactly one current-head review run
-    - The trigger label is removed through App-authenticated safe outputs
+    - The trigger label is consumed after the authorized review completes
     - Security, correctness/reliability, and quality/maintainability are reviewed
     - Every finding is an inline thread classified Critical, High, Medium, or Low
     - The review body reports the run ID, head SHA, verdict, and severity counts
@@ -183,9 +232,4 @@ Create exactly one check run named `SFL Reviewer Approval` with:
 - `summary`: the verdict, head SHA, run ID, and severity counts
 - `conclusion`: the approval-policy result above
 
-After requesting the consolidated review and check run, call `remove-labels`
-for `sfl-review` on the triggering pull request. This must be the final safe
-output request so the label can be applied again for a later re-review.
-
-Do not modify code, branches, or pull request metadata. The only permitted
-label change is removing `sfl-review` through the configured safe output.
+Do not modify code, branches, pull request labels, or pull request metadata.
