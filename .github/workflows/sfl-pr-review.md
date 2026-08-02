@@ -6,10 +6,26 @@ description: |
   consolidated review, and publishes the SFL Reviewer Approval check.
 
 on:
-  label_command:
-    name: sfl-review
-    events: [pull_request]
-    remove_label: true
+  pull_request_target:
+    types: [labeled]
+  labels: [sfl-review]
+  roles: [admin, maintainer, write]
+  permissions:
+    issues: write
+  steps:
+    - name: Consume sfl-review label
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          await github.rest.issues.removeLabel({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.payload.pull_request.number,
+            name: "sfl-review",
+          });
+
+checkout: false
 
 permissions:
   contents: read
