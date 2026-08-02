@@ -9,7 +9,25 @@ on:
   pull_request_target:
     types: [labeled, synchronize]
   labels: [sfl-review]
-  roles: [admin, maintainer, write]
+  roles: all
+  permissions:
+    contents: read
+  steps:
+    - name: Authorize label requester
+      if: github.event.action == 'labeled'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            username: context.actor,
+          });
+          const allowed = new Set(["admin", "maintain", "write"]);
+          if (!allowed.has(data.permission)) {
+            core.setFailed(`Actor ${context.actor} cannot request an SFL review`);
+          }
 
 if: >
   (github.event.action == 'labeled' && github.event.label.name == 'sfl-review') ||
