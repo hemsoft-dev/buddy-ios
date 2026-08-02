@@ -43,6 +43,72 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(capturedTokens, ["stored-token"])
     }
 
+    func testAuthoredPullRequestsUsesStoredTokenWithoutExposingItToDashboardCode() async throws {
+        let pullRequest = GitHubPullRequest(
+            id: 9,
+            repository: "HemSoft/Buddy",
+            number: 9,
+            title: "Dashboard pull requests",
+            isDraft: false,
+            updatedAt: Date(timeIntervalSince1970: 1_000),
+            url: URL(string: "https://github.com/HemSoft/Buddy/pull/9")!
+        )
+        let expectedCollection = GitHubPullRequestCollection(
+            pullRequests: [pullRequest],
+            totalCount: 1
+        )
+        let api = StubGitHubAPI(pullRequestResults: [.success(expectedCollection)])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: MockCredentialStore(initialValue: "stored-token")
+        )
+        let account = GitHubAccount(id: 7, login: "franz", name: nil, avatarURL: nil)
+
+        let collection = try await integration.authoredPullRequests(for: account)
+
+        XCTAssertEqual(collection, expectedCollection)
+        let requests = await api.pullRequestRequests()
+        XCTAssertEqual(requests, [PullRequestRequest(login: "franz", token: "stored-token")])
+    }
+
+    func testUnauthorizedPullRequestRefreshRemovesCredentialAndRequestsRecovery() async throws {
+        let api = StubGitHubAPI(pullRequestResults: [.failure(.unauthorized)])
+        let credentials = MockCredentialStore(initialValue: "revoked-token")
+        let integration = GitHubIntegration(clientID: "client-id", api: api, credentials: credentials)
+        let account = GitHubAccount(id: 7, login: "franz", name: nil, avatarURL: nil)
+
+        do {
+            _ = try await integration.authoredPullRequests(for: account)
+            XCTFail("Expected invalid token")
+        } catch let error as GitHubConnectionError {
+            XCTAssertEqual(error, .invalidToken)
+        }
+
+        let credentialValue = await credentials.stringValue()
+        XCTAssertNil(credentialValue)
+        XCTAssertEqual(integration.summary.connectionState, .needsAttention)
+        XCTAssertEqual(integration.summary.detail, "Authorization expired")
+    }
+
+    func testIncompletePullRequestSearchMapsToRetryableConnectionError() async throws {
+        let api = StubGitHubAPI(pullRequestResults: [.failure(.incompleteResults)])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: MockCredentialStore(initialValue: "stored-token")
+        )
+        let account = GitHubAccount(id: 7, login: "franz", name: nil, avatarURL: nil)
+
+        do {
+            _ = try await integration.authoredPullRequests(for: account)
+            XCTFail("Expected incomplete results error")
+        } catch let error as GitHubConnectionError {
+            XCTAssertEqual(error, .incompleteResults)
+            XCTAssertEqual(error.localizedDescription, "GitHub returned partial search results. Refresh to try again.")
+        }
+    }
+
     func testConcurrentRestoresShareOneValidationResult() async throws {
         let account = GitHubAccount(id: 7, login: "franz", name: nil, avatarURL: nil)
         let api = SequencedSuspendedUserGitHubAPI()
@@ -753,7 +819,7 @@ final class GitHubIntegrationTests: XCTestCase {
         let connectedPresentation = await MainActor.run {
             DashboardPresentation(githubState: viewModel.state)
         }
-        XCTAssertEqual(connectedPresentation, .connected)
+        XCTAssertEqual(connectedPresentation, .connected(account))
 
         await viewModel.disconnect()
         let disconnectedPresentation = await MainActor.run {
@@ -907,22 +973,31 @@ private let testAuthorization = GitHubDeviceAuthorization(
     interval: 5
 )
 
+private struct PullRequestRequest: Equatable, Sendable {
+    let login: String
+    let token: String
+}
+
 private actor StubGitHubAPI: GitHubAPIProviding {
     private var deviceResults: [Result<GitHubDeviceAuthorization, GitHubAPIError>]
     private var pollResults: [Result<GitHubTokenPollResult, GitHubAPIError>]
     private var userResults: [Result<GitHubAccount, GitHubAPIError>]
+    private var pullRequestResults: [Result<GitHubPullRequestCollection, GitHubAPIError>]
     private var capturedUserTokens: [String] = []
+    private var capturedPullRequestRequests: [PullRequestRequest] = []
     private var capturedDeviceRequestCount = 0
     private var capturedPollRequestCount = 0
 
     init(
         deviceResults: [Result<GitHubDeviceAuthorization, GitHubAPIError>] = [],
         pollResults: [Result<GitHubTokenPollResult, GitHubAPIError>] = [],
-        userResults: [Result<GitHubAccount, GitHubAPIError>] = []
+        userResults: [Result<GitHubAccount, GitHubAPIError>] = [],
+        pullRequestResults: [Result<GitHubPullRequestCollection, GitHubAPIError>] = []
     ) {
         self.deviceResults = deviceResults
         self.pollResults = pollResults
         self.userResults = userResults
+        self.pullRequestResults = pullRequestResults
     }
 
     func requestDeviceAuthorization(clientID: String) throws -> GitHubDeviceAuthorization {
@@ -940,8 +1015,17 @@ private actor StubGitHubAPI: GitHubAPIProviding {
         return try userResults.removeFirst().get()
     }
 
+    func authoredPullRequests(login: String, token: String) throws -> GitHubPullRequestCollection {
+        capturedPullRequestRequests.append(PullRequestRequest(login: login, token: token))
+        return try pullRequestResults.removeFirst().get()
+    }
+
     func userTokens() -> [String] {
         capturedUserTokens
+    }
+
+    func pullRequestRequests() -> [PullRequestRequest] {
+        capturedPullRequestRequests
     }
 
     func deviceRequestCount() -> Int {
