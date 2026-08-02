@@ -7,23 +7,17 @@ description: |
 
 on:
   pull_request_target:
-    types: [labeled]
+    types: [labeled, synchronize]
   labels: [sfl-review]
   roles: [admin, maintainer, write]
-  permissions:
-    issues: write
-  steps:
-    - name: Consume sfl-review label
-      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-      with:
-        github-token: ${{ secrets.GITHUB_TOKEN }}
-        script: |
-          await github.rest.issues.removeLabel({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            issue_number: context.payload.pull_request.number,
-            name: "sfl-review",
-          });
+
+if: >
+  (github.event.action == 'labeled' && github.event.label.name == 'sfl-review') ||
+  (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'sfl-review'))
+
+concurrency:
+  group: "gh-aw-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}"
+  cancel-in-progress: true
 
 checkout: false
 
@@ -58,13 +52,33 @@ tools:
       client-id: ${{ vars.SFL_APP_CLIENT_ID }}
       private-key: ${{ secrets.SFL_APP_PRIVATE_KEY }}
 
+jobs:
+  conclusion:
+    pre-steps:
+      - name: Consume sfl-review label
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                name: "sfl-review",
+              });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+
 safe-outputs:
-  threat-detection: false
   github-app:
     client-id: ${{ vars.SFL_APP_CLIENT_ID }}
     private-key: ${{ secrets.SFL_APP_PRIVATE_KEY }}
+  # The generated lock intentionally removes gh-aw's RIGHT-side default so the
+  # agent's explicit `side` input can target either additions or deletions.
   create-pull-request-review-comment:
-    side: RIGHT
     max: 20
   submit-pull-request-review:
     allowed-events: [APPROVE, REQUEST_CHANGES]
@@ -88,7 +102,7 @@ safe-outputs:
     one inline thread per finding, and an SFL Reviewer Approval check.
   acceptance-criteria:
     - The sfl-review label triggers exactly one current-head review run
-    - The trigger label is consumed during authorized activation
+    - The trigger label is consumed after the authorized review completes
     - Security, correctness/reliability, and quality/maintainability are reviewed
     - Every finding is an inline thread classified Critical, High, Medium, or Low
     - The review body reports the run ID, head SHA, verdict, and severity counts
@@ -140,7 +154,9 @@ Do not report style preferences, speculative concerns, or findings without
 specific evidence from the changed code.
 
 For each finding, call `create-pull-request-review-comment` on the most precise
-changed line. The comment body must begin with one of these exact prefixes:
+changed line. Set `side` to `LEFT` for deleted lines and `RIGHT` for added or
+unchanged context lines. The comment body must begin with one of these exact
+prefixes:
 
 - `**CRITICAL Finding**`
 - `**HIGH Finding**`
