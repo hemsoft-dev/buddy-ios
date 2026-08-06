@@ -660,20 +660,21 @@ final class GitHubIntegrationTests: XCTestCase {
             )
         }
 
+        let view = await MainActor.run {
+            GitHubView(
+                viewModel: viewModel,
+                addedAccountID: account.connectedAccountID
+            )
+        }
         await MainActor.run {
-            viewModel.reconnect(account.connectedAccountID, openURL: openURL)
+            view.connectPresentedAccount(openURL: openURL)
         }
         let pollingStarted = try await waitUntil {
             await api.pollDidStart()
         }
         XCTAssertTrue(pollingStarted)
 
-        let presentationState = await MainActor.run {
-            GitHubView(
-                viewModel: viewModel,
-                addedAccountID: account.connectedAccountID
-            ).presentationState
-        }
+        let presentationState = await MainActor.run { view.presentationState }
         XCTAssertEqual(presentationState, .authorizing(testAuthorization))
 
         await api.finishPoll()
@@ -2107,6 +2108,43 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertTrue(records.isEmpty)
     }
 
+    func testDisconnectWhileAccountWriteIsDelayedRemovesOrphanedMetadata() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let credentials = MockCredentialStore()
+        let accountStore = SuspendedSuccessfulUpsertConnectedAccountStore()
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(
+                deviceResults: [.success(testAuthorization)],
+                pollResults: [.success(.authorized(token: "new-token"))],
+                userResults: [.success(account)]
+            ),
+            credentials: credentials,
+            accountStore: accountStore,
+            sleep: { _ in }
+        )
+        let authorization = try await integration.beginAccountAuthorization()
+        let completion = Task {
+            try await integration.completeAccountAuthorization(authorization)
+        }
+        await accountStore.waitUntilUpsertBegins()
+
+        try await integration.disconnect(accountID: account.connectedAccountID)
+        await accountStore.finishUpsert()
+
+        do {
+            _ = try await completion.value
+            XCTFail("Expected disconnect to supersede the delayed account write")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let storedToken = await credentials.stringValue(for: credentialAccount)
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertNil(storedToken)
+        XCTAssertTrue(records.isEmpty)
+    }
+
     func testStaleAuthorizationRollbackCannotOverwriteNewerReconnect() async throws {
         let original = GitHubAccount(id: 42, login: "original", name: nil, avatarURL: nil)
         let failedAttempt = GitHubAccount(id: 42, login: "failed-attempt", name: nil, avatarURL: nil)
@@ -2791,6 +2829,67 @@ private actor SuspendedFailingUpsertConnectedAccountStore: ConnectedAccountStori
 
     func waitUntilUpsertBegins() async {
         guard upsertCompletion == nil else { return }
+        await withCheckedContinuation { continuation in
+            upsertStartedWaiter = continuation
+        }
+    }
+
+    func finishUpsert() {
+        upsertCompletion?.resume()
+        upsertCompletion = nil
+    }
+}
+
+private actor SuspendedSuccessfulUpsertConnectedAccountStore: ConnectedAccountStoring {
+    private var records: [ConnectedAccountRecord] = []
+    private var upsertIsSuspended = false
+    private var upsertStartedWaiter: CheckedContinuation<Void, Never>?
+    private var upsertCompletion: CheckedContinuation<Void, Never>?
+
+    func accounts(for provider: IntegrationProvider) -> [ConnectedAccountRecord] {
+        records.filter { $0.id.provider == provider }.sorted { $0.id < $1.id }
+    }
+
+    func upsert(_ account: ConnectedAccountRecord) async {
+        upsertIsSuspended = true
+        upsertStartedWaiter?.resume()
+        upsertStartedWaiter = nil
+        await withCheckedContinuation { continuation in
+            upsertCompletion = continuation
+        }
+        records.removeAll { $0.id == account.id }
+        records.append(account)
+    }
+
+    func upsertIfMissing(_ account: ConnectedAccountRecord) -> Bool {
+        guard !records.contains(where: { $0.id == account.id }) else { return false }
+        records.append(account)
+        return true
+    }
+
+    func replace(
+        _ expected: ConnectedAccountRecord,
+        with replacement: ConnectedAccountRecord?
+    ) -> Bool {
+        guard let index = records.firstIndex(where: { $0.id == expected.id }),
+              records[index] == expected
+        else {
+            return false
+        }
+        if let replacement {
+            records[index] = replacement
+        } else {
+            records.remove(at: index)
+        }
+        return true
+    }
+
+    func remove(_ id: ConnectedAccountID) {
+        records.removeAll { $0.id == id }
+    }
+
+    func waitUntilUpsertBegins() async {
+        guard !upsertIsSuspended else { return }
         await withCheckedContinuation { continuation in
             upsertStartedWaiter = continuation
         }

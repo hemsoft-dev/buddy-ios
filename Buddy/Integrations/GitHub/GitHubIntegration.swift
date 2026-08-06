@@ -321,6 +321,12 @@ actor GitHubIntegration: IntegrationProviding {
                                 for: credentialAccount,
                                 ifMatches: writtenToken
                             )
+                            if accountMutationIntents[accountID] == .disconnect {
+                                _ = try? await accountStore.replace(
+                                    account.connectedAccountRecord,
+                                    with: nil
+                                )
+                            }
                         }
                         throw GitHubConnectionError.credentialStorage
                     }
@@ -343,6 +349,12 @@ actor GitHubIntegration: IntegrationProviding {
                                 for: credentialAccount,
                                 ifMatches: writtenToken
                             )
+                            if accountMutationIntents[accountID] == .disconnect {
+                                _ = try? await accountStore.replace(
+                                    account.connectedAccountRecord,
+                                    with: nil
+                                )
+                            }
                         }
                         throw CancellationError()
                     }

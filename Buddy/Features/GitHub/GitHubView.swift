@@ -79,11 +79,7 @@ struct GitHubView: View {
             Text("Authorize Buddy to read your public GitHub identity. Your access token stays in this device's Keychain.")
         } actions: {
             Button("Connect GitHub") {
-                if let accountID {
-                    viewModel.reconnect(accountID, openURL: openURL)
-                } else {
-                    viewModel.addAccount(openURL: openURL) { addedAccountID = $0 }
-                }
+                connectPresentedAccount(openURL: openURL)
             }
             .buttonStyle(.borderedProminent)
         }
@@ -91,6 +87,15 @@ struct GitHubView: View {
 
     private var presentedAccountID: ConnectedAccountID? {
         accountID ?? addedAccountID
+    }
+
+    @MainActor
+    func connectPresentedAccount(openURL: OpenURLAction) {
+        if let presentedAccountID {
+            viewModel.reconnect(presentedAccountID, openURL: openURL)
+        } else {
+            viewModel.addAccount(openURL: openURL) { addedAccountID = $0 }
+        }
     }
 
     private func authorizingContent(_ authorization: GitHubDeviceAuthorization) -> some View {
