@@ -1,7 +1,7 @@
 import Foundation
 import Security
 
-actor KeychainStore {
+actor KeychainStore: CredentialStoring {
     private let service: String
 
     init(service: String = Bundle.main.bundleIdentifier ?? "com.hemsoft.buddy") {
@@ -23,6 +23,13 @@ actor KeychainStore {
         } else if status != errSecSuccess {
             throw KeychainError.unhandledStatus(status)
         }
+    }
+
+    /// Atomically restores a credential only when no newer value exists.
+    func setIfMissing(_ data: Data, for account: String) throws -> Bool {
+        guard try self.data(for: account) == nil else { return false }
+        try set(data, for: account)
+        return true
     }
 
     func data(for account: String) throws -> Data? {
@@ -49,6 +56,28 @@ actor KeychainStore {
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw KeychainError.unhandledStatus(status)
         }
+    }
+
+    /// Atomically compares and removes within this actor so a concurrent reconnect
+    /// cannot have its replacement credential deleted by a stale request.
+    func removeData(for account: String, ifMatches expectedData: Data) throws -> Bool {
+        guard try data(for: account) == expectedData else { return false }
+        try removeData(for: account)
+        return true
+    }
+
+    func replaceData(
+        for account: String,
+        ifMatches expectedData: Data,
+        with replacementData: Data?
+    ) throws -> Bool {
+        guard try data(for: account) == expectedData else { return false }
+        if let replacementData {
+            try set(replacementData, for: account)
+        } else {
+            try removeData(for: account)
+        }
+        return true
     }
 
     private func baseQuery(for account: String) -> [String: Any] {

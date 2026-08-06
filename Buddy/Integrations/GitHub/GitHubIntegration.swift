@@ -3,14 +3,71 @@ import SwiftUI
 
 protocol CredentialStoring: Sendable {
     func set(_ data: Data, for account: String) async throws
+    func setIfMissing(_ data: Data, for account: String) async throws -> Bool
     func data(for account: String) async throws -> Data?
     func removeData(for account: String) async throws
+    func removeData(for account: String, ifMatches expectedData: Data) async throws -> Bool
+    func replaceData(
+        for account: String,
+        ifMatches expectedData: Data,
+        with replacementData: Data?
+    ) async throws -> Bool
 }
 
-extension KeychainStore: CredentialStoring {}
+extension CredentialStoring {
+    func setIfMissing(_ data: Data, for account: String) async throws -> Bool {
+        guard try await self.data(for: account) == nil else { return false }
+        try await set(data, for: account)
+        return true
+    }
+
+    func removeData(for account: String, ifMatches expectedData: Data) async throws -> Bool {
+        guard try await data(for: account) == expectedData else { return false }
+        try await removeData(for: account)
+        return true
+    }
+
+    func replaceData(
+        for account: String,
+        ifMatches expectedData: Data,
+        with replacementData: Data?
+    ) async throws -> Bool {
+        guard try await data(for: account) == expectedData else { return false }
+        if let replacementData {
+            try await set(replacementData, for: account)
+        } else {
+            try await removeData(for: account)
+        }
+        return true
+    }
+}
 
 actor GitHubIntegration: IntegrationProviding {
+    private enum AccountMutationIntent: Sendable {
+        case reconnect
+        case disconnect
+    }
+    private struct AccountAuthorizationSession: Sendable {
+        let targetID: ConnectedAccountID?
+        let targetGeneration: Int?
+        let generationSnapshot: [ConnectedAccountID: Int]
+    }
+
+    private enum LegacyCredentialState: Sendable {
+        case unknown(Data)
+        case owned(Data, ConnectedAccountID)
+    }
+
+    private struct LegacyMigrationResult: Sendable {
+        let record: ConnectedAccountRecord
+        let requiresScopedValidation: Bool
+    }
+
     private static let credentialAccount = "github.oauth-token"
+
+    static func credentialAccount(for id: ConnectedAccountID) -> String {
+        "github.account.\(id.subject).oauth-token"
+    }
 
     nonisolated var summary: IntegrationSummary { summaryStorage.value }
     nonisolated let isAuthorizationConfigured: Bool
@@ -18,6 +75,7 @@ actor GitHubIntegration: IntegrationProviding {
     private let clientID: String?
     private let api: any GitHubAPIProviding
     private let credentials: any CredentialStoring
+    private let accountStore: any ConnectedAccountStoring
     private let sleep: @Sendable (Duration) async throws -> Void
     private let summaryStorage: LockedGitHubSummary
     private var authorizationGeneration = 0
@@ -30,11 +88,16 @@ actor GitHubIntegration: IntegrationProviding {
     private var cleanupSequence = 0
     private var activeCredentialCleanup: (id: Int, task: Task<Void, Error>)?
     private var activeDeviceCode: String?
+    private var accountAuthorizations: [String: AccountAuthorizationSession] = [:]
+    private var accountGenerations: [ConnectedAccountID: Int] = [:]
+    private var accountMutationIntents: [ConnectedAccountID: AccountMutationIntent] = [:]
+    private var legacyCredentialState: LegacyCredentialState?
 
     init(
         clientID: String? = AppConfiguration.current.githubClientID,
         api: (any GitHubAPIProviding)? = nil,
         credentials: any CredentialStoring = KeychainStore(),
+        accountStore: (any ConnectedAccountStoring)? = nil,
         sleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
             try await Task.sleep(for: duration)
         }
@@ -43,6 +106,13 @@ actor GitHubIntegration: IntegrationProviding {
         isAuthorizationConfigured = clientID != nil
         self.api = api ?? GitHubAPI()
         self.credentials = credentials
+        if let accountStore {
+            self.accountStore = accountStore
+        } else if credentials is KeychainStore {
+            self.accountStore = UserDefaultsConnectedAccountStore()
+        } else {
+            self.accountStore = InMemoryConnectedAccountStore()
+        }
         self.sleep = sleep
         summaryStorage = LockedGitHubSummary(
             IntegrationSummary(
@@ -57,8 +127,677 @@ actor GitHubIntegration: IntegrationProviding {
     }
 
     func refresh() async throws -> IntegrationSummary {
-        _ = try await restoreAccount()
+        _ = try await restoreAccounts()
         return summary
+    }
+
+    func restoreAccounts() async throws -> [GitHubAccountConnection] {
+        var records: [ConnectedAccountRecord]
+        do {
+            records = try await accountStore.accounts(for: .github)
+        } catch {
+            throw GitHubConnectionError.accountStorage
+        }
+
+        let migrated: LegacyMigrationResult?
+        do {
+            migrated = try await migrateLegacyCredential()
+        } catch {
+            guard !records.isEmpty else { throw error }
+            migrated = nil
+        }
+        if let migrated {
+            records.removeAll { $0.id == migrated.record.id }
+        }
+
+        var connections: [GitHubAccountConnection] = []
+        var connectionGenerations: [ConnectedAccountID: Int] = [:]
+        if let migrated {
+            if migrated.requiresScopedValidation {
+                if let connection = await restoreRegisteredAccount(migrated.record) {
+                    connections.append(connection)
+                    connectionGenerations[connection.id] = accountGenerations[connection.id, default: 0]
+                }
+            } else {
+                let connection = GitHubAccountConnection(
+                    account: GitHubAccount(record: migrated.record),
+                    state: .connected
+                )
+                connections.append(connection)
+                connectionGenerations[connection.id] = accountGenerations[connection.id, default: 0]
+            }
+        }
+        for record in records.sorted(by: { $0.id < $1.id }) {
+            if let connection = await restoreRegisteredAccount(record) {
+                connections.append(connection)
+                connectionGenerations[connection.id] = accountGenerations[connection.id, default: 0]
+            }
+        }
+        connections.removeAll { connection in
+            connectionGenerations[connection.id] != accountGenerations[connection.id, default: 0]
+        }
+        connections.sort { $0.id < $1.id }
+
+        if connections.isEmpty {
+            updateSummary(detail: "Ready to connect", state: .disconnected)
+        } else if let firstConnected = connections.first(where: { $0.state == .connected }) {
+            updateSummary(detail: "@\(firstConnected.account.login)", state: .connected)
+        } else {
+            updateSummary(detail: "One or more accounts need attention", state: .needsAttention)
+        }
+        return connections
+    }
+
+    func beginAccountAuthorization(
+        reconnecting id: ConnectedAccountID? = nil
+    ) async throws -> GitHubDeviceAuthorization {
+        guard let clientID else { throw GitHubConnectionError.missingClientID }
+        let generationSnapshot = accountGenerations
+        let targetGeneration = id.map { id in
+            accountGenerations[id, default: 0] &+= 1
+            accountMutationIntents[id] = .reconnect
+            return accountGenerations[id, default: 0]
+        }
+        do {
+            let authorization = try await api.requestDeviceAuthorization(clientID: clientID)
+            if let id,
+               accountGenerations[id, default: 0] != targetGeneration {
+                throw CancellationError()
+            }
+            accountAuthorizations[authorization.deviceCode] = AccountAuthorizationSession(
+                targetID: id,
+                targetGeneration: targetGeneration,
+                generationSnapshot: generationSnapshot
+            )
+            return authorization
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw map(error)
+        }
+    }
+
+    func completeAccountAuthorization(
+        _ authorization: GitHubDeviceAuthorization
+    ) async throws -> GitHubAccountConnection {
+        guard let clientID else { throw GitHubConnectionError.missingClientID }
+        guard let session = accountAuthorizations[authorization.deviceCode] else {
+            throw CancellationError()
+        }
+        let targetID = session.targetID
+        let targetGeneration = session.targetGeneration
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(authorization.expiresIn)
+        var interval = authorization.interval
+
+        do {
+            while clock.now < deadline {
+                try Task.checkCancellation()
+                try await sleep(min(.seconds(interval), clock.now.duration(to: deadline)))
+                guard accountAuthorizations.keys.contains(authorization.deviceCode) else {
+                    throw CancellationError()
+                }
+                guard clock.now < deadline else { throw GitHubConnectionError.requestExpired }
+
+                switch try await api.pollForAccessToken(
+                    clientID: clientID,
+                    deviceCode: authorization.deviceCode
+                ) {
+                case .pending:
+                    continue
+                case let .slowDown(serverInterval):
+                    interval = max(interval + 5, serverInterval ?? 0)
+                case let .authorized(token):
+                    let account = try await api.authenticatedUser(token: token)
+                    let accountID = account.connectedAccountID
+                    if let targetID, targetID != accountID {
+                        throw GitHubConnectionError.accountMismatch
+                    }
+                    if let targetID,
+                       accountGenerations[targetID, default: 0] != targetGeneration {
+                        throw CancellationError()
+                    }
+                    if targetID == nil,
+                       accountGenerations[accountID, default: 0]
+                        != session.generationSnapshot[accountID, default: 0] {
+                        throw CancellationError()
+                    }
+                    guard accountAuthorizations.keys.contains(authorization.deviceCode) else {
+                        throw CancellationError()
+                    }
+
+                    accountGenerations[accountID, default: 0] &+= 1
+                    accountMutationIntents[accountID] = .reconnect
+                    let accountGeneration = accountGenerations[accountID, default: 0]
+                    let credentialAccount = Self.credentialAccount(for: accountID)
+                    let previousToken: Data?
+                    let previousRecord: ConnectedAccountRecord?
+                    do {
+                        previousToken = try await credentials.data(for: credentialAccount)
+                        previousRecord = try await accountStore.accounts(for: .github)
+                            .first { $0.id == accountID }
+                    } catch {
+                        throw GitHubConnectionError.credentialStorage
+                    }
+                    guard !Task.isCancelled,
+                          accountAuthorizations.keys.contains(authorization.deviceCode),
+                          accountGenerations[accountID, default: 0] == accountGeneration
+                    else {
+                        throw CancellationError()
+                    }
+
+                    let writtenToken = Data(token.utf8)
+                    do {
+                        try await credentials.set(writtenToken, for: credentialAccount)
+                        guard !Task.isCancelled,
+                              accountAuthorizations.keys.contains(authorization.deviceCode),
+                              accountGenerations[accountID, default: 0] == accountGeneration
+                        else {
+                            if accountGenerations[accountID, default: 0] == accountGeneration {
+                                await rollbackAccountWrite(
+                                    id: accountID,
+                                    previousToken: previousToken,
+                                    previousRecord: previousRecord,
+                                    writtenToken: writtenToken,
+                                    writtenRecord: account.connectedAccountRecord,
+                                    generation: accountGeneration
+                                )
+                            } else {
+                                _ = try? await credentials.removeData(
+                                    for: credentialAccount,
+                                    ifMatches: writtenToken
+                                )
+                            }
+                            throw CancellationError()
+                        }
+                        try await accountStore.upsert(account.connectedAccountRecord)
+                    } catch {
+                        if error is CancellationError { throw error }
+                        if accountGenerations[accountID, default: 0] == accountGeneration {
+                            await rollbackAccountWrite(
+                                id: accountID,
+                                previousToken: previousToken,
+                                previousRecord: previousRecord,
+                                writtenToken: writtenToken,
+                                writtenRecord: account.connectedAccountRecord,
+                                generation: accountGeneration
+                            )
+                        } else {
+                            await discardSupersededAccountWrite(
+                                id: accountID,
+                                previousRecord: previousRecord,
+                                writtenToken: writtenToken,
+                                writtenRecord: account.connectedAccountRecord
+                            )
+                        }
+                        throw GitHubConnectionError.credentialStorage
+                    }
+
+                    guard !Task.isCancelled,
+                          accountAuthorizations.keys.contains(authorization.deviceCode),
+                          accountGenerations[accountID, default: 0] == accountGeneration
+                    else {
+                        if accountGenerations[accountID, default: 0] == accountGeneration {
+                            await rollbackAccountWrite(
+                                id: accountID,
+                                previousToken: previousToken,
+                                previousRecord: previousRecord,
+                                writtenToken: writtenToken,
+                                writtenRecord: account.connectedAccountRecord,
+                                generation: accountGeneration
+                            )
+                        } else {
+                            await discardSupersededAccountWrite(
+                                id: accountID,
+                                previousRecord: previousRecord,
+                                writtenToken: writtenToken,
+                                writtenRecord: account.connectedAccountRecord
+                            )
+                        }
+                        throw CancellationError()
+                    }
+                    accountAuthorizations.removeValue(forKey: authorization.deviceCode)
+                    return GitHubAccountConnection(account: account, state: .connected)
+                }
+            }
+            throw GitHubConnectionError.requestExpired
+        } catch is CancellationError {
+            accountAuthorizations.removeValue(forKey: authorization.deviceCode)
+            throw CancellationError()
+        } catch {
+            accountAuthorizations.removeValue(forKey: authorization.deviceCode)
+            throw map(error)
+        }
+    }
+
+    func cancelAccountAuthorization(_ authorization: GitHubDeviceAuthorization) {
+        accountAuthorizations.removeValue(forKey: authorization.deviceCode)
+    }
+
+    func disconnect(accountID: ConnectedAccountID) async throws {
+        accountGenerations[accountID, default: 0] &+= 1
+        accountMutationIntents[accountID] = .disconnect
+        let generation = accountGenerations[accountID, default: 0]
+        accountAuthorizations = accountAuthorizations.filter { $0.value.targetID != accountID }
+        var previousRecord: ConnectedAccountRecord?
+        var tokenData: Data?
+        let credentialAccount = Self.credentialAccount(for: accountID)
+        do {
+            // Preserve a legacy item whose transient validation has not identified its
+            // owner, or whose known owner is a different account.
+            try await removeLegacyCredentialIfOwned(by: accountID)
+            guard generation == accountGenerations[accountID, default: 0] else {
+                throw CancellationError()
+            }
+
+            previousRecord = try await accountStore.accounts(for: .github)
+                .first { $0.id == accountID }
+            tokenData = try await credentials.data(for: credentialAccount)
+            guard generation == accountGenerations[accountID, default: 0] else {
+                throw CancellationError()
+            }
+
+            // Remove metadata before the scoped token. If a reconnect supersedes this
+            // operation, rollback only fills values that its newer write did not replace.
+            try await accountStore.remove(accountID)
+            guard generation == accountGenerations[accountID, default: 0] else {
+                await restoreDisconnectedAccount(
+                    accountID: accountID,
+                    record: previousRecord,
+                    tokenData: tokenData,
+                    credentialAccount: credentialAccount,
+                    generation: generation
+                )
+                throw CancellationError()
+            }
+
+            if let tokenData {
+                let removed = try await credentials.removeData(
+                    for: credentialAccount,
+                    ifMatches: tokenData
+                )
+                guard removed else {
+                    await restoreDisconnectedAccount(
+                        accountID: accountID,
+                        record: previousRecord,
+                        tokenData: tokenData,
+                        credentialAccount: credentialAccount,
+                        generation: generation
+                    )
+                    if generation != accountGenerations[accountID, default: 0] {
+                        throw CancellationError()
+                    }
+                    throw GitHubConnectionError.credentialStorage
+                }
+            }
+            guard generation == accountGenerations[accountID, default: 0] else {
+                await restoreDisconnectedAccount(
+                    accountID: accountID,
+                    record: previousRecord,
+                    tokenData: tokenData,
+                    credentialAccount: credentialAccount,
+                    generation: generation
+                )
+                throw CancellationError()
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            await restoreDisconnectedAccount(
+                accountID: accountID,
+                record: previousRecord,
+                tokenData: tokenData,
+                credentialAccount: credentialAccount,
+                generation: generation
+            )
+            throw GitHubConnectionError.credentialStorage
+        }
+    }
+
+    private func restoreDisconnectedAccount(
+        accountID: ConnectedAccountID,
+        record: ConnectedAccountRecord?,
+        tokenData: Data?,
+        credentialAccount: String,
+        generation: Int
+    ) async {
+        guard shouldRestoreDisconnectedAccount(accountID, generation: generation) else { return }
+        if let record {
+            _ = try? await accountStore.upsertIfMissing(record)
+        }
+        guard shouldRestoreDisconnectedAccount(accountID, generation: generation) else { return }
+        if let tokenData {
+            _ = try? await credentials.setIfMissing(tokenData, for: credentialAccount)
+        }
+    }
+
+    private func shouldRestoreDisconnectedAccount(
+        _ accountID: ConnectedAccountID,
+        generation: Int
+    ) -> Bool {
+        generation == accountGenerations[accountID, default: 0]
+            || accountMutationIntents[accountID] == .reconnect
+    }
+
+    private func rollbackAccountWrite(
+        id: ConnectedAccountID,
+        previousToken: Data?,
+        previousRecord: ConnectedAccountRecord?,
+        writtenToken: Data,
+        writtenRecord: ConnectedAccountRecord,
+        generation: Int
+    ) async {
+        let credentialAccount = Self.credentialAccount(for: id)
+        _ = try? await credentials.replaceData(
+            for: credentialAccount,
+            ifMatches: writtenToken,
+            with: previousToken
+        )
+        guard generation == accountGenerations[id, default: 0] else { return }
+        _ = try? await accountStore.replace(writtenRecord, with: previousRecord)
+    }
+
+    private func discardSupersededAccountWrite(
+        id: ConnectedAccountID,
+        previousRecord: ConnectedAccountRecord?,
+        writtenToken: Data,
+        writtenRecord: ConnectedAccountRecord
+    ) async {
+        let credentialAccount = Self.credentialAccount(for: id)
+        let removedWrittenToken: Bool
+        do {
+            removedWrittenToken = try await credentials.removeData(
+                for: credentialAccount,
+                ifMatches: writtenToken
+            )
+        } catch {
+            // If Keychain cleanup fails, preserve recoverable metadata rather than
+            // leaving an invisible credential that the user cannot retry or remove.
+            _ = try? await accountStore.upsertIfMissing(writtenRecord)
+            return
+        }
+        if accountMutationIntents[id] == .disconnect {
+            _ = try? await accountStore.replace(writtenRecord, with: nil)
+            return
+        }
+        guard removedWrittenToken else { return }
+        _ = try? await accountStore.replace(writtenRecord, with: previousRecord)
+    }
+
+    private func removeLegacyCredentialIfOwned(
+        by accountID: ConnectedAccountID
+    ) async throws {
+        guard let legacyData = try await credentials.data(for: Self.credentialAccount) else {
+            legacyCredentialState = nil
+            return
+        }
+        switch legacyCredentialState {
+        case let .unknown(pendingData) where pendingData == legacyData:
+            return
+        case let .owned(pendingData, ownerID)
+            where pendingData == legacyData && ownerID != accountID:
+            return
+        default:
+            break
+        }
+        if try await credentials.removeData(
+            for: Self.credentialAccount,
+            ifMatches: legacyData
+        ) {
+            legacyCredentialState = nil
+        }
+    }
+
+    private func removeLegacyCredential(ifMatches legacyData: Data) async throws {
+        if try await credentials.removeData(
+            for: Self.credentialAccount,
+            ifMatches: legacyData
+        ) {
+            legacyCredentialState = nil
+        }
+    }
+
+    private func migrateLegacyCredential() async throws -> LegacyMigrationResult? {
+        let legacyData: Data?
+        do {
+            legacyData = try await credentials.data(for: Self.credentialAccount)
+        } catch {
+            throw GitHubConnectionError.credentialStorage
+        }
+        guard let legacyData else {
+            legacyCredentialState = nil
+            return nil
+        }
+        legacyCredentialState = .unknown(legacyData)
+        guard let token = String(data: legacyData, encoding: .utf8), !token.isEmpty else {
+            do {
+                try await removeLegacyCredential(ifMatches: legacyData)
+            } catch {
+                throw GitHubConnectionError.credentialStorage
+            }
+            return nil
+        }
+
+        let generationSnapshot = accountGenerations
+        let account: GitHubAccount
+        do {
+            account = try await api.authenticatedUser(token: token)
+        } catch GitHubAPIError.unauthorized {
+            do {
+                try await removeLegacyCredential(ifMatches: legacyData)
+            } catch {
+                throw GitHubConnectionError.credentialStorage
+            }
+            return nil
+        } catch {
+            throw map(error)
+        }
+
+        let accountID = account.connectedAccountID
+        legacyCredentialState = .owned(legacyData, accountID)
+        let generation = generationSnapshot[accountID, default: 0]
+        guard generation == accountGenerations[accountID, default: 0] else {
+            if accountMutationIntents[accountID] == .disconnect {
+                try? await removeLegacyCredential(ifMatches: legacyData)
+            }
+            return nil
+        }
+        let scopedCredentialAccount = Self.credentialAccount(for: accountID)
+        let existingRecord: ConnectedAccountRecord?
+        let existingScopedCredential: Data?
+        do {
+            existingRecord = try await accountStore.accounts(for: .github)
+                .first { $0.id == account.connectedAccountID }
+            existingScopedCredential = try await credentials.data(for: scopedCredentialAccount)
+        } catch {
+            throw GitHubConnectionError.credentialStorage
+        }
+        guard generation == accountGenerations[accountID, default: 0] else { return nil }
+
+        // A legacy credential can linger when its earlier cleanup failed. Never let that
+        // stale value overwrite a newer account-scoped reconnect credential.
+        if existingRecord != nil || existingScopedCredential != nil {
+            let record = existingRecord ?? account.connectedAccountRecord
+            if existingRecord == nil {
+                do {
+                    try await accountStore.upsert(record)
+                } catch {
+                    throw GitHubConnectionError.accountStorage
+                }
+                guard generation == accountGenerations[accountID, default: 0] else {
+                    if accountMutationIntents[accountID] == .disconnect {
+                        _ = try? await accountStore.replace(record, with: nil)
+                    }
+                    return nil
+                }
+            }
+            try? await removeLegacyCredential(ifMatches: legacyData)
+            return LegacyMigrationResult(record: record, requiresScopedValidation: true)
+        }
+
+        do {
+            try await credentials.set(
+                legacyData,
+                for: scopedCredentialAccount
+            )
+            guard generation == accountGenerations[accountID, default: 0] else {
+                if accountMutationIntents[accountID] == .disconnect {
+                    _ = try? await credentials.removeData(
+                        for: scopedCredentialAccount,
+                        ifMatches: legacyData
+                    )
+                }
+                return nil
+            }
+            try await accountStore.upsert(account.connectedAccountRecord)
+            guard generation == accountGenerations[accountID, default: 0] else {
+                if accountMutationIntents[accountID] == .disconnect {
+                    _ = try? await credentials.removeData(
+                        for: scopedCredentialAccount,
+                        ifMatches: legacyData
+                    )
+                    _ = try? await accountStore.replace(
+                        account.connectedAccountRecord,
+                        with: nil
+                    )
+                }
+                return nil
+            }
+            try? await removeLegacyCredential(ifMatches: legacyData)
+        } catch {
+            throw GitHubConnectionError.credentialStorage
+        }
+        return LegacyMigrationResult(
+            record: account.connectedAccountRecord,
+            requiresScopedValidation: false
+        )
+    }
+
+    private func restoreRegisteredAccount(
+        _ record: ConnectedAccountRecord
+    ) async -> GitHubAccountConnection? {
+        let generation = accountGenerations[record.id, default: 0]
+        let account = GitHubAccount(record: record)
+        do {
+            let isStillRegistered = try await accountStore.accounts(for: .github)
+                .contains { $0.id == record.id }
+            guard generation == accountGenerations[record.id, default: 0],
+                  isStillRegistered
+            else {
+                return nil
+            }
+        } catch {
+            guard generation == accountGenerations[record.id, default: 0] else { return nil }
+            return GitHubAccountConnection(
+                account: account,
+                state: .needsAttention,
+                message: GitHubConnectionError.accountStorage.localizedDescription,
+                recoveryAction: .validate
+            )
+        }
+        let credentialAccount = Self.credentialAccount(for: record.id)
+        let tokenData: Data?
+        do {
+            tokenData = try await credentials.data(for: credentialAccount)
+        } catch {
+            guard generation == accountGenerations[record.id, default: 0] else { return nil }
+            return GitHubAccountConnection(
+                account: account,
+                state: .needsAttention,
+                message: GitHubConnectionError.credentialStorage.localizedDescription,
+                recoveryAction: .validate
+            )
+        }
+        guard generation == accountGenerations[record.id, default: 0] else { return nil }
+        guard let tokenData,
+              let token = String(data: tokenData, encoding: .utf8),
+              !token.isEmpty
+        else {
+            if let tokenData {
+                let removed: Bool
+                do {
+                    removed = try await credentials.removeData(
+                        for: credentialAccount,
+                        ifMatches: tokenData
+                    )
+                } catch {
+                    guard generation == accountGenerations[record.id, default: 0] else { return nil }
+                    return GitHubAccountConnection(
+                        account: account,
+                        state: .needsAttention,
+                        message: GitHubConnectionError.credentialStorage.localizedDescription,
+                        recoveryAction: .validate
+                    )
+                }
+                guard removed == true else { return nil }
+            }
+            guard generation == accountGenerations[record.id, default: 0] else { return nil }
+            return GitHubAccountConnection(
+                account: account,
+                state: .needsAttention,
+                message: GitHubConnectionError.invalidToken.localizedDescription,
+                recoveryAction: .reconnect
+            )
+        }
+
+        do {
+            let refreshed = try await api.authenticatedUser(token: token)
+            guard generation == accountGenerations[record.id, default: 0] else { return nil }
+            guard refreshed.connectedAccountID == record.id else {
+                return GitHubAccountConnection(
+                    account: account,
+                    state: .needsAttention,
+                    message: GitHubConnectionError.accountMismatch.localizedDescription,
+                    recoveryAction: .reconnect
+                )
+            }
+            let refreshedRecord = refreshed.connectedAccountRecord
+            try? await accountStore.upsert(refreshedRecord)
+            guard generation == accountGenerations[record.id, default: 0] else {
+                if accountMutationIntents[record.id] == .disconnect {
+                    _ = try? await accountStore.replace(refreshedRecord, with: nil)
+                }
+                return nil
+            }
+            return GitHubAccountConnection(account: refreshed, state: .connected)
+        } catch GitHubAPIError.unauthorized {
+            guard generation == accountGenerations[record.id, default: 0] else { return nil }
+            let removed: Bool
+            do {
+                removed = try await credentials.removeData(
+                    for: credentialAccount,
+                    ifMatches: tokenData
+                )
+            } catch {
+                guard generation == accountGenerations[record.id, default: 0] else { return nil }
+                return GitHubAccountConnection(
+                    account: account,
+                    state: .needsAttention,
+                    message: GitHubConnectionError.credentialStorage.localizedDescription,
+                    recoveryAction: .validate
+                )
+            }
+            guard removed == true,
+                  generation == accountGenerations[record.id, default: 0]
+            else {
+                return nil
+            }
+            accountGenerations[record.id, default: 0] &+= 1
+            return GitHubAccountConnection(
+                account: account,
+                state: .needsAttention,
+                message: GitHubConnectionError.invalidToken.localizedDescription,
+                recoveryAction: .reconnect
+            )
+        } catch {
+            guard generation == accountGenerations[record.id, default: 0] else { return nil }
+            return GitHubAccountConnection(
+                account: account,
+                state: .needsAttention,
+                message: map(error).localizedDescription,
+                recoveryAction: .validate
+            )
+        }
     }
 
     func restoreAccount() async throws -> GitHubAccount? {
@@ -118,14 +857,30 @@ actor GitHubIntegration: IntegrationProviding {
         }
 
         let generation = authorizationGeneration
+        let accountID = account.connectedAccountID
+        let accountGeneration = accountGenerations[accountID, default: 0]
         let tokenData: Data?
+        let credentialAccount: String
         do {
-            tokenData = try await credentials.data(for: Self.credentialAccount)
+            let registered = try await accountStore.accounts(for: .github)
+                .contains { $0.id == accountID }
+            if let scopedToken = try await credentials.data(for: Self.credentialAccount(for: accountID)) {
+                tokenData = scopedToken
+                credentialAccount = Self.credentialAccount(for: accountID)
+            } else if !registered {
+                tokenData = try await credentials.data(for: Self.credentialAccount)
+                credentialAccount = Self.credentialAccount
+            } else {
+                tokenData = nil
+                credentialAccount = Self.credentialAccount(for: accountID)
+            }
         } catch {
             throw GitHubConnectionError.credentialStorage
         }
 
-        guard generation == authorizationGeneration else {
+        guard generation == authorizationGeneration,
+              accountGeneration == accountGenerations[accountID, default: 0]
+        else {
             throw CancellationError()
         }
 
@@ -140,24 +895,43 @@ actor GitHubIntegration: IntegrationProviding {
         do {
             let pullRequests = try await api.authoredPullRequests(login: account.login, token: token)
             try Task.checkCancellation()
-            guard generation == authorizationGeneration else {
+            guard generation == authorizationGeneration,
+                  accountGeneration == accountGenerations[accountID, default: 0]
+            else {
                 throw CancellationError()
             }
             return pullRequests
         } catch GitHubAPIError.unauthorized {
-            guard generation == authorizationGeneration else {
+            guard generation == authorizationGeneration,
+                  accountGeneration == accountGenerations[accountID, default: 0]
+            else {
                 throw CancellationError()
             }
-            guard try await removeInvalidCredential(generation: generation) else {
+            let removed: Bool
+            do {
+                removed = try await credentials.removeData(
+                    for: credentialAccount,
+                    ifMatches: tokenData
+                )
+            } catch {
+                throw GitHubConnectionError.credentialStorage
+            }
+            guard generation == authorizationGeneration,
+                  accountGeneration == accountGenerations[accountID, default: 0],
+                  removed
+            else {
                 throw CancellationError()
             }
+            accountGenerations[accountID, default: 0] &+= 1
             updateSummary(detail: "Authorization expired", state: .needsAttention)
             throw GitHubConnectionError.invalidToken
         } catch {
             if Task.isCancelled {
                 throw CancellationError()
             }
-            guard generation == authorizationGeneration else {
+            guard generation == authorizationGeneration,
+                  accountGeneration == accountGenerations[accountID, default: 0]
+            else {
                 throw CancellationError()
             }
             throw map(error)
@@ -479,6 +1253,8 @@ enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
     case incompleteResults
     case server(Int)
     case credentialStorage
+    case accountStorage
+    case accountMismatch
 
     var errorDescription: String? {
         switch self {
@@ -506,6 +1282,10 @@ enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
             "GitHub returned an error (\(statusCode)). Try again later."
         case .credentialStorage:
             "Buddy couldn't update the credential in Keychain. Try again."
+        case .accountStorage:
+            "Buddy couldn't load the connected account list. Try again."
+        case .accountMismatch:
+            "GitHub authorized a different account. Sign in with the account being reconnected."
         }
     }
 
@@ -523,8 +1303,36 @@ enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
         case .incompleteResults: "GitHub returned partial results"
         case .server: "GitHub is unavailable"
         case .credentialStorage: "Keychain update failed"
+        case .accountStorage: "Account list unavailable"
+        case .accountMismatch: "Different GitHub account authorized"
         }
     }
+}
+
+struct GitHubAccountConnection: Identifiable, Equatable, Sendable {
+    let account: GitHubAccount
+    var state: IntegrationConnectionState
+    var message: String?
+    var recoveryAction: GitHubAccountRecoveryAction?
+
+    var id: ConnectedAccountID { account.connectedAccountID }
+
+    init(
+        account: GitHubAccount,
+        state: IntegrationConnectionState,
+        message: String? = nil,
+        recoveryAction: GitHubAccountRecoveryAction? = nil
+    ) {
+        self.account = account
+        self.state = state
+        self.message = message
+        self.recoveryAction = recoveryAction
+    }
+}
+
+enum GitHubAccountRecoveryAction: Equatable, Sendable {
+    case validate
+    case reconnect
 }
 
 private final class LockedGitHubSummary: @unchecked Sendable {

@@ -30,6 +30,7 @@
 		A10000000000000000000015 /* GitHubAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000001B /* GitHubAPI.swift */; };
 		A10000000000000000000016 /* GitHubAPITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000001C /* GitHubAPITests.swift */; };
 		A10000000000000000000017 /* GitHubIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000001D /* GitHubIntegrationTests.swift */; };
+		A10000000000000000000018 /* ConnectedAccount.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000001E /* ConnectedAccount.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -72,6 +73,7 @@
 		A2000000000000000000001B /* GitHubAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubAPI.swift; sourceTree = "<group>"; };
 		A2000000000000000000001C /* GitHubAPITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubAPITests.swift; sourceTree = "<group>"; };
 		A2000000000000000000001D /* GitHubIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubIntegrationTests.swift; sourceTree = "<group>"; };
+		A2000000000000000000001E /* ConnectedAccount.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectedAccount.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -102,7 +104,7 @@
 		A7000000000000000000000B /* Logging */ = {isa = PBXGroup; children = (A2000000000000000000000C /* AppLogger.swift */); path = Logging; sourceTree = "<group>"; };
 		A7000000000000000000000C /* Networking */ = {isa = PBXGroup; children = (A2000000000000000000000A /* HTTPClient.swift */); path = Networking; sourceTree = "<group>"; };
 		A7000000000000000000000D /* Persistence */ = {isa = PBXGroup; children = (A2000000000000000000000E /* DashboardSnapshot.swift */); path = Persistence; sourceTree = "<group>"; };
-		A7000000000000000000000E /* Integrations */ = {isa = PBXGroup; children = (A2000000000000000000000F /* Integration.swift */, A7000000000000000000000F /* GitHub */); path = Integrations; sourceTree = "<group>"; };
+		A7000000000000000000000E /* Integrations */ = {isa = PBXGroup; children = (A2000000000000000000000F /* Integration.swift */, A2000000000000000000001E /* ConnectedAccount.swift */, A7000000000000000000000F /* GitHub */); path = Integrations; sourceTree = "<group>"; };
 		A7000000000000000000000F /* GitHub */ = {isa = PBXGroup; children = (A20000000000000000000010 /* GitHubIntegration.swift */, A2000000000000000000001B /* GitHubAPI.swift */); path = GitHub; sourceTree = "<group>"; };
 		A70000000000000000000010 /* Resources */ = {isa = PBXGroup; children = (A20000000000000000000011 /* Assets.xcassets */, A20000000000000000000013 /* Info.plist */, A20000000000000000000012 /* PrivacyInfo.xcprivacy */, A70000000000000000000016 /* Brand */); path = Resources; sourceTree = "<group>"; };
 		A70000000000000000000011 /* BuddyTests */ = {isa = PBXGroup; children = (A20000000000000000000015 /* AppRouteTests.swift */, A20000000000000000000016 /* DashboardViewModelTests.swift */, A2000000000000000000001C /* GitHubAPITests.swift */, A2000000000000000000001D /* GitHubIntegrationTests.swift */); path = BuddyTests; sourceTree = "<group>"; };
@@ -173,7 +175,7 @@
 		A80000000000000000000001 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
-			files = (A10000000000000000000001, A10000000000000000000002, A10000000000000000000003, A10000000000000000000004, A10000000000000000000005, A10000000000000000000006, A10000000000000000000007, A10000000000000000000008, A10000000000000000000009, A1000000000000000000000A, A1000000000000000000000B, A1000000000000000000000C, A1000000000000000000000D, A1000000000000000000000E, A1000000000000000000000F, A10000000000000000000010, A10000000000000000000015);
+			files = (A10000000000000000000001, A10000000000000000000002, A10000000000000000000003, A10000000000000000000004, A10000000000000000000005, A10000000000000000000006, A10000000000000000000007, A10000000000000000000008, A10000000000000000000009, A1000000000000000000000A, A1000000000000000000000B, A1000000000000000000000C, A1000000000000000000000D, A1000000000000000000000E, A1000000000000000000000F, A10000000000000000000010, A10000000000000000000015, A10000000000000000000018);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		A80000000000000000000002 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000013, A10000000000000000000014, A10000000000000000000016, A10000000000000000000017); runOnlyForDeploymentPostprocessing = 0; };
