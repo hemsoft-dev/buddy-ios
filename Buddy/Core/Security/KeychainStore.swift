@@ -25,6 +25,13 @@ actor KeychainStore {
         }
     }
 
+    /// Atomically restores a credential only when no newer value exists.
+    func setIfMissing(_ data: Data, for account: String) throws -> Bool {
+        guard try self.data(for: account) == nil else { return false }
+        try set(data, for: account)
+        return true
+    }
+
     func data(for account: String) throws -> Data? {
         var query = baseQuery(for: account)
         query[kSecReturnData as String] = true

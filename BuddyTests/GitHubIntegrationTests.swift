@@ -1415,6 +1415,70 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(records, [account.connectedAccountRecord])
     }
 
+    func testCanceledReconnectSupersedesDisconnectAndRestoresOriginalAccount() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let credentials = SuspendedConditionalRemovalCredentialStore(
+            values: [credentialAccount: "old-token"]
+        )
+        let accountStore = InMemoryConnectedAccountStore(records: [account.connectedAccountRecord])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(deviceResults: [.success(testAuthorization)]),
+            credentials: credentials,
+            accountStore: accountStore
+        )
+
+        let disconnection = Task {
+            try await integration.disconnect(accountID: account.connectedAccountID)
+        }
+        await credentials.waitUntilConditionalRemovalBegins()
+
+        let authorization = try await integration.beginAccountAuthorization(
+            reconnecting: account.connectedAccountID
+        )
+        await integration.cancelAccountAuthorization(authorization)
+        await credentials.finishConditionalRemoval()
+
+        do {
+            try await disconnection.value
+            XCTFail("Expected reconnect intent to supersede the older disconnect")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let storedToken = await credentials.stringValue(for: credentialAccount)
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertEqual(storedToken, "old-token")
+        XCTAssertEqual(records, [account.connectedAccountRecord])
+    }
+
+    func testCredentialDeletionFailureRestoresRemovedAccountMetadata() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let credentials = FailingConditionalRemovalCredentialStore(
+            values: [credentialAccount: "stored-token"]
+        )
+        let accountStore = InMemoryConnectedAccountStore(records: [account.connectedAccountRecord])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(),
+            credentials: credentials,
+            accountStore: accountStore
+        )
+
+        do {
+            try await integration.disconnect(accountID: account.connectedAccountID)
+            XCTFail("Expected credential deletion failure")
+        } catch let error as GitHubConnectionError {
+            XCTAssertEqual(error, .credentialStorage)
+        }
+
+        let storedToken = await credentials.stringValue(for: credentialAccount)
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertEqual(storedToken, "stored-token")
+        XCTAssertEqual(records, [account.connectedAccountRecord])
+    }
+
     func testReconnectUpdatesOnlyTheTargetAccountCredential() async throws {
         let first = GitHubAccount(id: 7, login: "first-renamed", name: nil, avatarURL: nil)
         let second = GitHubAccount(id: 42, login: "second", name: nil, avatarURL: nil)
@@ -1631,6 +1695,39 @@ private actor SuspendedConditionalRemovalCredentialStore: CredentialStoring {
     func finishConditionalRemoval() {
         removalCompletion?.resume()
         removalCompletion = nil
+    }
+
+    func stringValue(for account: String) -> String? {
+        values[account].flatMap { String(data: $0, encoding: .utf8) }
+    }
+}
+
+private actor FailingConditionalRemovalCredentialStore: CredentialStoring {
+    enum StoreError: Error {
+        case removalFailed
+    }
+
+    private var values: [String: Data]
+
+    init(values: [String: String]) {
+        self.values = values.mapValues { Data($0.utf8) }
+    }
+
+    func set(_ data: Data, for account: String) {
+        values[account] = data
+    }
+
+    func data(for account: String) -> Data? {
+        values[account]
+    }
+
+    func removeData(for account: String) {
+        values.removeValue(forKey: account)
+    }
+
+    func removeData(for account: String, ifMatches expectedData: Data) throws -> Bool {
+        guard values[account] == expectedData else { return false }
+        throw StoreError.removalFailed
     }
 
     func stringValue(for account: String) -> String? {

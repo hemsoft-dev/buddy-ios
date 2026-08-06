@@ -3,12 +3,19 @@ import SwiftUI
 
 protocol CredentialStoring: Sendable {
     func set(_ data: Data, for account: String) async throws
+    func setIfMissing(_ data: Data, for account: String) async throws -> Bool
     func data(for account: String) async throws -> Data?
     func removeData(for account: String) async throws
     func removeData(for account: String, ifMatches expectedData: Data) async throws -> Bool
 }
 
 extension CredentialStoring {
+    func setIfMissing(_ data: Data, for account: String) async throws -> Bool {
+        guard try await self.data(for: account) == nil else { return false }
+        try await set(data, for: account)
+        return true
+    }
+
     func removeData(for account: String, ifMatches expectedData: Data) async throws -> Bool {
         guard try await data(for: account) == expectedData else { return false }
         try await removeData(for: account)
@@ -21,6 +28,7 @@ extension KeychainStore: CredentialStoring {}
 actor GitHubIntegration: IntegrationProviding {
     private struct AccountAuthorizationSession: Sendable {
         let targetID: ConnectedAccountID?
+        let targetGeneration: Int?
     }
 
     private struct LegacyMigrationResult: Sendable {
@@ -149,10 +157,23 @@ actor GitHubIntegration: IntegrationProviding {
         reconnecting id: ConnectedAccountID? = nil
     ) async throws -> GitHubDeviceAuthorization {
         guard let clientID else { throw GitHubConnectionError.missingClientID }
+        let targetGeneration = id.map { id in
+            accountGenerations[id, default: 0] &+= 1
+            return accountGenerations[id, default: 0]
+        }
         do {
             let authorization = try await api.requestDeviceAuthorization(clientID: clientID)
-            accountAuthorizations[authorization.deviceCode] = AccountAuthorizationSession(targetID: id)
+            if let id,
+               accountGenerations[id, default: 0] != targetGeneration {
+                throw CancellationError()
+            }
+            accountAuthorizations[authorization.deviceCode] = AccountAuthorizationSession(
+                targetID: id,
+                targetGeneration: targetGeneration
+            )
             return authorization
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw map(error)
         }
@@ -166,7 +187,7 @@ actor GitHubIntegration: IntegrationProviding {
             throw CancellationError()
         }
         let targetID = session.targetID
-        let targetGeneration = targetID.map { accountGenerations[$0, default: 0] }
+        let targetGeneration = session.targetGeneration
         let clock = ContinuousClock()
         let deadline = clock.now + .seconds(authorization.expiresIn)
         var interval = authorization.interval
@@ -278,6 +299,9 @@ actor GitHubIntegration: IntegrationProviding {
         accountGenerations[accountID, default: 0] &+= 1
         let generation = accountGenerations[accountID, default: 0]
         accountAuthorizations = accountAuthorizations.filter { $0.value.targetID != accountID }
+        var previousRecord: ConnectedAccountRecord?
+        var tokenData: Data?
+        let credentialAccount = Self.credentialAccount(for: accountID)
         do {
             // Singleton credentials are pre-migration state and are never authoritative
             // once account-scoped records are presented. Clear the legacy item locally
@@ -287,31 +311,72 @@ actor GitHubIntegration: IntegrationProviding {
                 throw CancellationError()
             }
 
-            // Remove metadata before the scoped token. If a reconnect begins while an
-            // awaited deletion is in flight, its later upsert wins; generation checks
-            // prevent this older disconnect from advancing to the next destructive step.
-            try await accountStore.remove(accountID)
+            previousRecord = try await accountStore.accounts(for: .github)
+                .first { $0.id == accountID }
+            tokenData = try await credentials.data(for: credentialAccount)
             guard generation == accountGenerations[accountID, default: 0] else {
                 throw CancellationError()
             }
 
-            let credentialAccount = Self.credentialAccount(for: accountID)
-            if let tokenData = try await credentials.data(for: credentialAccount) {
-                guard generation == accountGenerations[accountID, default: 0] else {
-                    throw CancellationError()
-                }
-                _ = try await credentials.removeData(
+            // Remove metadata before the scoped token. If a reconnect supersedes this
+            // operation, rollback only fills values that its newer write did not replace.
+            try await accountStore.remove(accountID)
+            guard generation == accountGenerations[accountID, default: 0] else {
+                await restoreDisconnectedAccount(
+                    record: previousRecord,
+                    tokenData: tokenData,
+                    credentialAccount: credentialAccount
+                )
+                throw CancellationError()
+            }
+
+            if let tokenData {
+                let removed = try await credentials.removeData(
                     for: credentialAccount,
                     ifMatches: tokenData
                 )
+                guard removed else {
+                    await restoreDisconnectedAccount(
+                        record: previousRecord,
+                        tokenData: tokenData,
+                        credentialAccount: credentialAccount
+                    )
+                    if generation != accountGenerations[accountID, default: 0] {
+                        throw CancellationError()
+                    }
+                    throw GitHubConnectionError.credentialStorage
+                }
             }
             guard generation == accountGenerations[accountID, default: 0] else {
+                await restoreDisconnectedAccount(
+                    record: previousRecord,
+                    tokenData: tokenData,
+                    credentialAccount: credentialAccount
+                )
                 throw CancellationError()
             }
         } catch is CancellationError {
             throw CancellationError()
         } catch {
+            await restoreDisconnectedAccount(
+                record: previousRecord,
+                tokenData: tokenData,
+                credentialAccount: credentialAccount
+            )
             throw GitHubConnectionError.credentialStorage
+        }
+    }
+
+    private func restoreDisconnectedAccount(
+        record: ConnectedAccountRecord?,
+        tokenData: Data?,
+        credentialAccount: String
+    ) async {
+        if let record {
+            _ = try? await accountStore.upsertIfMissing(record)
+        }
+        if let tokenData {
+            _ = try? await credentials.setIfMissing(tokenData, for: credentialAccount)
         }
     }
 

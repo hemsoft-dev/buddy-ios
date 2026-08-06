@@ -30,6 +30,7 @@ struct ConnectedAccountRecord: Identifiable, Codable, Equatable, Sendable {
 protocol ConnectedAccountStoring: Sendable {
     func accounts(for provider: IntegrationProvider) async throws -> [ConnectedAccountRecord]
     func upsert(_ account: ConnectedAccountRecord) async throws
+    func upsertIfMissing(_ account: ConnectedAccountRecord) async throws -> Bool
     func remove(_ id: ConnectedAccountID) async throws
 }
 
@@ -68,6 +69,14 @@ actor UserDefaultsConnectedAccountStore: ConnectedAccountStoring {
         try persist()
     }
 
+    func upsertIfMissing(_ account: ConnectedAccountRecord) throws -> Bool {
+        try ensureLoaded()
+        guard !records.contains(where: { $0.id == account.id }) else { return false }
+        records.append(account)
+        try persist()
+        return true
+    }
+
     func remove(_ id: ConnectedAccountID) throws {
         try ensureLoaded()
         records.removeAll { $0.id == id }
@@ -97,6 +106,12 @@ actor InMemoryConnectedAccountStore: ConnectedAccountStoring {
     func upsert(_ account: ConnectedAccountRecord) {
         records.removeAll { $0.id == account.id }
         records.append(account)
+    }
+
+    func upsertIfMissing(_ account: ConnectedAccountRecord) -> Bool {
+        guard !records.contains(where: { $0.id == account.id }) else { return false }
+        records.append(account)
+        return true
     }
 
     func remove(_ id: ConnectedAccountID) {
