@@ -902,6 +902,47 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(accounts, [GitHubAccountConnection(account: account, state: .connected)])
     }
 
+    func testDuplicateAddAdvancesResolvedAccountDashboardRevision() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let api = StubGitHubAPI(
+            deviceResults: [.success(testAuthorization)],
+            pollResults: [.success(.authorized(token: "replacement-token"))],
+            userResults: [.success(account), .success(account)]
+        )
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: MockCredentialStore(values: [credentialAccount: "stored-token"]),
+            accountStore: InMemoryConnectedAccountStore(records: [account.connectedAccountRecord]),
+            sleep: { _ in }
+        )
+        let (viewModel, openURL) = await MainActor.run {
+            (
+                GitHubViewModel(integration: integration),
+                OpenURLAction { _ in .handled }
+            )
+        }
+        await viewModel.restore()
+
+        await MainActor.run { viewModel.addAccount(openURL: openURL) }
+        let additionFinished = try await waitUntil {
+            let authorizationFinished = await MainActor.run {
+                viewModel.activeAccountAuthorizationTarget == nil
+            }
+            let userTokenCount = await api.userTokens().count
+            return authorizationFinished && userTokenCount == 2
+        }
+
+        XCTAssertTrue(additionFinished)
+        let revision = await MainActor.run {
+            viewModel.dashboardRefreshRevision(for: account.connectedAccountID)
+        }
+        let accounts = await MainActor.run { viewModel.accounts }
+        XCTAssertEqual(revision, 1)
+        XCTAssertEqual(accounts, [GitHubAccountConnection(account: account, state: .connected)])
+    }
+
     func testFailedReconnectPreservesPreviouslyHealthyAccount() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let differentAccount = GitHubAccount(id: 84, login: "hubot", name: nil, avatarURL: nil)

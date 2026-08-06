@@ -327,6 +327,9 @@ final class GitHubViewModel {
                 let connection = try await integration.completeAccountAuthorization(startedAuthorization)
                 try Task.checkCancellation()
                 guard generation == operationGeneration else { return }
+                if id == nil {
+                    accountOperationGenerations[connection.id, default: 0] &+= 1
+                }
                 accounts.removeAll { $0.id == connection.id }
                 accounts.append(connection)
                 accounts.sort { $0.id < $1.id }
