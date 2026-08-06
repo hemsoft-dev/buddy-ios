@@ -152,9 +152,11 @@ struct DashboardView: View {
 
     private func pullRequestSection(_ account: GitHubAccount) -> some View {
         let isExpanded = githubPullRequestTreeExpansion.isPullRequestSectionExpanded(for: account.id)
-        let repositories = GitHubPullRequestRepositoryGroup
-            .grouped(viewModel.githubState.pullRequests)
-            .map(\.id)
+        let snapshot = DashboardGitHubPullRequestTreeSnapshot(
+            accountID: account.id,
+            dataAccountID: viewModel.githubAccountID,
+            state: viewModel.githubState
+        )
 
         return VStack(alignment: .leading, spacing: BuddyTheme.Spacing.medium) {
             Button {
@@ -209,10 +211,11 @@ struct DashboardView: View {
             }
         }
         .animation(reduceMotion ? nil : .snappy, value: isExpanded)
-        .onChange(of: repositories, initial: true) { _, repositories in
+        .onChange(of: snapshot, initial: true) { _, snapshot in
+            guard let snapshot else { return }
             githubPullRequestTreeExpansion.reconcile(
-                accountID: account.id,
-                repositories: repositories
+                accountID: snapshot.accountID,
+                repositories: snapshot.repositories
             )
         }
     }

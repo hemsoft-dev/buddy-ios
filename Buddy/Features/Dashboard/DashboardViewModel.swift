@@ -94,6 +94,36 @@ struct GitHubPullRequestRepositoryGroup: Identifiable, Equatable, Sendable {
     }
 }
 
+struct DashboardGitHubPullRequestTreeSnapshot: Equatable {
+    let accountID: Int
+    let repositories: [String]
+
+    init?(
+        accountID: Int,
+        dataAccountID: Int?,
+        state: GitHubPullRequestDashboardState
+    ) {
+        guard dataAccountID == accountID else { return nil }
+
+        let pullRequests: [GitHubPullRequest]
+        switch state {
+        case .loading:
+            return nil
+        case let .loaded(loadedPullRequests, _):
+            pullRequests = loadedPullRequests
+        case let .refreshing(previousPullRequests, refreshedAt):
+            guard refreshedAt != nil || !previousPullRequests.isEmpty else { return nil }
+            pullRequests = previousPullRequests
+        case let .failed(previousPullRequests, refreshedAt, _):
+            guard refreshedAt != nil || !previousPullRequests.isEmpty else { return nil }
+            pullRequests = previousPullRequests
+        }
+
+        self.accountID = accountID
+        repositories = GitHubPullRequestRepositoryGroup.grouped(pullRequests).map(\.id)
+    }
+}
+
 struct DashboardGitHubPullRequestTreeExpansionState: Equatable {
     private struct AccountState: Equatable {
         var isPullRequestSectionExpanded = false
@@ -141,7 +171,7 @@ final class DashboardViewModel {
     private let integrations: [any IntegrationProviding]
     private let github: any GitHubPullRequestProviding
     private let now: @MainActor @Sendable () -> Date
-    private var githubAccountID: Int?
+    private(set) var githubAccountID: Int?
     private var githubRefreshGeneration = 0
 
     init(

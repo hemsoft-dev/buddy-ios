@@ -86,6 +86,68 @@ final class DashboardViewModelTests: XCTestCase {
         XCTAssertTrue(expansion.isRepositoryExpanded("HemSoft/Buddy", for: testAccount.id))
     }
 
+    func testPullRequestTreeDoesNotReconcileTransientAccountSwitchData() throws {
+        let refreshDate = Date(timeIntervalSince1970: 500)
+        let secondAccountID = 84
+        let firstAccountPullRequest = makePullRequest(
+            id: 1,
+            repository: "HemSoft/Buddy",
+            updatedAt: refreshDate
+        )
+        let secondAccountPullRequest = makePullRequest(
+            id: 2,
+            repository: "HemSoft/Other",
+            updatedAt: refreshDate
+        )
+        var expansion = DashboardGitHubPullRequestTreeExpansionState()
+        expansion.reconcile(accountID: testAccount.id, repositories: [firstAccountPullRequest.repository])
+        expansion.togglePullRequestSection(for: testAccount.id)
+        expansion.toggleRepository(firstAccountPullRequest.repository, for: testAccount.id)
+
+        let staleFirstAccountSnapshot = DashboardGitHubPullRequestTreeSnapshot(
+            accountID: secondAccountID,
+            dataAccountID: testAccount.id,
+            state: .loaded([firstAccountPullRequest], refreshedAt: refreshDate)
+        )
+        let secondAccountLoadingSnapshot = DashboardGitHubPullRequestTreeSnapshot(
+            accountID: secondAccountID,
+            dataAccountID: secondAccountID,
+            state: .loading
+        )
+        let staleSecondAccountSnapshot = DashboardGitHubPullRequestTreeSnapshot(
+            accountID: testAccount.id,
+            dataAccountID: secondAccountID,
+            state: .loaded([secondAccountPullRequest], refreshedAt: refreshDate)
+        )
+        let returningAccountLoadingSnapshot = DashboardGitHubPullRequestTreeSnapshot(
+            accountID: testAccount.id,
+            dataAccountID: testAccount.id,
+            state: .loading
+        )
+
+        XCTAssertNil(staleFirstAccountSnapshot)
+        XCTAssertNil(secondAccountLoadingSnapshot)
+        XCTAssertNil(staleSecondAccountSnapshot)
+        XCTAssertNil(returningAccountLoadingSnapshot)
+        XCTAssertTrue(expansion.isPullRequestSectionExpanded(for: testAccount.id))
+        XCTAssertTrue(expansion.isRepositoryExpanded(firstAccountPullRequest.repository, for: testAccount.id))
+
+        let refreshedFirstAccountSnapshot = try XCTUnwrap(
+            DashboardGitHubPullRequestTreeSnapshot(
+                accountID: testAccount.id,
+                dataAccountID: testAccount.id,
+                state: .loaded([firstAccountPullRequest], refreshedAt: refreshDate)
+            )
+        )
+        expansion.reconcile(
+            accountID: refreshedFirstAccountSnapshot.accountID,
+            repositories: refreshedFirstAccountSnapshot.repositories
+        )
+
+        XCTAssertTrue(expansion.isPullRequestSectionExpanded(for: testAccount.id))
+        XCTAssertTrue(expansion.isRepositoryExpanded(firstAccountPullRequest.repository, for: testAccount.id))
+    }
+
     func testDashboardPresentationDistinguishesAccountLifecycleStates() {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let authorization = GitHubDeviceAuthorization(
