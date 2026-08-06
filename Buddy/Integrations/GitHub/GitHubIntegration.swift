@@ -440,16 +440,22 @@ actor GitHubIntegration: IntegrationProviding {
         credentialAccount: String,
         generation: Int
     ) async {
-        if generation != accountGenerations[accountID, default: 0],
-           accountMutationIntents[accountID] != .reconnect {
-            return
-        }
+        guard shouldRestoreDisconnectedAccount(accountID, generation: generation) else { return }
         if let record {
             _ = try? await accountStore.upsertIfMissing(record)
         }
+        guard shouldRestoreDisconnectedAccount(accountID, generation: generation) else { return }
         if let tokenData {
             _ = try? await credentials.setIfMissing(tokenData, for: credentialAccount)
         }
+    }
+
+    private func shouldRestoreDisconnectedAccount(
+        _ accountID: ConnectedAccountID,
+        generation: Int
+    ) -> Bool {
+        generation == accountGenerations[accountID, default: 0]
+            || accountMutationIntents[accountID] == .reconnect
     }
 
     private func rollbackAccountWrite(

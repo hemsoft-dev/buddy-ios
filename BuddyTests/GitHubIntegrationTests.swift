@@ -1830,6 +1830,48 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(records, [account.connectedAccountRecord])
     }
 
+    func testNewerDisconnectDuringRollbackCannotRestoreOrphanedCredential() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let credentials = SuspendedConditionalRemovalCredentialStore(
+            values: [credentialAccount: "old-token"]
+        )
+        let accountStore = SuspendedRestoreConnectedAccountStore(
+            records: [account.connectedAccountRecord]
+        )
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(deviceResults: [.success(testAuthorization)]),
+            credentials: credentials,
+            accountStore: accountStore
+        )
+        let olderDisconnect = Task {
+            try await integration.disconnect(accountID: account.connectedAccountID)
+        }
+        await credentials.waitUntilConditionalRemovalBegins()
+
+        let authorization = try await integration.beginAccountAuthorization(
+            reconnecting: account.connectedAccountID
+        )
+        await integration.cancelAccountAuthorization(authorization)
+        await credentials.finishConditionalRemoval()
+        await accountStore.waitUntilRestoreBegins()
+
+        try await integration.disconnect(accountID: account.connectedAccountID)
+        await accountStore.finishRestore()
+
+        do {
+            try await olderDisconnect.value
+            XCTFail("Expected the reconnect intent to supersede the older disconnect")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let storedToken = await credentials.stringValue(for: credentialAccount)
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertNil(storedToken)
+        XCTAssertTrue(records.isEmpty)
+    }
+
     func testCredentialDeletionFailureRestoresRemovedAccountMetadata() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
@@ -2512,6 +2554,73 @@ private actor SuspendedPostRemovalCredentialStore: CredentialStoring {
 
     func stringValue(for account: String) -> String? {
         values[account].flatMap { String(data: $0, encoding: .utf8) }
+    }
+}
+
+private actor SuspendedRestoreConnectedAccountStore: ConnectedAccountStoring {
+    private var records: [ConnectedAccountRecord]
+    private var didSuspendRestore = false
+    private var restoreStartedWaiter: CheckedContinuation<Void, Never>?
+    private var restoreCompletion: CheckedContinuation<Void, Never>?
+
+    init(records: [ConnectedAccountRecord]) {
+        self.records = records
+    }
+
+    func accounts(for provider: IntegrationProvider) -> [ConnectedAccountRecord] {
+        records.filter { $0.id.provider == provider }.sorted { $0.id < $1.id }
+    }
+
+    func upsert(_ account: ConnectedAccountRecord) {
+        records.removeAll { $0.id == account.id }
+        records.append(account)
+    }
+
+    func upsertIfMissing(_ account: ConnectedAccountRecord) async -> Bool {
+        guard !records.contains(where: { $0.id == account.id }) else { return false }
+        records.append(account)
+        if !didSuspendRestore {
+            didSuspendRestore = true
+            restoreStartedWaiter?.resume()
+            restoreStartedWaiter = nil
+            await withCheckedContinuation { continuation in
+                restoreCompletion = continuation
+            }
+        }
+        return true
+    }
+
+    func replace(
+        _ expected: ConnectedAccountRecord,
+        with replacement: ConnectedAccountRecord?
+    ) -> Bool {
+        guard let index = records.firstIndex(where: { $0.id == expected.id }),
+              records[index] == expected
+        else {
+            return false
+        }
+        if let replacement {
+            records[index] = replacement
+        } else {
+            records.remove(at: index)
+        }
+        return true
+    }
+
+    func remove(_ id: ConnectedAccountID) {
+        records.removeAll { $0.id == id }
+    }
+
+    func waitUntilRestoreBegins() async {
+        guard restoreCompletion == nil else { return }
+        await withCheckedContinuation { continuation in
+            restoreStartedWaiter = continuation
+        }
+    }
+
+    func finishRestore() {
+        restoreCompletion?.resume()
+        restoreCompletion = nil
     }
 }
 
