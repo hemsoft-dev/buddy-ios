@@ -21,6 +21,7 @@ struct DashboardView: View {
         integrations: IntegrationCatalog.defaultIntegrations
     )
     @DashboardGitHubCardExpansionStorage private var isGitHubCardExpanded
+    @State private var githubPullRequestTreeExpansion = DashboardGitHubPullRequestTreeExpansionState()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let githubViewModel: GitHubViewModel
     let openAccounts: () -> Void
@@ -133,7 +134,7 @@ struct DashboardView: View {
             .buttonStyle(.plain)
             .accessibilityLabel("GitHub account @\(account.login)")
             .accessibilityValue(isGitHubCardExpanded ? "Expanded, \(githubHeaderSummary)" : "Collapsed, \(githubHeaderSummary)")
-            .accessibilityHint(isGitHubCardExpanded ? "Collapses pull requests" : "Expands pull requests")
+            .accessibilityHint(isGitHubCardExpanded ? "Collapses GitHub account details" : "Expands GitHub account details")
 
             if isGitHubCardExpanded {
                 Divider()
@@ -145,8 +146,79 @@ struct DashboardView: View {
         .animation(reduceMotion ? nil : .snappy, value: isGitHubCardExpanded)
     }
 
-    @ViewBuilder
     private func githubAccountBody(_ account: GitHubAccount) -> some View {
+        pullRequestSection(account)
+    }
+
+    private func pullRequestSection(_ account: GitHubAccount) -> some View {
+        let isExpanded = githubPullRequestTreeExpansion.isPullRequestSectionExpanded(for: account.id)
+        let repositories = GitHubPullRequestRepositoryGroup
+            .grouped(viewModel.githubState.pullRequests)
+            .map(\.id)
+
+        return VStack(alignment: .leading, spacing: BuddyTheme.Spacing.medium) {
+            Button {
+                withAnimation(reduceMotion ? nil : .snappy) {
+                    githubPullRequestTreeExpansion.togglePullRequestSection(for: account.id)
+                }
+            } label: {
+                HStack(spacing: BuddyTheme.Spacing.small) {
+                    Image(systemName: "chevron.down")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isExpanded ? 0 : -90))
+                        .accessibilityHidden(true)
+
+                    VStack(alignment: .leading, spacing: BuddyTheme.Spacing.xSmall) {
+                        Text("My open PRs")
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+
+                        Text(githubPullRequestSectionSummary)
+                            .font(.caption)
+                            .foregroundStyle(githubPullRequestSectionSummaryColor)
+                    }
+
+                    Spacer(minLength: BuddyTheme.Spacing.small)
+
+                    if case .loading = viewModel.githubState {
+                        ProgressView()
+                            .controlSize(.small)
+                            .accessibilityHidden(true)
+                    } else {
+                        Text("\(viewModel.githubState.pullRequests.count)")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, BuddyTheme.Spacing.small)
+                            .padding(.vertical, BuddyTheme.Spacing.xSmall)
+                            .background(.secondary.opacity(0.12), in: Capsule())
+                            .accessibilityHidden(true)
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("My open pull requests")
+            .accessibilityValue("\(isExpanded ? "Expanded" : "Collapsed"), \(githubPullRequestSectionSummary)")
+            .accessibilityHint(isExpanded ? "Collapses pull request status and repositories" : "Expands pull request status and repositories")
+
+            if isExpanded {
+                githubPullRequestSectionContent(account)
+                    .padding(.leading, BuddyTheme.Spacing.medium)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .animation(reduceMotion ? nil : .snappy, value: isExpanded)
+        .onChange(of: repositories, initial: true) { _, repositories in
+            githubPullRequestTreeExpansion.reconcile(
+                accountID: account.id,
+                repositories: repositories
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func githubPullRequestSectionContent(_ account: GitHubAccount) -> some View {
         switch viewModel.githubState {
         case .loading:
             HStack(spacing: BuddyTheme.Spacing.small) {
@@ -157,7 +229,7 @@ struct DashboardView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
 
         case let .loaded(pullRequests, _):
-            pullRequestContent(pullRequests)
+            pullRequestContent(pullRequests, accountID: account.id)
 
         case let .refreshing(pullRequests, _):
             VStack(alignment: .leading, spacing: BuddyTheme.Spacing.medium) {
@@ -168,7 +240,7 @@ struct DashboardView: View {
                         .foregroundStyle(.secondary)
                 }
                 if !pullRequests.isEmpty {
-                    pullRequestList(pullRequests)
+                    repositoryGroupList(pullRequests, accountID: account.id)
                 }
             }
 
@@ -189,14 +261,14 @@ struct DashboardView: View {
                 .buttonStyle(.bordered)
 
                 if !pullRequests.isEmpty {
-                    pullRequestList(pullRequests)
+                    repositoryGroupList(pullRequests, accountID: account.id)
                 }
             }
         }
     }
 
     @ViewBuilder
-    private func pullRequestContent(_ pullRequests: [GitHubPullRequest]) -> some View {
+    private func pullRequestContent(_ pullRequests: [GitHubPullRequest], accountID: Int) -> some View {
         if pullRequests.isEmpty {
             VStack(alignment: .leading, spacing: BuddyTheme.Spacing.small) {
                 Label("No open pull requests", systemImage: "checkmark.circle.fill")
@@ -208,8 +280,69 @@ struct DashboardView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         } else {
-            pullRequestList(pullRequests)
+            repositoryGroupList(pullRequests, accountID: accountID)
         }
+    }
+
+    private func repositoryGroupList(_ pullRequests: [GitHubPullRequest], accountID: Int) -> some View {
+        let groups = GitHubPullRequestRepositoryGroup.grouped(pullRequests)
+
+        return LazyVStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(groups.enumerated()), id: \.element.id) { index, group in
+                if index > 0 {
+                    Divider()
+                }
+                repositoryGroup(group, accountID: accountID)
+                    .padding(.vertical, BuddyTheme.Spacing.small)
+            }
+        }
+    }
+
+    private func repositoryGroup(
+        _ group: GitHubPullRequestRepositoryGroup,
+        accountID: Int
+    ) -> some View {
+        let isExpanded = githubPullRequestTreeExpansion.isRepositoryExpanded(group.id, for: accountID)
+
+        return VStack(alignment: .leading, spacing: BuddyTheme.Spacing.small) {
+            Button {
+                withAnimation(reduceMotion ? nil : .snappy) {
+                    githubPullRequestTreeExpansion.toggleRepository(group.id, for: accountID)
+                }
+            } label: {
+                HStack(spacing: BuddyTheme.Spacing.small) {
+                    Image(systemName: "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isExpanded ? 0 : -90))
+                        .accessibilityHidden(true)
+
+                    Text(group.id)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .multilineTextAlignment(.leading)
+
+                    Spacer(minLength: BuddyTheme.Spacing.small)
+
+                    Text("\(group.pullRequests.count)")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(group.id), \(pullRequestCountDescription(group.pullRequests.count))")
+            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+            .accessibilityHint(isExpanded ? "Collapses pull requests for this repository" : "Expands pull requests for this repository")
+
+            if isExpanded {
+                pullRequestList(group.pullRequests)
+                    .padding(.leading, BuddyTheme.Spacing.medium)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .animation(reduceMotion ? nil : .snappy, value: isExpanded)
     }
 
     private func pullRequestList(_ pullRequests: [GitHubPullRequest]) -> some View {
@@ -255,6 +388,35 @@ struct DashboardView: View {
         }
         .accessibilityLabel("\(pullRequest.repository) pull request \(pullRequest.number), \(pullRequest.title), \(pullRequest.isDraft ? "draft" : "open")")
         .accessibilityHint("Opens on GitHub")
+    }
+
+    private var githubPullRequestSectionSummary: String {
+        let count = viewModel.githubState.pullRequests.count
+        let countDescription = "\(count) visible pull request\(count == 1 ? "" : "s")"
+
+        return switch viewModel.githubState {
+        case .loading:
+            "Loading"
+        case .loaded:
+            countDescription
+        case .refreshing:
+            "Refreshing · \(countDescription)"
+        case .failed(_, _, .authenticationRequired):
+            "Reconnect required · \(countDescription)"
+        case .failed:
+            "Refresh warning · \(countDescription)"
+        }
+    }
+
+    private var githubPullRequestSectionSummaryColor: Color {
+        if case .failed = viewModel.githubState {
+            return .orange
+        }
+        return .secondary
+    }
+
+    private func pullRequestCountDescription(_ count: Int) -> String {
+        "\(count) pull request\(count == 1 ? "" : "s")"
     }
 
     private var githubHeaderSummary: String {
