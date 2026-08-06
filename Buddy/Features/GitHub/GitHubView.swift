@@ -288,6 +288,10 @@ final class GitHubViewModel {
         openURL: OpenURLAction,
         onConnected: ((ConnectedAccountID) -> Void)? = nil
     ) {
+        if let previousTarget = activeAccountAuthorizationTarget,
+           previousTarget != id {
+            accountOperationGenerations[previousTarget, default: 0] &+= 1
+        }
         if let id {
             accountOperationGenerations[id, default: 0] &+= 1
         }
@@ -300,6 +304,9 @@ final class GitHubViewModel {
             var authorization: GitHubDeviceAuthorization?
             defer {
                 if generation == operationGeneration {
+                    if let id {
+                        accountOperationGenerations[id, default: 0] &+= 1
+                    }
                     accountConnectionTask = nil
                     activeAccountAuthorization = nil
                     activeAccountAuthorizationTarget = nil
@@ -356,6 +363,9 @@ final class GitHubViewModel {
         operationGeneration &+= 1
         accountConnectionTask?.cancel()
         accountConnectionTask = nil
+        if let activeAccountAuthorizationTarget {
+            accountOperationGenerations[activeAccountAuthorizationTarget, default: 0] &+= 1
+        }
         if let activeAccountAuthorization {
             Task { await integration.cancelAccountAuthorization(activeAccountAuthorization) }
         }
@@ -375,6 +385,7 @@ final class GitHubViewModel {
             try await integration.disconnect(accountID: id)
             guard generation == accountOperationGenerations[id, default: 0] else { return }
             accounts.removeAll { $0.id == id }
+            if case .authorizing = state { return }
             stateScope = preferredRestingStateScope
             state = preferredRestingState
         } catch is CancellationError {
@@ -385,9 +396,14 @@ final class GitHubViewModel {
                 accounts[index].state = .needsAttention
                 accounts[index].message = error.localizedDescription
             }
+            if case .authorizing = state { return }
             stateScope = .account(id)
             state = .needsAttention(error.localizedDescription)
         }
+    }
+
+    func dashboardRefreshRevision(for id: ConnectedAccountID) -> Int {
+        accountOperationGenerations[id, default: 0]
     }
 
     func reportDashboardAuthenticationFailure(for id: ConnectedAccountID) {

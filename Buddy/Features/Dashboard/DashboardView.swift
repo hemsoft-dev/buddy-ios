@@ -95,7 +95,9 @@ struct DashboardView: View {
     }
 
     private var accountRefreshKey: [String] {
-        githubViewModel.accounts.map { "\($0.id.rawValue):\($0.state.rawValue)" }
+        githubViewModel.accounts.map {
+            "\($0.id.rawValue):\($0.state.rawValue):\(githubViewModel.dashboardRefreshRevision(for: $0.id))"
+        }
     }
 
     private var dashboardPresentation: DashboardPresentation {

@@ -1791,6 +1791,87 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(secondToken, "second-token")
     }
 
+    func testUnrelatedDisconnectPreservesActiveAuthorizationPresentation() async throws {
+        let first = GitHubAccount(id: 7, login: "first", name: nil, avatarURL: nil)
+        let second = GitHubAccount(id: 42, login: "second", name: nil, avatarURL: nil)
+        let firstKey = GitHubIntegration.credentialAccount(for: first.connectedAccountID)
+        let secondKey = GitHubIntegration.credentialAccount(for: second.connectedAccountID)
+        let api = MultiAccountSuspendedPollingGitHubAPI(first: first, second: second)
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: MockCredentialStore(values: [
+                firstKey: "first-token",
+                secondKey: "second-token",
+            ]),
+            accountStore: InMemoryConnectedAccountStore(records: [
+                first.connectedAccountRecord,
+                second.connectedAccountRecord,
+            ]),
+            sleep: { _ in }
+        )
+        let (viewModel, openURL) = await MainActor.run {
+            (
+                GitHubViewModel(integration: integration),
+                OpenURLAction { _ in .handled }
+            )
+        }
+        await viewModel.restore()
+
+        await MainActor.run {
+            viewModel.reconnect(first.connectedAccountID, openURL: openURL)
+        }
+        await api.waitUntilPollBegins()
+        let revisionDuringReconnect = await MainActor.run {
+            viewModel.dashboardRefreshRevision(for: first.connectedAccountID)
+        }
+
+        await viewModel.disconnect(second.connectedAccountID)
+
+        let presentation = await MainActor.run {
+            GitHubView(viewModel: viewModel, accountID: first.connectedAccountID).presentationState
+        }
+        XCTAssertEqual(revisionDuringReconnect, 1)
+        XCTAssertEqual(presentation, .authorizing(testAuthorization))
+        await api.finishPoll()
+    }
+
+    func testReconnectRevisionAdvancesWhenAuthorizationIsCanceled() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let api = SuspendedPollingGitHubAPI(account: account)
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: MockCredentialStore(),
+            sleep: { _ in }
+        )
+        let (viewModel, openURL) = await MainActor.run {
+            (
+                GitHubViewModel(integration: integration),
+                OpenURLAction { _ in .handled }
+            )
+        }
+
+        await MainActor.run {
+            viewModel.reconnect(account.connectedAccountID, openURL: openURL)
+        }
+        let pollingStarted = try await waitUntil {
+            await api.pollDidStart()
+        }
+        XCTAssertTrue(pollingStarted)
+        let reconnectRevision = await MainActor.run {
+            viewModel.dashboardRefreshRevision(for: account.connectedAccountID)
+        }
+        await MainActor.run { viewModel.cancelAccountAuthorization() }
+        let canceledRevision = await MainActor.run {
+            viewModel.dashboardRefreshRevision(for: account.connectedAccountID)
+        }
+
+        XCTAssertEqual(reconnectRevision, 1)
+        XCTAssertEqual(canceledRevision, 2)
+        await api.finishPoll()
+    }
+
     func testUnauthorizedRefreshCannotDeleteTokenReplacedByReconnect() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
@@ -3740,6 +3821,51 @@ private actor SuspendedPollingGitHubAPI: GitHubAPIProviding {
 
     func pollDidStart() -> Bool {
         didStartPoll
+    }
+
+    func finishPoll() {
+        pollCompletion?.resume()
+        pollCompletion = nil
+    }
+}
+
+private actor MultiAccountSuspendedPollingGitHubAPI: GitHubAPIProviding {
+    private let first: GitHubAccount
+    private let second: GitHubAccount
+    private var pollStartedWaiter: CheckedContinuation<Void, Never>?
+    private var pollCompletion: CheckedContinuation<Void, Never>?
+
+    init(first: GitHubAccount, second: GitHubAccount) {
+        self.first = first
+        self.second = second
+    }
+
+    func requestDeviceAuthorization(clientID: String) -> GitHubDeviceAuthorization {
+        testAuthorization
+    }
+
+    func pollForAccessToken(clientID: String, deviceCode: String) async -> GitHubTokenPollResult {
+        pollStartedWaiter?.resume()
+        pollStartedWaiter = nil
+        await withCheckedContinuation { continuation in
+            pollCompletion = continuation
+        }
+        return .authorized(token: "new-first-token")
+    }
+
+    func authenticatedUser(token: String) throws -> GitHubAccount {
+        switch token {
+        case "first-token", "new-first-token": first
+        case "second-token": second
+        default: throw GitHubAPIError.malformedResponse
+        }
+    }
+
+    func waitUntilPollBegins() async {
+        guard pollCompletion == nil else { return }
+        await withCheckedContinuation { continuation in
+            pollStartedWaiter = continuation
+        }
     }
 
     func finishPoll() {
