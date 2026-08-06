@@ -3,12 +3,14 @@ import SwiftUI
 
 struct GitHubView: View {
     @Environment(\.openURL) private var openURL
+    @State private var addedAccountID: ConnectedAccountID?
     let viewModel: GitHubViewModel
     let accountID: ConnectedAccountID?
 
     init(viewModel: GitHubViewModel, accountID: ConnectedAccountID? = nil) {
         self.viewModel = viewModel
         self.accountID = accountID
+        _addedAccountID = State(initialValue: nil)
     }
 
     var body: some View {
@@ -31,20 +33,23 @@ struct GitHubView: View {
         .navigationTitle("GitHub")
     }
 
-    private var presentationState: GitHubViewState {
+    var presentationState: GitHubViewState {
         if case let .authorizing(authorization) = viewModel.state,
            viewModel.activeAccountAuthorizationTarget == accountID {
             return .authorizing(authorization)
         }
-        if let accountID,
-           let connection = viewModel.accounts.first(where: { $0.id == accountID }) {
+        if let presentedAccountID,
+           let connection = viewModel.accounts.first(where: { $0.id == presentedAccountID }) {
             if connection.state == .needsAttention {
                 return .needsAttention(connection.message ?? GitHubConnectionError.invalidToken.localizedDescription)
             }
             return .connected(connection.account)
         }
-        if accountID != nil {
+        if presentedAccountID != nil {
             return .disconnected
+        }
+        if case let .needsAttention(message) = viewModel.state {
+            return .needsAttention(message)
         }
         if viewModel.accounts.isEmpty, viewModel.state == .loading {
             return .loading
@@ -73,11 +78,15 @@ struct GitHubView: View {
                 if let accountID {
                     viewModel.reconnect(accountID, openURL: openURL)
                 } else {
-                    viewModel.addAccount(openURL: openURL)
+                    viewModel.addAccount(openURL: openURL) { addedAccountID = $0 }
                 }
             }
             .buttonStyle(.borderedProminent)
         }
+    }
+
+    private var presentedAccountID: ConnectedAccountID? {
+        accountID ?? addedAccountID
     }
 
     private func authorizingContent(_ authorization: GitHubDeviceAuthorization) -> some View {
@@ -144,7 +153,7 @@ struct GitHubView: View {
                 if let accountID {
                     viewModel.reconnect(accountID, openURL: openURL)
                 } else {
-                    viewModel.addAccount(openURL: openURL)
+                    viewModel.addAccount(openURL: openURL) { addedAccountID = $0 }
                 }
             }
             .buttonStyle(.borderedProminent)
@@ -185,6 +194,7 @@ final class GitHubViewModel {
 
     func restore() async {
         guard connectionTask == nil,
+              accountConnectionTask == nil,
               cancellationTask == nil
         else {
             return
@@ -220,8 +230,11 @@ final class GitHubViewModel {
         }
     }
 
-    func addAccount(openURL: OpenURLAction) {
-        authorizeAccount(reconnecting: nil, openURL: openURL)
+    func addAccount(
+        openURL: OpenURLAction,
+        onConnected: ((ConnectedAccountID) -> Void)? = nil
+    ) {
+        authorizeAccount(reconnecting: nil, openURL: openURL, onConnected: onConnected)
     }
 
     func reconnect(_ id: ConnectedAccountID, openURL: OpenURLAction) {
@@ -230,7 +243,8 @@ final class GitHubViewModel {
 
     private func authorizeAccount(
         reconnecting id: ConnectedAccountID?,
-        openURL: OpenURLAction
+        openURL: OpenURLAction,
+        onConnected: ((ConnectedAccountID) -> Void)? = nil
     ) {
         operationGeneration &+= 1
         let generation = operationGeneration
@@ -264,6 +278,7 @@ final class GitHubViewModel {
                 accounts.append(connection)
                 accounts.sort { $0.id < $1.id }
                 state = .connected(connection.account)
+                onConnected?(connection.id)
             } catch is CancellationError {
                 if let authorization {
                     await integration.cancelAccountAuthorization(authorization)
@@ -274,6 +289,10 @@ final class GitHubViewModel {
                 guard generation == operationGeneration else { return }
                 if let id,
                    let index = accounts.firstIndex(where: { $0.id == id }) {
+                    if accounts[index].state == .connected {
+                        state = .connected(accounts[index].account)
+                        return
+                    }
                     accounts[index].state = .needsAttention
                     accounts[index].message = error.localizedDescription
                 }
@@ -312,11 +331,10 @@ final class GitHubViewModel {
     }
 
     func reportDashboardAuthenticationFailure(for id: ConnectedAccountID) {
-        if let index = accounts.firstIndex(where: { $0.id == id }) {
-            accounts[index].state = .needsAttention
-            accounts[index].message = GitHubConnectionError.invalidToken.localizedDescription
-        }
-        state = .needsAttention(GitHubConnectionError.invalidToken.localizedDescription)
+        guard let index = accounts.firstIndex(where: { $0.id == id }) else { return }
+        accounts[index].state = .needsAttention
+        accounts[index].message = GitHubConnectionError.invalidToken.localizedDescription
+        state = preferredRestingState
     }
 
     private var preferredRestingState: GitHubViewState {

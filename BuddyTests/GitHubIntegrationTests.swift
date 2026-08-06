@@ -607,6 +607,154 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(finalState, .connected(account))
     }
 
+    func testAutomaticRestoreDoesNotCancelAccountAuthorizationPolling() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let api = SuspendedPollingGitHubAPI(account: account)
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: MockCredentialStore(),
+            sleep: { _ in }
+        )
+        let (viewModel, openURL) = await MainActor.run {
+            (
+                GitHubViewModel(integration: integration),
+                OpenURLAction { _ in .handled }
+            )
+        }
+
+        await MainActor.run { viewModel.addAccount(openURL: openURL) }
+        let pollingStarted = try await waitUntil {
+            await api.pollDidStart()
+        }
+        XCTAssertTrue(pollingStarted)
+
+        await viewModel.restore()
+        let stateAfterReappearance = await MainActor.run { viewModel.state }
+        XCTAssertEqual(stateAfterReappearance, .authorizing(testAuthorization))
+
+        await api.finishPoll()
+        let connectionFinished = try await waitUntil {
+            await MainActor.run {
+                viewModel.accounts == [
+                    GitHubAccountConnection(account: account, state: .connected),
+                ]
+            }
+        }
+        XCTAssertTrue(connectionFinished)
+    }
+
+    func testAddAccountFailureIsPresentedInsteadOfReturningToConnectScreen() async throws {
+        let api = StubGitHubAPI(deviceResults: [.failure(.server(503))])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: MockCredentialStore()
+        )
+        let (viewModel, openURL) = await MainActor.run {
+            (
+                GitHubViewModel(integration: integration),
+                OpenURLAction { _ in .handled }
+            )
+        }
+
+        await MainActor.run { viewModel.addAccount(openURL: openURL) }
+        let failurePresented = try await waitUntil {
+            await MainActor.run {
+                if case .needsAttention = viewModel.state { return true }
+                return false
+            }
+        }
+
+        XCTAssertTrue(failurePresented)
+        let presentationState = await MainActor.run {
+            GitHubView(viewModel: viewModel).presentationState
+        }
+        XCTAssertEqual(
+            presentationState,
+            .needsAttention(GitHubConnectionError.server(503).localizedDescription)
+        )
+    }
+
+    func testSuccessfulAddAccountReportsIdentityForDestinationSelection() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(
+                deviceResults: [.success(testAuthorization)],
+                pollResults: [.success(.authorized(token: "new-token"))],
+                userResults: [.success(account)]
+            ),
+            credentials: MockCredentialStore(),
+            sleep: { _ in }
+        )
+        let (viewModel, openURL) = await MainActor.run {
+            (
+                GitHubViewModel(integration: integration),
+                OpenURLAction { _ in .handled }
+            )
+        }
+        let selectedDestination = expectation(description: "Select added account destination")
+
+        await MainActor.run {
+            viewModel.addAccount(openURL: openURL) { accountID in
+                XCTAssertEqual(accountID, account.connectedAccountID)
+                selectedDestination.fulfill()
+            }
+        }
+
+        await fulfillment(of: [selectedDestination], timeout: 1)
+        let accounts = await MainActor.run { viewModel.accounts }
+        XCTAssertEqual(accounts, [GitHubAccountConnection(account: account, state: .connected)])
+    }
+
+    func testFailedReconnectPreservesPreviouslyHealthyAccount() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let differentAccount = GitHubAccount(id: 84, login: "hubot", name: nil, avatarURL: nil)
+        let accountStore = InMemoryConnectedAccountStore(records: [account.connectedAccountRecord])
+        let credentials = MockCredentialStore(values: [
+            GitHubIntegration.credentialAccount(for: account.connectedAccountID): "old-token",
+        ])
+        let api = StubGitHubAPI(
+            deviceResults: [.success(testAuthorization)],
+            pollResults: [.success(.authorized(token: "wrong-account-token"))],
+            userResults: [.success(account), .success(differentAccount)]
+        )
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: credentials,
+            accountStore: accountStore,
+            sleep: { _ in }
+        )
+        let (viewModel, openURL) = await MainActor.run {
+            (
+                GitHubViewModel(integration: integration),
+                OpenURLAction { _ in .handled }
+            )
+        }
+        await viewModel.restore()
+
+        await MainActor.run {
+            viewModel.reconnect(account.connectedAccountID, openURL: openURL)
+        }
+        let reconnectFinished = try await waitUntil {
+            let validatedTokens = await api.userTokens()
+            return await MainActor.run {
+                validatedTokens.count == 2 && viewModel.activeAccountAuthorizationTarget == nil
+            }
+        }
+
+        XCTAssertTrue(reconnectFinished)
+        let (state, accounts) = await MainActor.run { (viewModel.state, viewModel.accounts) }
+        XCTAssertEqual(state, .connected(account))
+        XCTAssertEqual(accounts, [GitHubAccountConnection(account: account, state: .connected)])
+        let storedToken = await credentials.stringValue(
+            for: GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        )
+        XCTAssertEqual(storedToken, "old-token")
+    }
+
     func testAutomaticRestoreRevalidatesStateAfterExternalCredentialRemoval() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let api = StubGitHubAPI(userResults: [.success(account)])
@@ -632,6 +780,28 @@ final class GitHubIntegrationTests: XCTestCase {
             refreshedState,
             .needsAttention(GitHubConnectionError.invalidToken.localizedDescription)
         )
+    }
+
+    func testStaleDashboardAuthenticationFailureCannotResurrectDisconnectedState() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(userResults: [.success(account)]),
+            credentials: MockCredentialStore(values: [credentialAccount: "stored-token"]),
+            accountStore: InMemoryConnectedAccountStore(records: [account.connectedAccountRecord])
+        )
+        let viewModel = await MainActor.run { GitHubViewModel(integration: integration) }
+        await viewModel.restore()
+        await viewModel.disconnect(account.connectedAccountID)
+
+        await MainActor.run {
+            viewModel.reportDashboardAuthenticationFailure(for: account.connectedAccountID)
+        }
+
+        let (state, accounts) = await MainActor.run { (viewModel.state, viewModel.accounts) }
+        XCTAssertEqual(state, .disconnected)
+        XCTAssertTrue(accounts.isEmpty)
     }
 
     func testDisconnectRetryRepeatsCredentialRemoval() async throws {
@@ -926,6 +1096,61 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(migratedToken, "legacy-token")
     }
 
+    func testDisconnectRemovesLegacyCredentialBelongingToSameAccount() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let scopedKey = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let credentials = MockCredentialStore(values: [
+            "github.oauth-token": "legacy-token",
+            scopedKey: "scoped-token",
+        ])
+        let accountStore = InMemoryConnectedAccountStore(records: [account.connectedAccountRecord])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(userResults: [.success(account)]),
+            credentials: credentials,
+            accountStore: accountStore
+        )
+
+        try await integration.disconnect(accountID: account.connectedAccountID)
+
+        let legacyToken = await credentials.stringValue(for: "github.oauth-token")
+        let scopedToken = await credentials.stringValue(for: scopedKey)
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertNil(legacyToken)
+        XCTAssertNil(scopedToken)
+        XCTAssertTrue(records.isEmpty)
+    }
+
+    func testDisconnectClearsObsoleteLegacyCredentialWithoutAffectingOtherScopedAccounts() async throws {
+        let disconnected = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let otherAccount = GitHubAccount(id: 84, login: "hubot", name: nil, avatarURL: nil)
+        let scopedKey = GitHubIntegration.credentialAccount(for: disconnected.connectedAccountID)
+        let otherScopedKey = GitHubIntegration.credentialAccount(for: otherAccount.connectedAccountID)
+        let credentials = MockCredentialStore(values: [
+            "github.oauth-token": "other-account-token",
+            scopedKey: "scoped-token",
+            otherScopedKey: "other-scoped-token",
+        ])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(),
+            credentials: credentials,
+            accountStore: InMemoryConnectedAccountStore(records: [
+                disconnected.connectedAccountRecord,
+                otherAccount.connectedAccountRecord,
+            ])
+        )
+
+        try await integration.disconnect(accountID: disconnected.connectedAccountID)
+
+        let legacyToken = await credentials.stringValue(for: "github.oauth-token")
+        let scopedToken = await credentials.stringValue(for: scopedKey)
+        let otherScopedToken = await credentials.stringValue(for: otherScopedKey)
+        XCTAssertNil(legacyToken)
+        XCTAssertNil(scopedToken)
+        XCTAssertEqual(otherScopedToken, "other-scoped-token")
+    }
+
     func testLingeringLegacyCredentialNeverOverwritesNewerScopedCredential() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let scopedKey = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
@@ -983,6 +1208,56 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(healthyToken, "healthy-token")
     }
 
+    func testDisconnectDuringRestoreCannotResurrectAccount() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let scopedKey = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let api = SuspendedUserGitHubAPI(account: account)
+        let credentials = MockCredentialStore(values: [scopedKey: "stored-token"])
+        let accountStore = InMemoryConnectedAccountStore(records: [account.connectedAccountRecord])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: credentials,
+            accountStore: accountStore
+        )
+        let restore = Task { try await integration.restoreAccounts() }
+        await api.waitUntilUserRequestBegins()
+
+        try await integration.disconnect(accountID: account.connectedAccountID)
+        await api.finishUserRequest()
+
+        let restored = try await restore.value
+        let records = await accountStore.accounts(for: .github)
+        let scopedToken = await credentials.stringValue(for: scopedKey)
+        XCTAssertTrue(restored.isEmpty)
+        XCTAssertTrue(records.isEmpty)
+        XCTAssertNil(scopedToken)
+    }
+
+    func testMalformedPersistedAccountMetadataSurfacesStorageFailure() async throws {
+        let suiteName = "GitHubIntegrationTests.account-store-corruption.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(Data("not-json".utf8), forKey: UserDefaultsConnectedAccountStore.key)
+        let accountStore = UserDefaultsConnectedAccountStore(
+            defaults: try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        )
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(),
+            credentials: MockCredentialStore(),
+            accountStore: accountStore
+        )
+
+        do {
+            _ = try await integration.restoreAccounts()
+            XCTFail("Expected account storage failure")
+        } catch let error as GitHubConnectionError {
+            XCTAssertEqual(error, .accountStorage)
+        }
+    }
+
     func testDisconnectAndRefreshAreIsolatedAcrossAccounts() async throws {
         let first = GitHubAccount(id: 7, login: "first", name: nil, avatarURL: nil)
         let second = GitHubAccount(id: 42, login: "second", name: nil, avatarURL: nil)
@@ -1014,6 +1289,44 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(secondToken, "second-token")
         XCTAssertEqual(requests, [PullRequestRequest(login: "second", token: "second-token")])
         XCTAssertEqual(records, [second.connectedAccountRecord])
+    }
+
+    func testUnauthorizedRefreshCannotDeleteTokenReplacedByReconnect() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let credentials = SuspendedConditionalRemovalCredentialStore(
+            values: [credentialAccount: "old-token"]
+        )
+        let accountStore = InMemoryConnectedAccountStore(records: [account.connectedAccountRecord])
+        let api = RefreshThenReconnectGitHubAPI(account: account)
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: credentials,
+            accountStore: accountStore,
+            sleep: { _ in }
+        )
+        let refresh = Task {
+            try await integration.authoredPullRequests(for: account)
+        }
+        await api.waitUntilRefreshBegins()
+        await api.finishRefreshAsUnauthorized()
+        await credentials.waitUntilConditionalRemovalBegins()
+
+        let authorization = try await integration.beginAccountAuthorization(
+            reconnecting: account.connectedAccountID
+        )
+        _ = try await integration.completeAccountAuthorization(authorization)
+        await credentials.finishConditionalRemoval()
+
+        do {
+            _ = try await refresh.value
+            XCTFail("Expected the stale refresh to be superseded")
+        } catch is CancellationError {
+            // Expected: reconnect replaced the credential used by the request.
+        }
+        let storedToken = await credentials.stringValue(for: credentialAccount)
+        XCTAssertEqual(storedToken, "new-token")
     }
 
     func testReconnectUpdatesOnlyTheTargetAccountCredential() async throws {
@@ -1173,9 +1486,65 @@ private actor MockCredentialStore: CredentialStoring {
         values.removeValue(forKey: account)
     }
 
+    func removeData(for account: String, ifMatches expectedData: Data) -> Bool {
+        guard values[account] == expectedData else { return false }
+        values.removeValue(forKey: account)
+        return true
+    }
+
     func stringValue() -> String? {
         let value = values["github.oauth-token"] ?? values.values.first
         return value.flatMap { String(data: $0, encoding: .utf8) }
+    }
+
+    func stringValue(for account: String) -> String? {
+        values[account].flatMap { String(data: $0, encoding: .utf8) }
+    }
+}
+
+private actor SuspendedConditionalRemovalCredentialStore: CredentialStoring {
+    private var values: [String: Data]
+    private var removalStartedWaiter: CheckedContinuation<Void, Never>?
+    private var removalCompletion: CheckedContinuation<Void, Never>?
+
+    init(values: [String: String]) {
+        self.values = values.mapValues { Data($0.utf8) }
+    }
+
+    func set(_ data: Data, for account: String) {
+        values[account] = data
+    }
+
+    func data(for account: String) -> Data? {
+        values[account]
+    }
+
+    func removeData(for account: String) {
+        values.removeValue(forKey: account)
+    }
+
+    func removeData(for account: String, ifMatches expectedData: Data) async -> Bool {
+        guard values[account] == expectedData else { return false }
+        removalStartedWaiter?.resume()
+        removalStartedWaiter = nil
+        await withCheckedContinuation { continuation in
+            removalCompletion = continuation
+        }
+        guard values[account] == expectedData else { return false }
+        values.removeValue(forKey: account)
+        return true
+    }
+
+    func waitUntilConditionalRemovalBegins() async {
+        guard removalCompletion == nil else { return }
+        await withCheckedContinuation { continuation in
+            removalStartedWaiter = continuation
+        }
+    }
+
+    func finishConditionalRemoval() {
+        removalCompletion?.resume()
+        removalCompletion = nil
     }
 
     func stringValue(for account: String) -> String? {
@@ -1302,6 +1671,49 @@ private actor StubGitHubAPI: GitHubAPIProviding {
 
     func pollRequestCount() -> Int {
         capturedPollRequestCount
+    }
+}
+
+private actor RefreshThenReconnectGitHubAPI: GitHubAPIProviding {
+    private let account: GitHubAccount
+    private var refreshStartedWaiter: CheckedContinuation<Void, Never>?
+    private var refreshCompletion: CheckedContinuation<Void, Never>?
+
+    init(account: GitHubAccount) {
+        self.account = account
+    }
+
+    func requestDeviceAuthorization(clientID: String) -> GitHubDeviceAuthorization {
+        testAuthorization
+    }
+
+    func pollForAccessToken(clientID: String, deviceCode: String) -> GitHubTokenPollResult {
+        .authorized(token: "new-token")
+    }
+
+    func authenticatedUser(token: String) -> GitHubAccount {
+        account
+    }
+
+    func authoredPullRequests(login: String, token: String) async throws -> GitHubPullRequestCollection {
+        refreshStartedWaiter?.resume()
+        refreshStartedWaiter = nil
+        await withCheckedContinuation { continuation in
+            refreshCompletion = continuation
+        }
+        throw GitHubAPIError.unauthorized
+    }
+
+    func waitUntilRefreshBegins() async {
+        guard refreshCompletion == nil else { return }
+        await withCheckedContinuation { continuation in
+            refreshStartedWaiter = continuation
+        }
+    }
+
+    func finishRefreshAsUnauthorized() {
+        refreshCompletion?.resume()
+        refreshCompletion = nil
     }
 }
 

@@ -88,10 +88,14 @@ struct DashboardView: View {
                 }
             }
         }
-        .task(id: githubViewModel.accounts.map(\.id)) {
+        .task(id: accountRefreshKey) {
             $expandedGitHubAccountCards.migrateLegacyExpansion(to: githubViewModel.accounts.first?.id)
             await refreshConnectedAccounts()
         }
+    }
+
+    private var accountRefreshKey: [String] {
+        githubViewModel.accounts.map { "\($0.id.rawValue):\($0.state.rawValue)" }
     }
 
     private var dashboardPresentation: DashboardPresentation {

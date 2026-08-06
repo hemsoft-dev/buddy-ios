@@ -34,38 +34,52 @@ protocol ConnectedAccountStoring: Sendable {
 }
 
 actor UserDefaultsConnectedAccountStore: ConnectedAccountStoring {
-    private static let key = "connected-accounts.v1"
+    static let key = "connected-accounts.v1"
 
     private let defaults: UserDefaults
     private var records: [ConnectedAccountRecord]
+    private let loadingError: Error?
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: sending UserDefaults = .standard) {
         self.defaults = defaults
-        if let data = defaults.data(forKey: Self.key),
-           let decoded = try? JSONDecoder().decode([ConnectedAccountRecord].self, from: data) {
-            records = decoded
-        } else {
+        guard let data = defaults.data(forKey: Self.key) else {
             records = []
+            loadingError = nil
+            return
+        }
+        do {
+            records = try JSONDecoder().decode([ConnectedAccountRecord].self, from: data)
+            loadingError = nil
+        } catch {
+            records = []
+            loadingError = error
         }
     }
 
-    func accounts(for provider: IntegrationProvider) -> [ConnectedAccountRecord] {
-        records.filter { $0.id.provider == provider }.sorted { $0.id < $1.id }
+    func accounts(for provider: IntegrationProvider) throws -> [ConnectedAccountRecord] {
+        try ensureLoaded()
+        return records.filter { $0.id.provider == provider }.sorted { $0.id < $1.id }
     }
 
     func upsert(_ account: ConnectedAccountRecord) throws {
+        try ensureLoaded()
         records.removeAll { $0.id == account.id }
         records.append(account)
         try persist()
     }
 
     func remove(_ id: ConnectedAccountID) throws {
+        try ensureLoaded()
         records.removeAll { $0.id == id }
         try persist()
     }
 
     private func persist() throws {
         defaults.set(try JSONEncoder().encode(records.sorted { $0.id < $1.id }), forKey: Self.key)
+    }
+
+    private func ensureLoaded() throws {
+        if let loadingError { throw loadingError }
     }
 }
 

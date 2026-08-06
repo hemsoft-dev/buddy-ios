@@ -51,6 +51,14 @@ actor KeychainStore {
         }
     }
 
+    /// Atomically compares and removes within this actor so a concurrent reconnect
+    /// cannot have its replacement credential deleted by a stale request.
+    func removeData(for account: String, ifMatches expectedData: Data) throws -> Bool {
+        guard try data(for: account) == expectedData else { return false }
+        try removeData(for: account)
+        return true
+    }
+
     private func baseQuery(for account: String) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
