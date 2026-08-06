@@ -276,14 +276,40 @@ actor GitHubIntegration: IntegrationProviding {
 
     func disconnect(accountID: ConnectedAccountID) async throws {
         accountGenerations[accountID, default: 0] &+= 1
+        let generation = accountGenerations[accountID, default: 0]
         accountAuthorizations = accountAuthorizations.filter { $0.value.targetID != accountID }
         do {
             // Singleton credentials are pre-migration state and are never authoritative
             // once account-scoped records are presented. Clear the legacy item locally
             // so disconnect remains durable while offline.
             try await credentials.removeData(for: Self.credentialAccount)
-            try await credentials.removeData(for: Self.credentialAccount(for: accountID))
+            guard generation == accountGenerations[accountID, default: 0] else {
+                throw CancellationError()
+            }
+
+            // Remove metadata before the scoped token. If a reconnect begins while an
+            // awaited deletion is in flight, its later upsert wins; generation checks
+            // prevent this older disconnect from advancing to the next destructive step.
             try await accountStore.remove(accountID)
+            guard generation == accountGenerations[accountID, default: 0] else {
+                throw CancellationError()
+            }
+
+            let credentialAccount = Self.credentialAccount(for: accountID)
+            if let tokenData = try await credentials.data(for: credentialAccount) {
+                guard generation == accountGenerations[accountID, default: 0] else {
+                    throw CancellationError()
+                }
+                _ = try await credentials.removeData(
+                    for: credentialAccount,
+                    ifMatches: tokenData
+                )
+            }
+            guard generation == accountGenerations[accountID, default: 0] else {
+                throw CancellationError()
+            }
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw GitHubConnectionError.credentialStorage
         }
@@ -395,7 +421,8 @@ actor GitHubIntegration: IntegrationProviding {
             return GitHubAccountConnection(
                 account: account,
                 state: .needsAttention,
-                message: GitHubConnectionError.credentialStorage.localizedDescription
+                message: GitHubConnectionError.credentialStorage.localizedDescription,
+                recoveryAction: .validate
             )
         }
         guard generation == accountGenerations[record.id, default: 0] else { return nil }
@@ -414,7 +441,8 @@ actor GitHubIntegration: IntegrationProviding {
             return GitHubAccountConnection(
                 account: account,
                 state: .needsAttention,
-                message: GitHubConnectionError.invalidToken.localizedDescription
+                message: GitHubConnectionError.invalidToken.localizedDescription,
+                recoveryAction: .reconnect
             )
         }
 
@@ -425,7 +453,8 @@ actor GitHubIntegration: IntegrationProviding {
                 return GitHubAccountConnection(
                     account: account,
                     state: .needsAttention,
-                    message: GitHubConnectionError.accountMismatch.localizedDescription
+                    message: GitHubConnectionError.accountMismatch.localizedDescription,
+                    recoveryAction: .reconnect
                 )
             }
             try? await accountStore.upsert(refreshed.connectedAccountRecord)
@@ -446,14 +475,16 @@ actor GitHubIntegration: IntegrationProviding {
             return GitHubAccountConnection(
                 account: account,
                 state: .needsAttention,
-                message: GitHubConnectionError.invalidToken.localizedDescription
+                message: GitHubConnectionError.invalidToken.localizedDescription,
+                recoveryAction: .reconnect
             )
         } catch {
             guard generation == accountGenerations[record.id, default: 0] else { return nil }
             return GitHubAccountConnection(
                 account: account,
                 state: .needsAttention,
-                message: map(error).localizedDescription
+                message: map(error).localizedDescription,
+                recoveryAction: .validate
             )
         }
     }
@@ -971,18 +1002,26 @@ struct GitHubAccountConnection: Identifiable, Equatable, Sendable {
     let account: GitHubAccount
     var state: IntegrationConnectionState
     var message: String?
+    var recoveryAction: GitHubAccountRecoveryAction?
 
     var id: ConnectedAccountID { account.connectedAccountID }
 
     init(
         account: GitHubAccount,
         state: IntegrationConnectionState,
-        message: String? = nil
+        message: String? = nil,
+        recoveryAction: GitHubAccountRecoveryAction? = nil
     ) {
         self.account = account
         self.state = state
         self.message = message
+        self.recoveryAction = recoveryAction
     }
+}
+
+enum GitHubAccountRecoveryAction: Equatable, Sendable {
+    case validate
+    case reconnect
 }
 
 private final class LockedGitHubSummary: @unchecked Sendable {

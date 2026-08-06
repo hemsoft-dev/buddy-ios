@@ -151,7 +151,7 @@ struct GitHubView: View {
         } actions: {
             Button("Try Again") {
                 if let accountID {
-                    viewModel.reconnect(accountID, openURL: openURL)
+                    viewModel.retry(accountID, openURL: openURL)
                 } else {
                     viewModel.addAccount(openURL: openURL) { addedAccountID = $0 }
                 }
@@ -241,6 +241,16 @@ final class GitHubViewModel {
         authorizeAccount(reconnecting: id, openURL: openURL)
     }
 
+    func retry(_ id: ConnectedAccountID, openURL: OpenURLAction) {
+        guard let connection = accounts.first(where: { $0.id == id }),
+              connection.recoveryAction == .validate
+        else {
+            reconnect(id, openURL: openURL)
+            return
+        }
+        Task { await performRestore() }
+    }
+
     private func authorizeAccount(
         reconnecting id: ConnectedAccountID?,
         openURL: OpenURLAction,
@@ -295,6 +305,7 @@ final class GitHubViewModel {
                     }
                     accounts[index].state = .needsAttention
                     accounts[index].message = error.localizedDescription
+                    accounts[index].recoveryAction = .reconnect
                 }
                 state = .needsAttention(error.localizedDescription)
             }
@@ -317,11 +328,17 @@ final class GitHubViewModel {
         if activeAccountAuthorizationTarget == id {
             cancelAccountAuthorization()
         }
+        operationGeneration &+= 1
+        let generation = operationGeneration
         do {
             try await integration.disconnect(accountID: id)
+            guard generation == operationGeneration else { return }
             accounts.removeAll { $0.id == id }
             state = preferredRestingState
+        } catch is CancellationError {
+            return
         } catch {
+            guard generation == operationGeneration else { return }
             if let index = accounts.firstIndex(where: { $0.id == id }) {
                 accounts[index].state = .needsAttention
                 accounts[index].message = error.localizedDescription
@@ -334,6 +351,7 @@ final class GitHubViewModel {
         guard let index = accounts.firstIndex(where: { $0.id == id }) else { return }
         accounts[index].state = .needsAttention
         accounts[index].message = GitHubConnectionError.invalidToken.localizedDescription
+        accounts[index].recoveryAction = .reconnect
         state = preferredRestingState
     }
 
