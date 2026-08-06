@@ -12,7 +12,7 @@ final class DashboardViewModelTests: XCTestCase {
 
         let preference = DashboardGitHubCardExpansionStorage(store: defaults)
 
-        XCTAssertFalse(preference.wrappedValue)
+        XCTAssertTrue(preference.wrappedValue.isEmpty)
     }
 
     func testGitHubCardPersistsExplicitExpansionChoice() throws {
@@ -21,12 +21,53 @@ final class DashboardViewModelTests: XCTestCase {
         defaults.removePersistentDomain(forName: suiteName)
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
+        let firstAccountID = ConnectedAccountID(provider: .github, subject: "42")
+        let secondAccountID = ConnectedAccountID(provider: .github, subject: "84")
         let preference = DashboardGitHubCardExpansionStorage(store: defaults)
-        preference.wrappedValue = true
+        preference.wrappedValue = [firstAccountID]
 
         let recreatedPreference = DashboardGitHubCardExpansionStorage(store: defaults)
 
-        XCTAssertTrue(recreatedPreference.wrappedValue)
+        XCTAssertEqual(recreatedPreference.wrappedValue, [firstAccountID])
+        XCTAssertFalse(recreatedPreference.wrappedValue.contains(secondAccountID))
+    }
+
+    func testGitHubCardExpansionStaysIsolatedAcrossAccountsAndStorageRecreation() throws {
+        let suiteName = "DashboardViewModelTests.multi-account-persistence.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let firstAccountID = ConnectedAccountID(provider: .github, subject: "42")
+        let secondAccountID = ConnectedAccountID(provider: .github, subject: "84")
+
+        let preference = DashboardGitHubCardExpansionStorage(store: defaults)
+        preference.wrappedValue = [firstAccountID]
+        var changed = preference.wrappedValue
+        changed.remove(firstAccountID)
+        changed.insert(secondAccountID)
+        preference.wrappedValue = changed
+
+        let recreatedPreference = DashboardGitHubCardExpansionStorage(store: defaults)
+        XCTAssertFalse(recreatedPreference.wrappedValue.contains(firstAccountID))
+        XCTAssertTrue(recreatedPreference.wrappedValue.contains(secondAccountID))
+    }
+
+    func testGitHubCardMigratesLegacyExpansionToFirstAccountOnly() throws {
+        let suiteName = "DashboardViewModelTests.legacy-persistence.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let firstAccountID = ConnectedAccountID(provider: .github, subject: "42")
+        let secondAccountID = ConnectedAccountID(provider: .github, subject: "84")
+        defaults.set(true, forKey: DashboardGitHubCardExpansionStorage.legacyKey)
+
+        let preference = DashboardGitHubCardExpansionStorage(store: defaults)
+        preference.migrateLegacyExpansion(to: firstAccountID)
+
+        let recreatedPreference = DashboardGitHubCardExpansionStorage(store: defaults)
+        XCTAssertEqual(recreatedPreference.wrappedValue, [firstAccountID])
+        XCTAssertFalse(recreatedPreference.wrappedValue.contains(secondAccountID))
+        XCTAssertFalse(defaults.bool(forKey: DashboardGitHubCardExpansionStorage.legacyKey))
     }
 
     func testPullRequestRepositoryGroupsSortRepositoriesAndRecentActivity() {
@@ -330,6 +371,40 @@ final class DashboardViewModelTests: XCTestCase {
         XCTAssertEqual(failure, .offline)
         XCTAssertEqual(viewModel.githubState, .failed([], refreshedAt: nil, .offline))
         XCTAssertEqual(viewModel.githubTotalCount, 0)
+    }
+
+    func testGitHubDashboardRetainsIndependentStateForMultipleAccountCards() async {
+        let refreshDate = Date(timeIntervalSince1970: 4_500)
+        let firstPullRequest = makePullRequest(id: 1, updatedAt: refreshDate)
+        let secondPullRequest = makePullRequest(
+            id: 2,
+            repository: "HemSoft/Other",
+            updatedAt: refreshDate
+        )
+        let secondAccount = GitHubAccount(id: 84, login: "hubot", name: nil, avatarURL: nil)
+        let provider = StubPullRequestProvider(results: [
+            .success(collection([firstPullRequest], totalCount: 3)),
+            .success(collection([secondPullRequest], totalCount: 1)),
+        ])
+        let viewModel = DashboardViewModel(
+            integrations: [],
+            github: provider,
+            now: { refreshDate }
+        )
+
+        await viewModel.refresh(account: testAccount)
+        await viewModel.refresh(account: secondAccount)
+
+        XCTAssertEqual(
+            viewModel.githubState(for: testAccount),
+            .loaded([firstPullRequest], refreshedAt: refreshDate)
+        )
+        XCTAssertEqual(
+            viewModel.githubState(for: secondAccount),
+            .loaded([secondPullRequest], refreshedAt: refreshDate)
+        )
+        XCTAssertEqual(viewModel.githubTotalCount(for: testAccount), 3)
+        XCTAssertEqual(viewModel.githubTotalCount(for: secondAccount), 1)
     }
 
     func testGitHubDashboardBlocksDuplicateInitialRefreshes() async {

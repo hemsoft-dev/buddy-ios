@@ -2,7 +2,7 @@ import SwiftUI
 
 enum SettingsRoute: Hashable {
     case accounts
-    case github
+    case github(ConnectedAccountID?)
 }
 
 struct SettingsView: View {
@@ -35,8 +35,8 @@ struct SettingsView: View {
                 switch route {
                 case .accounts:
                     AccountsSettingsView(githubViewModel: githubViewModel)
-                case .github:
-                    GitHubView(viewModel: githubViewModel)
+                case let .github(accountID):
+                    GitHubView(viewModel: githubViewModel, accountID: accountID)
                 }
             }
         }
@@ -49,39 +49,56 @@ private struct AccountsSettingsView: View {
     var body: some View {
         List {
             Section {
-                NavigationLink(value: SettingsRoute.github) {
-                    HStack(spacing: BuddyTheme.Spacing.medium) {
-                        Image(systemName: "chevron.left.forwardslash.chevron.right")
-                            .foregroundStyle(BuddyTheme.accent)
-                            .accessibilityHidden(true)
-
-                        VStack(alignment: .leading, spacing: BuddyTheme.Spacing.xSmall) {
-                            Text("GitHub")
-                            Text(githubViewModel.state.settingsStatus)
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                        }
-
-                        Spacer(minLength: BuddyTheme.Spacing.small)
-
-                        if githubViewModel.state == .loading {
-                            ProgressView()
+                ForEach(githubViewModel.accounts) { connection in
+                    NavigationLink(value: SettingsRoute.github(connection.id)) {
+                        HStack(spacing: BuddyTheme.Spacing.medium) {
+                            Image(systemName: "chevron.left.forwardslash.chevron.right")
+                                .foregroundStyle(BuddyTheme.accent)
                                 .accessibilityHidden(true)
-                        } else {
-                            Image(systemName: githubViewModel.state.settingsSystemImage)
-                                .foregroundStyle(githubViewModel.state.settingsTint)
+
+                            VStack(alignment: .leading, spacing: BuddyTheme.Spacing.xSmall) {
+                                Text("@\(connection.account.login)")
+                                Text(connection.settingsStatus)
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            Spacer(minLength: BuddyTheme.Spacing.small)
+
+                            Image(systemName: connection.settingsSystemImage)
+                                .foregroundStyle(connection.settingsTint)
                                 .accessibilityHidden(true)
                         }
                     }
+                    .accessibilityLabel("GitHub @\(connection.account.login), \(connection.settingsStatus)")
+                    .accessibilityHint("Manage this GitHub account")
                 }
-                .accessibilityLabel("GitHub, \(githubViewModel.state.settingsStatus)")
-                .accessibilityHint("Manage your GitHub connection")
+
+                NavigationLink(value: SettingsRoute.github(nil)) {
+                    Label("Add account", systemImage: "person.crop.circle.badge.plus")
+                }
+                .accessibilityHint("Connect another GitHub account")
+            } header: {
+                Text("GitHub")
             } footer: {
                 Text("Account credentials stay in this device's Keychain.")
             }
         }
         .navigationTitle("Accounts")
     }
+}
+
+private extension GitHubAccountConnection {
+    var settingsStatus: String {
+        switch state {
+        case .connected: "Connected"
+        case .disconnected: "Not connected"
+        case .needsAttention: "Needs attention"
+        }
+    }
+
+    var settingsSystemImage: String { state.systemImage }
+    var settingsTint: Color { state.tint }
 }
 
 extension GitHubViewState {

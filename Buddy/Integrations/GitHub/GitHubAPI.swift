@@ -13,6 +13,33 @@ struct GitHubAccount: Hashable, Sendable {
     let login: String
     let name: String?
     let avatarURL: URL?
+
+    init(id: Int, login: String, name: String?, avatarURL: URL?) {
+        self.id = id
+        self.login = login
+        self.name = name
+        self.avatarURL = avatarURL
+    }
+
+    var connectedAccountID: ConnectedAccountID {
+        ConnectedAccountID(provider: .github, subject: String(id))
+    }
+
+    var connectedAccountRecord: ConnectedAccountRecord {
+        ConnectedAccountRecord(
+            id: connectedAccountID,
+            username: login,
+            displayName: name,
+            avatarURL: avatarURL
+        )
+    }
+
+    init(record: ConnectedAccountRecord) {
+        id = Int(record.id.subject) ?? 0
+        login = record.username
+        name = record.displayName
+        avatarURL = record.avatarURL
+    }
 }
 
 struct GitHubPullRequest: Identifiable, Equatable, Sendable {

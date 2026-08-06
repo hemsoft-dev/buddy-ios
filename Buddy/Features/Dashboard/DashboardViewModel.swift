@@ -164,15 +164,41 @@ final class DashboardViewModel {
     private(set) var cards: [DashboardCard]
     private(set) var isRefreshing = false
     private(set) var lastUpdated: Date?
-    private(set) var githubState = GitHubPullRequestDashboardState.loading
-    private(set) var githubTotalCount = 0
-    private(set) var isGitHubRefreshInFlight = false
+    private(set) var githubStates: [ConnectedAccountID: GitHubPullRequestDashboardState] = [:]
+    private(set) var githubTotalCounts: [ConnectedAccountID: Int] = [:]
+    private(set) var githubRefreshesInFlight: Set<ConnectedAccountID> = []
 
     private let integrations: [any IntegrationProviding]
     private let github: any GitHubPullRequestProviding
     private let now: @MainActor @Sendable () -> Date
     private(set) var githubAccountID: Int?
-    private var githubRefreshGeneration = 0
+    private var githubRefreshGenerations: [ConnectedAccountID: Int] = [:]
+
+    var githubState: GitHubPullRequestDashboardState {
+        guard let githubAccountID else { return .loading }
+        let id = ConnectedAccountID(provider: .github, subject: String(githubAccountID))
+        return githubStates[id] ?? .loading
+    }
+
+    var githubTotalCount: Int {
+        guard let githubAccountID else { return 0 }
+        let id = ConnectedAccountID(provider: .github, subject: String(githubAccountID))
+        return githubTotalCounts[id] ?? 0
+    }
+
+    var isGitHubRefreshInFlight: Bool { !githubRefreshesInFlight.isEmpty }
+
+    func githubState(for account: GitHubAccount) -> GitHubPullRequestDashboardState {
+        githubStates[account.connectedAccountID] ?? .loading
+    }
+
+    func githubTotalCount(for account: GitHubAccount) -> Int {
+        githubTotalCounts[account.connectedAccountID] ?? 0
+    }
+
+    func isGitHubRefreshInFlight(for account: GitHubAccount) -> Bool {
+        githubRefreshesInFlight.contains(account.connectedAccountID)
+    }
 
     init(
         integrations: [any IntegrationProviding],
@@ -187,26 +213,22 @@ final class DashboardViewModel {
 
     @discardableResult
     func refresh(account: GitHubAccount) async -> GitHubPullRequestFailure? {
-        let accountChanged = githubAccountID != account.id
-        if accountChanged {
-            githubAccountID = account.id
-            githubState = .loading
-            githubTotalCount = 0
-        }
-        guard !isGitHubRefreshInFlight || accountChanged else { return nil }
+        let accountID = account.connectedAccountID
+        githubAccountID = account.id
+        guard !githubRefreshesInFlight.contains(accountID) else { return nil }
 
-        let requestedAccountID = account.id
-        githubRefreshGeneration &+= 1
-        let refreshGeneration = githubRefreshGeneration
-        isGitHubRefreshInFlight = true
+        githubRefreshGenerations[accountID, default: 0] &+= 1
+        let refreshGeneration = githubRefreshGenerations[accountID]
+        githubRefreshesInFlight.insert(accountID)
         defer {
-            if githubRefreshGeneration == refreshGeneration {
-                isGitHubRefreshInFlight = false
+            if githubRefreshGenerations[accountID] == refreshGeneration {
+                githubRefreshesInFlight.remove(accountID)
             }
         }
-        let previousPullRequests = githubState.pullRequests
-        let previousRefreshDate = githubState.refreshedAt
-        githubState = previousRefreshDate == nil && previousPullRequests.isEmpty
+        let previousState = githubStates[accountID] ?? .loading
+        let previousPullRequests = previousState.pullRequests
+        let previousRefreshDate = previousState.refreshedAt
+        githubStates[accountID] = previousRefreshDate == nil && previousPullRequests.isEmpty
             ? .loading
             : .refreshing(previousPullRequests, refreshedAt: previousRefreshDate)
 
@@ -214,28 +236,22 @@ final class DashboardViewModel {
             let collection = try await github.authoredPullRequests(for: account)
             let pullRequests = collection.pullRequests
                 .sorted { $0.updatedAt > $1.updatedAt }
-            guard githubAccountID == requestedAccountID,
-                  githubRefreshGeneration == refreshGeneration
-            else { return nil }
-            githubTotalCount = collection.totalCount
-            githubState = .loaded(pullRequests, refreshedAt: now())
+            guard githubRefreshGenerations[accountID] == refreshGeneration else { return nil }
+            githubTotalCounts[accountID] = collection.totalCount
+            githubStates[accountID] = .loaded(pullRequests, refreshedAt: now())
             return nil
         } catch is CancellationError {
-            guard githubAccountID == requestedAccountID,
-                  githubRefreshGeneration == refreshGeneration
-            else { return nil }
+            guard githubRefreshGenerations[accountID] == refreshGeneration else { return nil }
             if let previousRefreshDate {
-                githubState = .loaded(previousPullRequests, refreshedAt: previousRefreshDate)
+                githubStates[accountID] = .loaded(previousPullRequests, refreshedAt: previousRefreshDate)
             } else {
-                githubState = .loading
+                githubStates[accountID] = .loading
             }
             return nil
         } catch {
-            guard githubAccountID == requestedAccountID,
-                  githubRefreshGeneration == refreshGeneration
-            else { return nil }
+            guard githubRefreshGenerations[accountID] == refreshGeneration else { return nil }
             let failure = Self.mapGitHubFailure(error)
-            githubState = .failed(
+            githubStates[accountID] = .failed(
                 previousPullRequests,
                 refreshedAt: previousRefreshDate,
                 failure
@@ -290,6 +306,8 @@ final class DashboardViewModel {
             .server
         case .credentialStorage:
             .credentialStorage
+        case .accountStorage, .accountMismatch:
+            .unknown
         default:
             .unknown
         }

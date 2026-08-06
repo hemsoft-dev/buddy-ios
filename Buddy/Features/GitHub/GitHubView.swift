@@ -4,10 +4,16 @@ import SwiftUI
 struct GitHubView: View {
     @Environment(\.openURL) private var openURL
     let viewModel: GitHubViewModel
+    let accountID: ConnectedAccountID?
+
+    init(viewModel: GitHubViewModel, accountID: ConnectedAccountID? = nil) {
+        self.viewModel = viewModel
+        self.accountID = accountID
+    }
 
     var body: some View {
         Group {
-            switch viewModel.state {
+            switch presentationState {
             case .loading:
                 ProgressView("Checking GitHub connection…")
             case .disconnected:
@@ -25,6 +31,30 @@ struct GitHubView: View {
         .navigationTitle("GitHub")
     }
 
+    private var presentationState: GitHubViewState {
+        if case let .authorizing(authorization) = viewModel.state,
+           viewModel.activeAccountAuthorizationTarget == accountID {
+            return .authorizing(authorization)
+        }
+        if let accountID,
+           let connection = viewModel.accounts.first(where: { $0.id == accountID }) {
+            if connection.state == .needsAttention {
+                return .needsAttention(connection.message ?? GitHubConnectionError.invalidToken.localizedDescription)
+            }
+            return .connected(connection.account)
+        }
+        if accountID != nil {
+            return .disconnected
+        }
+        if viewModel.accounts.isEmpty, viewModel.state == .loading {
+            return .loading
+        }
+        if !viewModel.integrationIsAuthorizationConfigured {
+            return .configurationRequired(GitHubConnectionError.missingClientID.localizedDescription)
+        }
+        return .disconnected
+    }
+
     private func configurationRequiredContent(_ message: String) -> some View {
         ContentUnavailableView {
             Label("GitHub Isn't Configured", systemImage: "wrench.and.screwdriver.fill")
@@ -40,7 +70,11 @@ struct GitHubView: View {
             Text("Authorize Buddy to read your public GitHub identity. Your access token stays in this device's Keychain.")
         } actions: {
             Button("Connect GitHub") {
-                viewModel.connect(openURL: openURL)
+                if let accountID {
+                    viewModel.reconnect(accountID, openURL: openURL)
+                } else {
+                    viewModel.addAccount(openURL: openURL)
+                }
             }
             .buttonStyle(.borderedProminent)
         }
@@ -70,7 +104,7 @@ struct GitHubView: View {
             .buttonStyle(.borderedProminent)
 
             Button("Cancel", role: .cancel) {
-                viewModel.cancel()
+                viewModel.cancelAccountAuthorization()
             }
         }
         .padding(BuddyTheme.Spacing.medium)
@@ -87,8 +121,12 @@ struct GitHubView: View {
             }
 
             Section {
+                Button("Reconnect account") {
+                    viewModel.reconnect(account.connectedAccountID, openURL: openURL)
+                }
+
                 Button("Disconnect GitHub", role: .destructive) {
-                    Task { await viewModel.disconnect() }
+                    Task { await viewModel.disconnect(account.connectedAccountID) }
                 }
             } footer: {
                 Text("Disconnecting removes Buddy's GitHub access token from this device.")
@@ -103,12 +141,20 @@ struct GitHubView: View {
             Text(message)
         } actions: {
             Button("Try Again") {
-                viewModel.retry(openURL: openURL)
+                if let accountID {
+                    viewModel.reconnect(accountID, openURL: openURL)
+                } else {
+                    viewModel.addAccount(openURL: openURL)
+                }
             }
             .buttonStyle(.borderedProminent)
 
             Button("Disconnect", role: .destructive) {
-                Task { await viewModel.disconnect() }
+                if let accountID {
+                    Task { await viewModel.disconnect(accountID) }
+                } else {
+                    viewModel.cancelAccountAuthorization()
+                }
             }
         }
     }
@@ -118,15 +164,23 @@ struct GitHubView: View {
 @Observable
 final class GitHubViewModel {
     private(set) var state: GitHubViewState = .loading
+    private(set) var accounts: [GitHubAccountConnection] = []
+    private(set) var activeAccountAuthorizationTarget: ConnectedAccountID?
 
     private let integration: GitHubIntegration
     private var connectionTask: Task<Void, Never>?
+    private var accountConnectionTask: Task<Void, Never>?
+    private var activeAccountAuthorization: GitHubDeviceAuthorization?
     private var cancellationTask: Task<Void, Error>?
     private var retryAction = RetryAction.restore
     private var operationGeneration = 0
 
     init(integration: GitHubIntegration = IntegrationCatalog.github) {
         self.integration = integration
+    }
+
+    var integrationIsAuthorizationConfigured: Bool {
+        integration.isAuthorizationConfigured
     }
 
     func restore() async {
@@ -145,9 +199,14 @@ final class GitHubViewModel {
         state = .loading
 
         do {
-            if let account = try await integration.restoreAccount() {
+            let restoredAccounts = try await integration.restoreAccounts()
+            guard generation == operationGeneration else { return }
+            accounts = restoredAccounts
+            if let account = restoredAccounts.first(where: { $0.state == .connected })?.account {
                 guard generation == operationGeneration else { return }
                 state = .connected(account)
+            } else if let message = restoredAccounts.first?.message {
+                state = .needsAttention(message)
             } else {
                 guard generation == operationGeneration else { return }
                 state = disconnectedState
@@ -159,6 +218,115 @@ final class GitHubViewModel {
             retryAction = (error as? GitHubConnectionError) == .invalidToken ? .connect : .restore
             state = .needsAttention(error.localizedDescription)
         }
+    }
+
+    func addAccount(openURL: OpenURLAction) {
+        authorizeAccount(reconnecting: nil, openURL: openURL)
+    }
+
+    func reconnect(_ id: ConnectedAccountID, openURL: OpenURLAction) {
+        authorizeAccount(reconnecting: id, openURL: openURL)
+    }
+
+    private func authorizeAccount(
+        reconnecting id: ConnectedAccountID?,
+        openURL: OpenURLAction
+    ) {
+        operationGeneration &+= 1
+        let generation = operationGeneration
+        accountConnectionTask?.cancel()
+        activeAccountAuthorizationTarget = id
+        accountConnectionTask = Task {
+            var authorization: GitHubDeviceAuthorization?
+            defer {
+                if generation == operationGeneration {
+                    accountConnectionTask = nil
+                    activeAccountAuthorization = nil
+                    activeAccountAuthorizationTarget = nil
+                }
+            }
+            do {
+                let startedAuthorization = try await integration.beginAccountAuthorization(reconnecting: id)
+                authorization = startedAuthorization
+                guard generation == operationGeneration else {
+                    await integration.cancelAccountAuthorization(startedAuthorization)
+                    return
+                }
+                activeAccountAuthorization = startedAuthorization
+                try Task.checkCancellation()
+                state = .authorizing(startedAuthorization)
+                openURL(startedAuthorization.verificationURI)
+
+                let connection = try await integration.completeAccountAuthorization(startedAuthorization)
+                try Task.checkCancellation()
+                guard generation == operationGeneration else { return }
+                accounts.removeAll { $0.id == connection.id }
+                accounts.append(connection)
+                accounts.sort { $0.id < $1.id }
+                state = .connected(connection.account)
+            } catch is CancellationError {
+                if let authorization {
+                    await integration.cancelAccountAuthorization(authorization)
+                }
+                guard generation == operationGeneration else { return }
+                state = preferredRestingState
+            } catch {
+                guard generation == operationGeneration else { return }
+                if let id,
+                   let index = accounts.firstIndex(where: { $0.id == id }) {
+                    accounts[index].state = .needsAttention
+                    accounts[index].message = error.localizedDescription
+                }
+                state = .needsAttention(error.localizedDescription)
+            }
+        }
+    }
+
+    func cancelAccountAuthorization() {
+        operationGeneration &+= 1
+        accountConnectionTask?.cancel()
+        accountConnectionTask = nil
+        if let activeAccountAuthorization {
+            Task { await integration.cancelAccountAuthorization(activeAccountAuthorization) }
+        }
+        activeAccountAuthorization = nil
+        activeAccountAuthorizationTarget = nil
+        state = preferredRestingState
+    }
+
+    func disconnect(_ id: ConnectedAccountID) async {
+        if activeAccountAuthorizationTarget == id {
+            cancelAccountAuthorization()
+        }
+        do {
+            try await integration.disconnect(accountID: id)
+            accounts.removeAll { $0.id == id }
+            state = preferredRestingState
+        } catch {
+            if let index = accounts.firstIndex(where: { $0.id == id }) {
+                accounts[index].state = .needsAttention
+                accounts[index].message = error.localizedDescription
+            }
+            state = .needsAttention(error.localizedDescription)
+        }
+    }
+
+    func reportDashboardAuthenticationFailure(for id: ConnectedAccountID) {
+        if let index = accounts.firstIndex(where: { $0.id == id }) {
+            accounts[index].state = .needsAttention
+            accounts[index].message = GitHubConnectionError.invalidToken.localizedDescription
+        }
+        state = .needsAttention(GitHubConnectionError.invalidToken.localizedDescription)
+    }
+
+    private var preferredRestingState: GitHubViewState {
+        if let account = accounts.first(where: { $0.state == .connected })?.account {
+            return .connected(account)
+        }
+        if let message = accounts.first?.message {
+            return .needsAttention(message)
+        }
+        return disconnectedState
     }
 
     func connect(openURL: OpenURLAction) {
