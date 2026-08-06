@@ -67,7 +67,95 @@ enum GitHubPullRequestDashboardState: Equatable, Sendable {
             refreshedAt
         }
     }
+}
 
+struct GitHubPullRequestRepositoryGroup: Identifiable, Equatable, Sendable {
+    let id: String
+    let pullRequests: [GitHubPullRequest]
+
+    static func grouped(_ pullRequests: [GitHubPullRequest]) -> [Self] {
+        Dictionary(grouping: pullRequests, by: \.repository)
+            .map { repository, pullRequests in
+                Self(
+                    id: repository,
+                    pullRequests: pullRequests.sorted {
+                        if $0.updatedAt != $1.updatedAt {
+                            return $0.updatedAt > $1.updatedAt
+                        }
+                        return $0.id < $1.id
+                    }
+                )
+            }
+            .sorted {
+                let left = $0.id.lowercased()
+                let right = $1.id.lowercased()
+                return left == right ? $0.id < $1.id : left < right
+            }
+    }
+}
+
+struct DashboardGitHubPullRequestTreeSnapshot: Equatable {
+    let accountID: Int
+    let repositories: [String]
+
+    init?(
+        accountID: Int,
+        dataAccountID: Int?,
+        state: GitHubPullRequestDashboardState
+    ) {
+        guard dataAccountID == accountID else { return nil }
+
+        let pullRequests: [GitHubPullRequest]
+        switch state {
+        case .loading:
+            return nil
+        case let .loaded(loadedPullRequests, _):
+            pullRequests = loadedPullRequests
+        case let .refreshing(previousPullRequests, refreshedAt):
+            guard refreshedAt != nil || !previousPullRequests.isEmpty else { return nil }
+            pullRequests = previousPullRequests
+        case let .failed(previousPullRequests, refreshedAt, _):
+            guard refreshedAt != nil || !previousPullRequests.isEmpty else { return nil }
+            pullRequests = previousPullRequests
+        }
+
+        self.accountID = accountID
+        repositories = GitHubPullRequestRepositoryGroup.grouped(pullRequests).map(\.id)
+    }
+}
+
+struct DashboardGitHubPullRequestTreeExpansionState: Equatable {
+    private struct AccountState: Equatable {
+        var isPullRequestSectionExpanded = false
+        var expandedRepositories: Set<String> = []
+    }
+
+    private var accounts: [Int: AccountState] = [:]
+
+    func isPullRequestSectionExpanded(for accountID: Int) -> Bool {
+        accounts[accountID]?.isPullRequestSectionExpanded ?? false
+    }
+
+    func isRepositoryExpanded(_ repository: String, for accountID: Int) -> Bool {
+        accounts[accountID]?.expandedRepositories.contains(repository) ?? false
+    }
+
+    mutating func togglePullRequestSection(for accountID: Int) {
+        accounts[accountID, default: AccountState()].isPullRequestSectionExpanded.toggle()
+    }
+
+    mutating func toggleRepository(_ repository: String, for accountID: Int) {
+        if accounts[accountID, default: AccountState()].expandedRepositories.contains(repository) {
+            accounts[accountID]?.expandedRepositories.remove(repository)
+        } else {
+            accounts[accountID]?.expandedRepositories.insert(repository)
+        }
+    }
+
+    mutating func reconcile(accountID: Int, repositories: [String]) {
+        accounts[accountID, default: AccountState()]
+            .expandedRepositories.formIntersection(repositories)
+    }
 }
 
 @MainActor
@@ -83,7 +171,7 @@ final class DashboardViewModel {
     private let integrations: [any IntegrationProviding]
     private let github: any GitHubPullRequestProviding
     private let now: @MainActor @Sendable () -> Date
-    private var githubAccountID: Int?
+    private(set) var githubAccountID: Int?
     private var githubRefreshGeneration = 0
 
     init(

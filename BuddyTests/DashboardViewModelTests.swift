@@ -29,6 +29,125 @@ final class DashboardViewModelTests: XCTestCase {
         XCTAssertTrue(recreatedPreference.wrappedValue)
     }
 
+    func testPullRequestRepositoryGroupsSortRepositoriesAndRecentActivity() {
+        let groups = GitHubPullRequestRepositoryGroup.grouped([
+            makePullRequest(
+                id: 1,
+                repository: "HemSoft/Zebra",
+                updatedAt: Date(timeIntervalSince1970: 300)
+            ),
+            makePullRequest(
+                id: 2,
+                repository: "HemSoft/alpha",
+                updatedAt: Date(timeIntervalSince1970: 100)
+            ),
+            makePullRequest(
+                id: 3,
+                repository: "HemSoft/alpha",
+                updatedAt: Date(timeIntervalSince1970: 200)
+            ),
+        ])
+
+        XCTAssertEqual(groups.map(\.id), ["HemSoft/alpha", "HemSoft/Zebra"])
+        XCTAssertEqual(groups[0].pullRequests.map(\.id), [3, 2])
+        XCTAssertEqual(groups[1].pullRequests.map(\.id), [1])
+    }
+
+    func testPullRequestTreeExpansionSurvivesRefreshForExistingRepositories() {
+        var expansion = DashboardGitHubPullRequestTreeExpansionState()
+        expansion.reconcile(accountID: testAccount.id, repositories: ["HemSoft/Buddy", "HemSoft/Other"])
+        expansion.togglePullRequestSection(for: testAccount.id)
+        expansion.toggleRepository("HemSoft/Buddy", for: testAccount.id)
+
+        expansion.reconcile(accountID: testAccount.id, repositories: ["HemSoft/Buddy", "HemSoft/New"])
+
+        XCTAssertTrue(expansion.isPullRequestSectionExpanded(for: testAccount.id))
+        XCTAssertTrue(expansion.isRepositoryExpanded("HemSoft/Buddy", for: testAccount.id))
+        XCTAssertFalse(expansion.isRepositoryExpanded("HemSoft/New", for: testAccount.id))
+
+        expansion.reconcile(accountID: testAccount.id, repositories: ["HemSoft/New"])
+        expansion.reconcile(accountID: testAccount.id, repositories: ["HemSoft/Buddy", "HemSoft/New"])
+
+        XCTAssertFalse(expansion.isRepositoryExpanded("HemSoft/Buddy", for: testAccount.id))
+    }
+
+    func testPullRequestTreeExpansionDoesNotLeakBetweenAccounts() {
+        let secondAccountID = 84
+        var expansion = DashboardGitHubPullRequestTreeExpansionState()
+        expansion.reconcile(accountID: testAccount.id, repositories: ["HemSoft/Buddy"])
+        expansion.togglePullRequestSection(for: testAccount.id)
+        expansion.toggleRepository("HemSoft/Buddy", for: testAccount.id)
+
+        expansion.reconcile(accountID: secondAccountID, repositories: ["HemSoft/Buddy"])
+
+        XCTAssertFalse(expansion.isPullRequestSectionExpanded(for: secondAccountID))
+        XCTAssertFalse(expansion.isRepositoryExpanded("HemSoft/Buddy", for: secondAccountID))
+        XCTAssertTrue(expansion.isPullRequestSectionExpanded(for: testAccount.id))
+        XCTAssertTrue(expansion.isRepositoryExpanded("HemSoft/Buddy", for: testAccount.id))
+    }
+
+    func testPullRequestTreeDoesNotReconcileTransientAccountSwitchData() throws {
+        let refreshDate = Date(timeIntervalSince1970: 500)
+        let secondAccountID = 84
+        let firstAccountPullRequest = makePullRequest(
+            id: 1,
+            repository: "HemSoft/Buddy",
+            updatedAt: refreshDate
+        )
+        let secondAccountPullRequest = makePullRequest(
+            id: 2,
+            repository: "HemSoft/Other",
+            updatedAt: refreshDate
+        )
+        var expansion = DashboardGitHubPullRequestTreeExpansionState()
+        expansion.reconcile(accountID: testAccount.id, repositories: [firstAccountPullRequest.repository])
+        expansion.togglePullRequestSection(for: testAccount.id)
+        expansion.toggleRepository(firstAccountPullRequest.repository, for: testAccount.id)
+
+        let staleFirstAccountSnapshot = DashboardGitHubPullRequestTreeSnapshot(
+            accountID: secondAccountID,
+            dataAccountID: testAccount.id,
+            state: .loaded([firstAccountPullRequest], refreshedAt: refreshDate)
+        )
+        let secondAccountLoadingSnapshot = DashboardGitHubPullRequestTreeSnapshot(
+            accountID: secondAccountID,
+            dataAccountID: secondAccountID,
+            state: .loading
+        )
+        let staleSecondAccountSnapshot = DashboardGitHubPullRequestTreeSnapshot(
+            accountID: testAccount.id,
+            dataAccountID: secondAccountID,
+            state: .loaded([secondAccountPullRequest], refreshedAt: refreshDate)
+        )
+        let returningAccountLoadingSnapshot = DashboardGitHubPullRequestTreeSnapshot(
+            accountID: testAccount.id,
+            dataAccountID: testAccount.id,
+            state: .loading
+        )
+
+        XCTAssertNil(staleFirstAccountSnapshot)
+        XCTAssertNil(secondAccountLoadingSnapshot)
+        XCTAssertNil(staleSecondAccountSnapshot)
+        XCTAssertNil(returningAccountLoadingSnapshot)
+        XCTAssertTrue(expansion.isPullRequestSectionExpanded(for: testAccount.id))
+        XCTAssertTrue(expansion.isRepositoryExpanded(firstAccountPullRequest.repository, for: testAccount.id))
+
+        let refreshedFirstAccountSnapshot = try XCTUnwrap(
+            DashboardGitHubPullRequestTreeSnapshot(
+                accountID: testAccount.id,
+                dataAccountID: testAccount.id,
+                state: .loaded([firstAccountPullRequest], refreshedAt: refreshDate)
+            )
+        )
+        expansion.reconcile(
+            accountID: refreshedFirstAccountSnapshot.accountID,
+            repositories: refreshedFirstAccountSnapshot.repositories
+        )
+
+        XCTAssertTrue(expansion.isPullRequestSectionExpanded(for: testAccount.id))
+        XCTAssertTrue(expansion.isRepositoryExpanded(firstAccountPullRequest.repository, for: testAccount.id))
+    }
+
     func testDashboardPresentationDistinguishesAccountLifecycleStates() {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let authorization = GitHubDeviceAuthorization(
@@ -238,10 +357,14 @@ final class DashboardViewModelTests: XCTestCase {
 
 private let testAccount = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
 
-private func makePullRequest(id: Int, updatedAt: Date) -> GitHubPullRequest {
+private func makePullRequest(
+    id: Int,
+    repository: String = "HemSoft/Buddy",
+    updatedAt: Date
+) -> GitHubPullRequest {
     GitHubPullRequest(
         id: id,
-        repository: "HemSoft/Buddy",
+        repository: repository,
         number: id,
         title: "Pull request \(id)",
         isDraft: false,
