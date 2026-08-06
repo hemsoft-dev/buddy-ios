@@ -7,10 +7,14 @@ struct GitHubView: View {
     let viewModel: GitHubViewModel
     let accountID: ConnectedAccountID?
 
-    init(viewModel: GitHubViewModel, accountID: ConnectedAccountID? = nil) {
+    init(
+        viewModel: GitHubViewModel,
+        accountID: ConnectedAccountID? = nil,
+        addedAccountID: ConnectedAccountID? = nil
+    ) {
         self.viewModel = viewModel
         self.accountID = accountID
-        _addedAccountID = State(initialValue: nil)
+        _addedAccountID = State(initialValue: addedAccountID)
     }
 
     var body: some View {
@@ -35,7 +39,7 @@ struct GitHubView: View {
 
     var presentationState: GitHubViewState {
         if case let .authorizing(authorization) = viewModel.state,
-           viewModel.activeAccountAuthorizationTarget == accountID {
+           viewModel.activeAccountAuthorizationTarget == presentedAccountID {
             return .authorizing(authorization)
         }
         if let presentedAccountID,
@@ -150,8 +154,8 @@ struct GitHubView: View {
             Text(message)
         } actions: {
             Button("Try Again") {
-                if let accountID {
-                    viewModel.retry(accountID, openURL: openURL)
+                if let presentedAccountID {
+                    viewModel.retry(presentedAccountID, openURL: openURL)
                 } else {
                     viewModel.retryAccountSetup(openURL: openURL) { addedAccountID = $0 }
                 }
@@ -159,12 +163,17 @@ struct GitHubView: View {
             .buttonStyle(.borderedProminent)
 
             Button("Disconnect", role: .destructive) {
-                if let accountID {
-                    Task { await viewModel.disconnect(accountID) }
-                } else {
-                    viewModel.cancelAccountAuthorization()
-                }
+                Task { await disconnectPresentedAccount() }
             }
+        }
+    }
+
+    @MainActor
+    func disconnectPresentedAccount() async {
+        if let presentedAccountID {
+            await viewModel.disconnect(presentedAccountID)
+        } else {
+            viewModel.cancelAccountAuthorization()
         }
     }
 }
@@ -250,7 +259,7 @@ final class GitHubViewModel {
             reconnect(id, openURL: openURL)
             return
         }
-        Task { await performRestore() }
+        Task { await restore() }
     }
 
     private func authorizeAccount(
@@ -420,7 +429,7 @@ final class GitHubViewModel {
         case .connect:
             connect(openURL: openURL)
         case .restore:
-            Task { await performRestore() }
+            Task { await restore() }
         case .cancel:
             cancel()
         case .disconnect:
@@ -434,7 +443,7 @@ final class GitHubViewModel {
     ) {
         switch retryAction {
         case .restore:
-            Task { await performRestore() }
+            Task { await restore() }
         case .connect:
             addAccount(openURL: openURL, onConnected: onConnected)
         case .cancel:

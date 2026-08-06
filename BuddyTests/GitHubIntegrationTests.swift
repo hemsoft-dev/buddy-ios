@@ -644,6 +644,135 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertTrue(connectionFinished)
     }
 
+    func testAddedAccountRouteShowsItsReconnectAuthorization() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let api = SuspendedPollingGitHubAPI(account: account)
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: MockCredentialStore(),
+            sleep: { _ in }
+        )
+        let (viewModel, openURL) = await MainActor.run {
+            (
+                GitHubViewModel(integration: integration),
+                OpenURLAction { _ in .handled }
+            )
+        }
+
+        await MainActor.run {
+            viewModel.reconnect(account.connectedAccountID, openURL: openURL)
+        }
+        let pollingStarted = try await waitUntil {
+            await api.pollDidStart()
+        }
+        XCTAssertTrue(pollingStarted)
+
+        let presentationState = await MainActor.run {
+            GitHubView(
+                viewModel: viewModel,
+                addedAccountID: account.connectedAccountID
+            ).presentationState
+        }
+        XCTAssertEqual(presentationState, .authorizing(testAuthorization))
+
+        await api.finishPoll()
+        let connectionFinished = try await waitUntil {
+            await MainActor.run { viewModel.activeAccountAuthorizationTarget == nil }
+        }
+        XCTAssertTrue(connectionFinished)
+    }
+
+    func testAddedAccountRouteDisconnectsItsPresentedAccount() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let credentials = MockCredentialStore(values: [credentialAccount: "stored-token"])
+        let accountStore = InMemoryConnectedAccountStore(records: [account.connectedAccountRecord])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(userResults: [.success(account)]),
+            credentials: credentials,
+            accountStore: accountStore
+        )
+        let viewModel = await MainActor.run { GitHubViewModel(integration: integration) }
+        await viewModel.restore()
+        let view = await MainActor.run {
+            GitHubView(
+                viewModel: viewModel,
+                addedAccountID: account.connectedAccountID
+            )
+        }
+
+        await view.disconnectPresentedAccount()
+
+        let storedToken = await credentials.stringValue(for: credentialAccount)
+        let records = await accountStore.accounts(for: .github)
+        let (state, accounts) = await MainActor.run { (viewModel.state, viewModel.accounts) }
+        XCTAssertNil(storedToken)
+        XCTAssertTrue(records.isEmpty)
+        XCTAssertTrue(accounts.isEmpty)
+        XCTAssertEqual(state, .disconnected)
+    }
+
+    func testValidationRetryDoesNotSupersedeUnrelatedAccountAuthorization() async throws {
+        let failed = GitHubAccount(id: 7, login: "failed", name: nil, avatarURL: nil)
+        let reconnecting = GitHubAccount(id: 42, login: "reconnecting", name: nil, avatarURL: nil)
+        let api = ValidationRetryDuringAuthorizationGitHubAPI(
+            reconnectingAccount: reconnecting
+        )
+        let credentials = MockCredentialStore(values: [
+            GitHubIntegration.credentialAccount(for: failed.connectedAccountID): "failed-token",
+            GitHubIntegration.credentialAccount(for: reconnecting.connectedAccountID): "connected-token",
+        ])
+        let accountStore = InMemoryConnectedAccountStore(records: [
+            failed.connectedAccountRecord,
+            reconnecting.connectedAccountRecord,
+        ])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: credentials,
+            accountStore: accountStore,
+            sleep: { _ in }
+        )
+        let (viewModel, openURL) = await MainActor.run {
+            (
+                GitHubViewModel(integration: integration),
+                OpenURLAction { _ in .handled }
+            )
+        }
+        await viewModel.restore()
+
+        await MainActor.run {
+            viewModel.reconnect(reconnecting.connectedAccountID, openURL: openURL)
+        }
+        await api.waitUntilPollBegins()
+        await MainActor.run {
+            viewModel.retry(failed.connectedAccountID, openURL: openURL)
+        }
+        await api.finishPoll()
+
+        let authorizationFinished = try await waitUntil {
+            await MainActor.run { viewModel.activeAccountAuthorizationTarget == nil }
+        }
+        XCTAssertTrue(authorizationFinished)
+        let accounts = await MainActor.run { viewModel.accounts }
+        XCTAssertEqual(
+            accounts,
+            [
+                GitHubAccountConnection(
+                    account: failed,
+                    state: .needsAttention,
+                    message: GitHubConnectionError.server(503).localizedDescription,
+                    recoveryAction: .validate
+                ),
+                GitHubAccountConnection(account: reconnecting, state: .connected),
+            ]
+        )
+        let userTokens = await api.userTokens()
+        XCTAssertEqual(userTokens, ["failed-token", "connected-token", "new-token"])
+    }
+
     func testAddAccountFailureIsPresentedInsteadOfReturningToConnectScreen() async throws {
         let api = StubGitHubAPI(deviceResults: [.failure(.server(503))])
         let integration = GitHubIntegration(
@@ -2825,6 +2954,58 @@ private actor SuspendedAuthorizationAPI: GitHubAPIProviding {
     func finishAuthorization() {
         authorizationCompletion?.resume()
         authorizationCompletion = nil
+    }
+}
+
+private actor ValidationRetryDuringAuthorizationGitHubAPI: GitHubAPIProviding {
+    private let reconnectingAccount: GitHubAccount
+    private var capturedUserTokens: [String] = []
+    private var pollStartedWaiter: CheckedContinuation<Void, Never>?
+    private var pollCompletion: CheckedContinuation<Void, Never>?
+
+    init(reconnectingAccount: GitHubAccount) {
+        self.reconnectingAccount = reconnectingAccount
+    }
+
+    func requestDeviceAuthorization(clientID: String) -> GitHubDeviceAuthorization {
+        testAuthorization
+    }
+
+    func pollForAccessToken(clientID: String, deviceCode: String) async -> GitHubTokenPollResult {
+        pollStartedWaiter?.resume()
+        pollStartedWaiter = nil
+        await withCheckedContinuation { continuation in
+            pollCompletion = continuation
+        }
+        return .authorized(token: "new-token")
+    }
+
+    func authenticatedUser(token: String) throws -> GitHubAccount {
+        capturedUserTokens.append(token)
+        switch token {
+        case "failed-token":
+            throw GitHubAPIError.server(503)
+        case "connected-token", "new-token":
+            return reconnectingAccount
+        default:
+            throw GitHubAPIError.malformedResponse
+        }
+    }
+
+    func waitUntilPollBegins() async {
+        guard pollCompletion == nil else { return }
+        await withCheckedContinuation { continuation in
+            pollStartedWaiter = continuation
+        }
+    }
+
+    func finishPoll() {
+        pollCompletion?.resume()
+        pollCompletion = nil
+    }
+
+    func userTokens() -> [String] {
+        capturedUserTokens
     }
 }
 
