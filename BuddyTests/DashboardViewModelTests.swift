@@ -4,6 +4,31 @@ import XCTest
 
 @MainActor
 final class DashboardViewModelTests: XCTestCase {
+    func testGitHubCardDefaultsToCollapsedWithoutStoredPreference() throws {
+        let suiteName = "DashboardViewModelTests.default.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let preference = DashboardGitHubCardExpansionStorage(store: defaults)
+
+        XCTAssertFalse(preference.wrappedValue)
+    }
+
+    func testGitHubCardPersistsExplicitExpansionChoice() throws {
+        let suiteName = "DashboardViewModelTests.persistence.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let preference = DashboardGitHubCardExpansionStorage(store: defaults)
+        preference.wrappedValue = true
+
+        let recreatedPreference = DashboardGitHubCardExpansionStorage(store: defaults)
+
+        XCTAssertTrue(recreatedPreference.wrappedValue)
+    }
+
     func testDashboardPresentationDistinguishesAccountLifecycleStates() {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let authorization = GitHubDeviceAuthorization(

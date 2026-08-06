@@ -1,10 +1,26 @@
 import SwiftUI
 
+@propertyWrapper
+struct DashboardGitHubCardExpansionStorage: DynamicProperty {
+    static let key = "dashboard.github.account-card.expanded"
+
+    @AppStorage private var value: Bool
+
+    init(store: UserDefaults? = nil) {
+        _value = AppStorage(wrappedValue: false, Self.key, store: store)
+    }
+
+    var wrappedValue: Bool {
+        get { value }
+        nonmutating set { value = newValue }
+    }
+}
+
 struct DashboardView: View {
     @State private var viewModel = DashboardViewModel(
         integrations: IntegrationCatalog.defaultIntegrations
     )
-    @AppStorage("dashboard.github.account-card.expanded") private var isGitHubCardExpanded = true
+    @DashboardGitHubCardExpansionStorage private var isGitHubCardExpanded
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let githubViewModel: GitHubViewModel
     let openAccounts: () -> Void
