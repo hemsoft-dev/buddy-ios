@@ -304,6 +304,11 @@ actor GitHubIntegration: IntegrationProviding {
                                 writtenRecord: account.connectedAccountRecord,
                                 generation: accountGeneration
                             )
+                        } else {
+                            _ = try? await credentials.removeData(
+                                for: credentialAccount,
+                                ifMatches: writtenToken
+                            )
                         }
                         throw GitHubConnectionError.credentialStorage
                     }
@@ -612,10 +617,21 @@ actor GitHubIntegration: IntegrationProviding {
               !token.isEmpty
         else {
             if let tokenData {
-                let removed = try? await credentials.removeData(
-                    for: credentialAccount,
-                    ifMatches: tokenData
-                )
+                let removed: Bool
+                do {
+                    removed = try await credentials.removeData(
+                        for: credentialAccount,
+                        ifMatches: tokenData
+                    )
+                } catch {
+                    guard generation == accountGenerations[record.id, default: 0] else { return nil }
+                    return GitHubAccountConnection(
+                        account: account,
+                        state: .needsAttention,
+                        message: GitHubConnectionError.credentialStorage.localizedDescription,
+                        recoveryAction: .validate
+                    )
+                }
                 guard removed == true else { return nil }
             }
             guard generation == accountGenerations[record.id, default: 0] else { return nil }
@@ -643,10 +659,21 @@ actor GitHubIntegration: IntegrationProviding {
             return GitHubAccountConnection(account: refreshed, state: .connected)
         } catch GitHubAPIError.unauthorized {
             guard generation == accountGenerations[record.id, default: 0] else { return nil }
-            let removed = try? await credentials.removeData(
-                for: credentialAccount,
-                ifMatches: tokenData
-            )
+            let removed: Bool
+            do {
+                removed = try await credentials.removeData(
+                    for: credentialAccount,
+                    ifMatches: tokenData
+                )
+            } catch {
+                guard generation == accountGenerations[record.id, default: 0] else { return nil }
+                return GitHubAccountConnection(
+                    account: account,
+                    state: .needsAttention,
+                    message: GitHubConnectionError.credentialStorage.localizedDescription,
+                    recoveryAction: .validate
+                )
+            }
             guard removed == true,
                   generation == accountGenerations[record.id, default: 0]
             else {

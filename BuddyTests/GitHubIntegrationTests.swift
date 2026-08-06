@@ -1857,6 +1857,39 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(records, [account.connectedAccountRecord])
     }
 
+    func testRevokedCredentialDeletionFailureKeepsAccountVisibleForRecovery() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let credentials = FailingConditionalRemovalCredentialStore(
+            values: [credentialAccount: "revoked-token"]
+        )
+        let accountStore = InMemoryConnectedAccountStore(records: [account.connectedAccountRecord])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(userResults: [.failure(.unauthorized)]),
+            credentials: credentials,
+            accountStore: accountStore
+        )
+
+        let restored = try await integration.restoreAccounts()
+
+        XCTAssertEqual(
+            restored,
+            [
+                GitHubAccountConnection(
+                    account: account,
+                    state: .needsAttention,
+                    message: GitHubConnectionError.credentialStorage.localizedDescription,
+                    recoveryAction: .validate
+                ),
+            ]
+        )
+        let storedToken = await credentials.stringValue(for: credentialAccount)
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertEqual(storedToken, "revoked-token")
+        XCTAssertEqual(records, [account.connectedAccountRecord])
+    }
+
     func testReconnectUpdatesOnlyTheTargetAccountCredential() async throws {
         let first = GitHubAccount(id: 7, login: "first-renamed", name: nil, avatarURL: nil)
         let second = GitHubAccount(id: 42, login: "second", name: nil, avatarURL: nil)
@@ -2025,6 +2058,53 @@ final class GitHubIntegrationTests: XCTestCase {
         let records = await accountStore.accounts(for: .github)
         XCTAssertEqual(storedToken, "latest-token")
         XCTAssertEqual(records, [latest.connectedAccountRecord])
+    }
+
+    func testSupersededPersistenceFailureRemovesItsCredential() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let credentials = MockCredentialStore()
+        let accountStore = SuspendedFailingUpsertConnectedAccountStore()
+        let secondAuthorization = GitHubDeviceAuthorization(
+            deviceCode: "second-device-code",
+            userCode: "IJKL-MNOP",
+            verificationURI: testAuthorization.verificationURI,
+            expiresIn: 900,
+            interval: 5
+        )
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(
+                deviceResults: [.success(testAuthorization), .success(secondAuthorization)],
+                pollResults: [.success(.authorized(token: "orphaned-token"))],
+                userResults: [.success(account)]
+            ),
+            credentials: credentials,
+            accountStore: accountStore,
+            sleep: { _ in }
+        )
+        let authorization = try await integration.beginAccountAuthorization()
+        let completion = Task {
+            try await integration.completeAccountAuthorization(authorization)
+        }
+        await accountStore.waitUntilUpsertBegins()
+
+        let supersedingAuthorization = try await integration.beginAccountAuthorization(
+            reconnecting: account.connectedAccountID
+        )
+        await integration.cancelAccountAuthorization(supersedingAuthorization)
+        await accountStore.finishUpsert()
+
+        do {
+            _ = try await completion.value
+            XCTFail("Expected account persistence failure")
+        } catch let error as GitHubConnectionError {
+            XCTAssertEqual(error, .credentialStorage)
+        }
+        let storedToken = await credentials.stringValue(for: credentialAccount)
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertNil(storedToken)
+        XCTAssertTrue(records.isEmpty)
     }
 
     func testNewerDisconnectPreventsOlderDisconnectFromRestoringAccount() async throws {
@@ -2485,6 +2565,68 @@ private actor FailFirstUpsertConnectedAccountStore: ConnectedAccountStoring {
 
     func remove(_ id: ConnectedAccountID) {
         records.removeAll { $0.id == id }
+    }
+}
+
+private actor SuspendedFailingUpsertConnectedAccountStore: ConnectedAccountStoring {
+    enum StoreError: Error {
+        case upsertFailed
+    }
+
+    private var records: [ConnectedAccountRecord] = []
+    private var upsertStartedWaiter: CheckedContinuation<Void, Never>?
+    private var upsertCompletion: CheckedContinuation<Void, Never>?
+
+    func accounts(for provider: IntegrationProvider) -> [ConnectedAccountRecord] {
+        records.filter { $0.id.provider == provider }.sorted { $0.id < $1.id }
+    }
+
+    func upsert(_ account: ConnectedAccountRecord) async throws {
+        upsertStartedWaiter?.resume()
+        upsertStartedWaiter = nil
+        await withCheckedContinuation { continuation in
+            upsertCompletion = continuation
+        }
+        throw StoreError.upsertFailed
+    }
+
+    func upsertIfMissing(_ account: ConnectedAccountRecord) -> Bool {
+        guard !records.contains(where: { $0.id == account.id }) else { return false }
+        records.append(account)
+        return true
+    }
+
+    func replace(
+        _ expected: ConnectedAccountRecord,
+        with replacement: ConnectedAccountRecord?
+    ) -> Bool {
+        guard let index = records.firstIndex(where: { $0.id == expected.id }),
+              records[index] == expected
+        else {
+            return false
+        }
+        if let replacement {
+            records[index] = replacement
+        } else {
+            records.remove(at: index)
+        }
+        return true
+    }
+
+    func remove(_ id: ConnectedAccountID) {
+        records.removeAll { $0.id == id }
+    }
+
+    func waitUntilUpsertBegins() async {
+        guard upsertCompletion == nil else { return }
+        await withCheckedContinuation { continuation in
+            upsertStartedWaiter = continuation
+        }
+    }
+
+    func finishUpsert() {
+        upsertCompletion?.resume()
+        upsertCompletion = nil
     }
 }
 
