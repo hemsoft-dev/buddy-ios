@@ -1434,6 +1434,35 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(otherScopedToken, "other-scoped-token")
     }
 
+    func testDisconnectPreservesPendingLegacyCredentialWithUnknownOwner() async throws {
+        let scopedAccount = GitHubAccount(id: 7, login: "scoped", name: nil, avatarURL: nil)
+        let scopedKey = GitHubIntegration.credentialAccount(for: scopedAccount.connectedAccountID)
+        let credentials = MockCredentialStore(values: [
+            "github.oauth-token": "pending-other-token",
+            scopedKey: "scoped-token",
+        ])
+        let accountStore = InMemoryConnectedAccountStore(records: [scopedAccount.connectedAccountRecord])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(userResults: [
+                .failure(.server(503)),
+                .success(scopedAccount),
+            ]),
+            credentials: credentials,
+            accountStore: accountStore
+        )
+        _ = try await integration.restoreAccounts()
+
+        try await integration.disconnect(accountID: scopedAccount.connectedAccountID)
+
+        let legacyToken = await credentials.stringValue(for: "github.oauth-token")
+        let scopedToken = await credentials.stringValue(for: scopedKey)
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertEqual(legacyToken, "pending-other-token")
+        XCTAssertNil(scopedToken)
+        XCTAssertTrue(records.isEmpty)
+    }
+
     func testLingeringLegacyCredentialNeverOverwritesNewerScopedCredential() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let scopedKey = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
@@ -1784,6 +1813,40 @@ final class GitHubIntegrationTests: XCTestCase {
         do {
             _ = try await completion.value
             XCTFail("Expected disconnect to supersede the authorization snapshot")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let storedToken = await credentials.stringValue(for: credentialAccount)
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertNil(storedToken)
+        XCTAssertTrue(records.isEmpty)
+    }
+
+    func testDisconnectRejectsOlderUntargetedAuthorizationCompletion() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let credentials = MockCredentialStore(values: [credentialAccount: "old-token"])
+        let accountStore = InMemoryConnectedAccountStore(records: [account.connectedAccountRecord])
+        let api = SuspendedAuthorizationUserGitHubAPI(account: account)
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: credentials,
+            accountStore: accountStore,
+            sleep: { _ in }
+        )
+        let authorization = try await integration.beginAccountAuthorization()
+        let completion = Task {
+            try await integration.completeAccountAuthorization(authorization)
+        }
+        await api.waitUntilUserRequestBegins()
+
+        try await integration.disconnect(accountID: account.connectedAccountID)
+        await api.finishUserRequest()
+
+        do {
+            _ = try await completion.value
+            XCTFail("Expected the later disconnect to supersede add-account completion")
         } catch is CancellationError {
             // Expected.
         }
@@ -3088,6 +3151,45 @@ private actor SuspendedUserGitHubAPI: GitHubAPIProviding {
     func waitUntilUserRequestBegins() async {
         guard userRequestCompletion == nil else { return }
 
+        await withCheckedContinuation { continuation in
+            userRequestWaiter = continuation
+        }
+    }
+
+    func finishUserRequest() {
+        userRequestCompletion?.resume()
+        userRequestCompletion = nil
+    }
+}
+
+private actor SuspendedAuthorizationUserGitHubAPI: GitHubAPIProviding {
+    private let account: GitHubAccount
+    private var userRequestWaiter: CheckedContinuation<Void, Never>?
+    private var userRequestCompletion: CheckedContinuation<Void, Never>?
+
+    init(account: GitHubAccount) {
+        self.account = account
+    }
+
+    func requestDeviceAuthorization(clientID: String) -> GitHubDeviceAuthorization {
+        testAuthorization
+    }
+
+    func pollForAccessToken(clientID: String, deviceCode: String) -> GitHubTokenPollResult {
+        .authorized(token: "new-token")
+    }
+
+    func authenticatedUser(token: String) async -> GitHubAccount {
+        userRequestWaiter?.resume()
+        userRequestWaiter = nil
+        await withCheckedContinuation { continuation in
+            userRequestCompletion = continuation
+        }
+        return account
+    }
+
+    func waitUntilUserRequestBegins() async {
+        guard userRequestCompletion == nil else { return }
         await withCheckedContinuation { continuation in
             userRequestWaiter = continuation
         }

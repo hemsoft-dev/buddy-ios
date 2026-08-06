@@ -1,7 +1,7 @@
 import Foundation
 import Security
 
-actor KeychainStore {
+actor KeychainStore: CredentialStoring {
     private let service: String
 
     init(service: String = Bundle.main.bundleIdentifier ?? "com.hemsoft.buddy") {

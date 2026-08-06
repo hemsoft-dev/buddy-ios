@@ -42,8 +42,6 @@ extension CredentialStoring {
     }
 }
 
-extension KeychainStore: CredentialStoring {}
-
 actor GitHubIntegration: IntegrationProviding {
     private enum AccountMutationIntent: Sendable {
         case reconnect
@@ -52,6 +50,12 @@ actor GitHubIntegration: IntegrationProviding {
     private struct AccountAuthorizationSession: Sendable {
         let targetID: ConnectedAccountID?
         let targetGeneration: Int?
+        let generationSnapshot: [ConnectedAccountID: Int]
+    }
+
+    private enum LegacyCredentialState: Sendable {
+        case unknown(Data)
+        case owned(Data, ConnectedAccountID)
     }
 
     private struct LegacyMigrationResult: Sendable {
@@ -87,6 +91,7 @@ actor GitHubIntegration: IntegrationProviding {
     private var accountAuthorizations: [String: AccountAuthorizationSession] = [:]
     private var accountGenerations: [ConnectedAccountID: Int] = [:]
     private var accountMutationIntents: [ConnectedAccountID: AccountMutationIntent] = [:]
+    private var legacyCredentialState: LegacyCredentialState?
 
     init(
         clientID: String? = AppConfiguration.current.githubClientID,
@@ -181,6 +186,7 @@ actor GitHubIntegration: IntegrationProviding {
         reconnecting id: ConnectedAccountID? = nil
     ) async throws -> GitHubDeviceAuthorization {
         guard let clientID else { throw GitHubConnectionError.missingClientID }
+        let generationSnapshot = accountGenerations
         let targetGeneration = id.map { id in
             accountGenerations[id, default: 0] &+= 1
             accountMutationIntents[id] = .reconnect
@@ -194,7 +200,8 @@ actor GitHubIntegration: IntegrationProviding {
             }
             accountAuthorizations[authorization.deviceCode] = AccountAuthorizationSession(
                 targetID: id,
-                targetGeneration: targetGeneration
+                targetGeneration: targetGeneration,
+                generationSnapshot: generationSnapshot
             )
             return authorization
         } catch is CancellationError {
@@ -242,6 +249,11 @@ actor GitHubIntegration: IntegrationProviding {
                     }
                     if let targetID,
                        accountGenerations[targetID, default: 0] != targetGeneration {
+                        throw CancellationError()
+                    }
+                    if targetID == nil,
+                       accountGenerations[accountID, default: 0]
+                        != session.generationSnapshot[accountID, default: 0] {
                         throw CancellationError()
                     }
                     guard accountAuthorizations.keys.contains(authorization.deviceCode) else {
@@ -361,10 +373,9 @@ actor GitHubIntegration: IntegrationProviding {
         var tokenData: Data?
         let credentialAccount = Self.credentialAccount(for: accountID)
         do {
-            // Singleton credentials are pre-migration state and are never authoritative
-            // once account-scoped records are presented. Clear the legacy item locally
-            // so disconnect remains durable while offline.
-            try await credentials.removeData(for: Self.credentialAccount)
+            // Preserve a legacy item whose transient validation has not identified its
+            // owner, or whose known owner is a different account.
+            try await removeLegacyCredentialIfOwned(by: accountID)
             guard generation == accountGenerations[accountID, default: 0] else {
                 throw CancellationError()
             }
@@ -476,6 +487,39 @@ actor GitHubIntegration: IntegrationProviding {
         _ = try? await accountStore.replace(writtenRecord, with: previousRecord)
     }
 
+    private func removeLegacyCredentialIfOwned(
+        by accountID: ConnectedAccountID
+    ) async throws {
+        guard let legacyData = try await credentials.data(for: Self.credentialAccount) else {
+            legacyCredentialState = nil
+            return
+        }
+        switch legacyCredentialState {
+        case let .unknown(pendingData) where pendingData == legacyData:
+            return
+        case let .owned(pendingData, ownerID)
+            where pendingData == legacyData && ownerID != accountID:
+            return
+        default:
+            break
+        }
+        if try await credentials.removeData(
+            for: Self.credentialAccount,
+            ifMatches: legacyData
+        ) {
+            legacyCredentialState = nil
+        }
+    }
+
+    private func removeLegacyCredential(ifMatches legacyData: Data) async throws {
+        if try await credentials.removeData(
+            for: Self.credentialAccount,
+            ifMatches: legacyData
+        ) {
+            legacyCredentialState = nil
+        }
+    }
+
     private func migrateLegacyCredential() async throws -> LegacyMigrationResult? {
         let legacyData: Data?
         do {
@@ -483,10 +527,14 @@ actor GitHubIntegration: IntegrationProviding {
         } catch {
             throw GitHubConnectionError.credentialStorage
         }
-        guard let legacyData else { return nil }
+        guard let legacyData else {
+            legacyCredentialState = nil
+            return nil
+        }
+        legacyCredentialState = .unknown(legacyData)
         guard let token = String(data: legacyData, encoding: .utf8), !token.isEmpty else {
             do {
-                try await credentials.removeData(for: Self.credentialAccount)
+                try await removeLegacyCredential(ifMatches: legacyData)
             } catch {
                 throw GitHubConnectionError.credentialStorage
             }
@@ -499,7 +547,7 @@ actor GitHubIntegration: IntegrationProviding {
             account = try await api.authenticatedUser(token: token)
         } catch GitHubAPIError.unauthorized {
             do {
-                try await credentials.removeData(for: Self.credentialAccount)
+                try await removeLegacyCredential(ifMatches: legacyData)
             } catch {
                 throw GitHubConnectionError.credentialStorage
             }
@@ -509,8 +557,14 @@ actor GitHubIntegration: IntegrationProviding {
         }
 
         let accountID = account.connectedAccountID
+        legacyCredentialState = .owned(legacyData, accountID)
         let generation = generationSnapshot[accountID, default: 0]
-        guard generation == accountGenerations[accountID, default: 0] else { return nil }
+        guard generation == accountGenerations[accountID, default: 0] else {
+            if accountMutationIntents[accountID] == .disconnect {
+                try? await removeLegacyCredential(ifMatches: legacyData)
+            }
+            return nil
+        }
         let scopedCredentialAccount = Self.credentialAccount(for: accountID)
         let existingRecord: ConnectedAccountRecord?
         let existingScopedCredential: Data?
@@ -540,7 +594,7 @@ actor GitHubIntegration: IntegrationProviding {
                     return nil
                 }
             }
-            try? await credentials.removeData(for: Self.credentialAccount)
+            try? await removeLegacyCredential(ifMatches: legacyData)
             return LegacyMigrationResult(record: record, requiresScopedValidation: true)
         }
 
@@ -572,7 +626,7 @@ actor GitHubIntegration: IntegrationProviding {
                 }
                 return nil
             }
-            try? await credentials.removeData(for: Self.credentialAccount)
+            try? await removeLegacyCredential(ifMatches: legacyData)
         } catch {
             throw GitHubConnectionError.credentialStorage
         }
