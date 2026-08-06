@@ -235,6 +235,12 @@ actor GitHubIntegration: IntegrationProviding {
                     } catch {
                         throw GitHubConnectionError.credentialStorage
                     }
+                    guard !Task.isCancelled,
+                          accountAuthorizations.keys.contains(authorization.deviceCode),
+                          accountGenerations[accountID, default: 0] == accountGeneration
+                    else {
+                        throw CancellationError()
+                    }
 
                     do {
                         try await credentials.set(Data(token.utf8), for: credentialAccount)
@@ -477,6 +483,23 @@ actor GitHubIntegration: IntegrationProviding {
     ) async -> GitHubAccountConnection? {
         let generation = accountGenerations[record.id, default: 0]
         let account = GitHubAccount(record: record)
+        do {
+            let isStillRegistered = try await accountStore.accounts(for: .github)
+                .contains { $0.id == record.id }
+            guard generation == accountGenerations[record.id, default: 0],
+                  isStillRegistered
+            else {
+                return nil
+            }
+        } catch {
+            guard generation == accountGenerations[record.id, default: 0] else { return nil }
+            return GitHubAccountConnection(
+                account: account,
+                state: .needsAttention,
+                message: GitHubConnectionError.accountStorage.localizedDescription,
+                recoveryAction: .validate
+            )
+        }
         let credentialAccount = Self.credentialAccount(for: record.id)
         let tokenData: Data?
         do {

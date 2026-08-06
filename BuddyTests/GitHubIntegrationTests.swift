@@ -1319,6 +1319,47 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertNil(scopedToken)
     }
 
+    func testRestoreSnapshotCannotResurrectAccountDisconnectedBeforeItsValidation() async throws {
+        let first = GitHubAccount(id: 7, login: "first", name: nil, avatarURL: nil)
+        let second = GitHubAccount(id: 42, login: "second", name: nil, avatarURL: nil)
+        let api = SequencedSuspendedUserGitHubAPI()
+        let credentials = MockCredentialStore(values: [
+            GitHubIntegration.credentialAccount(for: first.connectedAccountID): "first-token",
+            GitHubIntegration.credentialAccount(for: second.connectedAccountID): "second-token",
+        ])
+        let accountStore = InMemoryConnectedAccountStore(records: [
+            first.connectedAccountRecord,
+            second.connectedAccountRecord,
+        ])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: credentials,
+            accountStore: accountStore
+        )
+        let viewModel = await MainActor.run { GitHubViewModel(integration: integration) }
+
+        let initialRestore = Task { await viewModel.restore() }
+        await api.waitForRequest(count: 1)
+        await api.finishRequest(at: 0, with: .success(first))
+        await api.waitForRequest(count: 2)
+        await api.finishRequest(at: 1, with: .success(second))
+        await initialRestore.value
+
+        let refresh = Task { await viewModel.restore() }
+        await api.waitForRequest(count: 3)
+        await viewModel.disconnect(second.connectedAccountID)
+        await api.finishRequest(at: 2, with: .success(first))
+        await refresh.value
+
+        let requestCount = await api.requestCount()
+        let accounts = await MainActor.run { viewModel.accounts }
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertEqual(requestCount, 3)
+        XCTAssertEqual(accounts, [GitHubAccountConnection(account: first, state: .connected)])
+        XCTAssertEqual(records, [first.connectedAccountRecord])
+    }
+
     func testMalformedPersistedAccountMetadataSurfacesStorageFailure() async throws {
         let suiteName = "GitHubIntegrationTests.account-store-corruption.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -1511,6 +1552,47 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(reconnected, GitHubAccountConnection(account: account, state: .connected))
         XCTAssertEqual(storedToken, "new-token")
         XCTAssertEqual(records, [account.connectedAccountRecord])
+    }
+
+    func testDisconnectDuringAuthorizationSnapshotCannotWriteOrphanedCredential() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let credentials = SuspendedFirstReadCredentialStore(
+            values: [credentialAccount: "old-token"]
+        )
+        let accountStore = InMemoryConnectedAccountStore(records: [account.connectedAccountRecord])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(
+                deviceResults: [.success(testAuthorization)],
+                pollResults: [.success(.authorized(token: "new-token"))],
+                userResults: [.success(account)]
+            ),
+            credentials: credentials,
+            accountStore: accountStore,
+            sleep: { _ in }
+        )
+        let authorization = try await integration.beginAccountAuthorization(
+            reconnecting: account.connectedAccountID
+        )
+        let completion = Task {
+            try await integration.completeAccountAuthorization(authorization)
+        }
+        await credentials.waitUntilFirstReadBegins()
+
+        try await integration.disconnect(accountID: account.connectedAccountID)
+        await credentials.finishFirstRead()
+
+        do {
+            _ = try await completion.value
+            XCTFail("Expected disconnect to supersede the authorization snapshot")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let storedToken = await credentials.stringValue(for: credentialAccount)
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertNil(storedToken)
+        XCTAssertTrue(records.isEmpty)
     }
 
     func testCanceledReconnectSupersedesDisconnectAndRestoresOriginalAccount() async throws {
@@ -1793,6 +1875,60 @@ private actor SuspendedConditionalRemovalCredentialStore: CredentialStoring {
     func finishConditionalRemoval() {
         removalCompletion?.resume()
         removalCompletion = nil
+    }
+
+    func stringValue(for account: String) -> String? {
+        values[account].flatMap { String(data: $0, encoding: .utf8) }
+    }
+}
+
+private actor SuspendedFirstReadCredentialStore: CredentialStoring {
+    private var values: [String: Data]
+    private var didSuspendRead = false
+    private var readStartedWaiter: CheckedContinuation<Void, Never>?
+    private var readCompletion: CheckedContinuation<Void, Never>?
+
+    init(values: [String: String]) {
+        self.values = values.mapValues { Data($0.utf8) }
+    }
+
+    func set(_ data: Data, for account: String) {
+        values[account] = data
+    }
+
+    func data(for account: String) async -> Data? {
+        let captured = values[account]
+        if !didSuspendRead, captured != nil {
+            didSuspendRead = true
+            readStartedWaiter?.resume()
+            readStartedWaiter = nil
+            await withCheckedContinuation { continuation in
+                readCompletion = continuation
+            }
+        }
+        return captured
+    }
+
+    func removeData(for account: String) {
+        values.removeValue(forKey: account)
+    }
+
+    func removeData(for account: String, ifMatches expectedData: Data) -> Bool {
+        guard values[account] == expectedData else { return false }
+        values.removeValue(forKey: account)
+        return true
+    }
+
+    func waitUntilFirstReadBegins() async {
+        guard readCompletion == nil else { return }
+        await withCheckedContinuation { continuation in
+            readStartedWaiter = continuation
+        }
+    }
+
+    func finishFirstRead() {
+        readCompletion?.resume()
+        readCompletion = nil
     }
 
     func stringValue(for account: String) -> String? {
