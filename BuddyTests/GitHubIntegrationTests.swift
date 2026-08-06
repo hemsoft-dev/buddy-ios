@@ -2208,6 +2208,53 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertTrue(records.isEmpty)
     }
 
+    func testCanceledReconnectSupersedingDelayedAddRemovesOrphanedMetadata() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let credentials = MockCredentialStore()
+        let accountStore = SuspendedSuccessfulUpsertConnectedAccountStore()
+        let secondAuthorization = GitHubDeviceAuthorization(
+            deviceCode: "second-device-code",
+            userCode: "IJKL-MNOP",
+            verificationURI: testAuthorization.verificationURI,
+            expiresIn: 900,
+            interval: 5
+        )
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(
+                deviceResults: [.success(testAuthorization), .success(secondAuthorization)],
+                pollResults: [.success(.authorized(token: "first-token"))],
+                userResults: [.success(account)]
+            ),
+            credentials: credentials,
+            accountStore: accountStore,
+            sleep: { _ in }
+        )
+        let firstAuthorization = try await integration.beginAccountAuthorization()
+        let firstCompletion = Task {
+            try await integration.completeAccountAuthorization(firstAuthorization)
+        }
+        await accountStore.waitUntilUpsertBegins()
+
+        let supersedingAuthorization = try await integration.beginAccountAuthorization(
+            reconnecting: account.connectedAccountID
+        )
+        await integration.cancelAccountAuthorization(supersedingAuthorization)
+        await accountStore.finishUpsert()
+
+        do {
+            _ = try await firstCompletion.value
+            XCTFail("Expected the reconnect to supersede the delayed add")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let storedToken = await credentials.stringValue(for: credentialAccount)
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertNil(storedToken)
+        XCTAssertTrue(records.isEmpty)
+    }
+
     func testStaleAuthorizationRollbackCannotOverwriteNewerReconnect() async throws {
         let original = GitHubAccount(id: 42, login: "original", name: nil, avatarURL: nil)
         let failedAttempt = GitHubAccount(id: 42, login: "failed-attempt", name: nil, avatarURL: nil)

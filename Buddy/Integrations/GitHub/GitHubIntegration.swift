@@ -323,16 +323,12 @@ actor GitHubIntegration: IntegrationProviding {
                                 generation: accountGeneration
                             )
                         } else {
-                            _ = try? await credentials.removeData(
-                                for: credentialAccount,
-                                ifMatches: writtenToken
+                            await discardSupersededAccountWrite(
+                                id: accountID,
+                                previousRecord: previousRecord,
+                                writtenToken: writtenToken,
+                                writtenRecord: account.connectedAccountRecord
                             )
-                            if accountMutationIntents[accountID] == .disconnect {
-                                _ = try? await accountStore.replace(
-                                    account.connectedAccountRecord,
-                                    with: nil
-                                )
-                            }
                         }
                         throw GitHubConnectionError.credentialStorage
                     }
@@ -351,16 +347,12 @@ actor GitHubIntegration: IntegrationProviding {
                                 generation: accountGeneration
                             )
                         } else {
-                            _ = try? await credentials.removeData(
-                                for: credentialAccount,
-                                ifMatches: writtenToken
+                            await discardSupersededAccountWrite(
+                                id: accountID,
+                                previousRecord: previousRecord,
+                                writtenToken: writtenToken,
+                                writtenRecord: account.connectedAccountRecord
                             )
-                            if accountMutationIntents[accountID] == .disconnect {
-                                _ = try? await accountStore.replace(
-                                    account.connectedAccountRecord,
-                                    with: nil
-                                )
-                            }
                         }
                         throw CancellationError()
                     }
@@ -502,6 +494,25 @@ actor GitHubIntegration: IntegrationProviding {
             with: previousToken
         )
         guard generation == accountGenerations[id, default: 0] else { return }
+        _ = try? await accountStore.replace(writtenRecord, with: previousRecord)
+    }
+
+    private func discardSupersededAccountWrite(
+        id: ConnectedAccountID,
+        previousRecord: ConnectedAccountRecord?,
+        writtenToken: Data,
+        writtenRecord: ConnectedAccountRecord
+    ) async {
+        let credentialAccount = Self.credentialAccount(for: id)
+        let removedWrittenToken = try? await credentials.removeData(
+            for: credentialAccount,
+            ifMatches: writtenToken
+        )
+        if accountMutationIntents[id] == .disconnect {
+            _ = try? await accountStore.replace(writtenRecord, with: nil)
+            return
+        }
+        guard removedWrittenToken == true else { return }
         _ = try? await accountStore.replace(writtenRecord, with: previousRecord)
     }
 
