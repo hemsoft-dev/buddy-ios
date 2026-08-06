@@ -482,6 +482,7 @@ actor GitHubIntegration: IntegrationProviding {
             return nil
         }
 
+        let generationSnapshot = accountGenerations
         let account: GitHubAccount
         do {
             account = try await api.authenticatedUser(token: token)
@@ -496,7 +497,10 @@ actor GitHubIntegration: IntegrationProviding {
             throw map(error)
         }
 
-        let scopedCredentialAccount = Self.credentialAccount(for: account.connectedAccountID)
+        let accountID = account.connectedAccountID
+        let generation = generationSnapshot[accountID, default: 0]
+        guard generation == accountGenerations[accountID, default: 0] else { return nil }
+        let scopedCredentialAccount = Self.credentialAccount(for: accountID)
         let existingRecord: ConnectedAccountRecord?
         let existingScopedCredential: Data?
         do {
@@ -506,6 +510,7 @@ actor GitHubIntegration: IntegrationProviding {
         } catch {
             throw GitHubConnectionError.credentialStorage
         }
+        guard generation == accountGenerations[accountID, default: 0] else { return nil }
 
         // A legacy credential can linger when its earlier cleanup failed. Never let that
         // stale value overwrite a newer account-scoped reconnect credential.
@@ -517,6 +522,12 @@ actor GitHubIntegration: IntegrationProviding {
                 } catch {
                     throw GitHubConnectionError.accountStorage
                 }
+                guard generation == accountGenerations[accountID, default: 0] else {
+                    if accountMutationIntents[accountID] == .disconnect {
+                        _ = try? await accountStore.replace(record, with: nil)
+                    }
+                    return nil
+                }
             }
             try? await credentials.removeData(for: Self.credentialAccount)
             return LegacyMigrationResult(record: record, requiresScopedValidation: true)
@@ -527,7 +538,29 @@ actor GitHubIntegration: IntegrationProviding {
                 legacyData,
                 for: scopedCredentialAccount
             )
+            guard generation == accountGenerations[accountID, default: 0] else {
+                if accountMutationIntents[accountID] == .disconnect {
+                    _ = try? await credentials.removeData(
+                        for: scopedCredentialAccount,
+                        ifMatches: legacyData
+                    )
+                }
+                return nil
+            }
             try await accountStore.upsert(account.connectedAccountRecord)
+            guard generation == accountGenerations[accountID, default: 0] else {
+                if accountMutationIntents[accountID] == .disconnect {
+                    _ = try? await credentials.removeData(
+                        for: scopedCredentialAccount,
+                        ifMatches: legacyData
+                    )
+                    _ = try? await accountStore.replace(
+                        account.connectedAccountRecord,
+                        with: nil
+                    )
+                }
+                return nil
+            }
             try? await credentials.removeData(for: Self.credentialAccount)
         } catch {
             throw GitHubConnectionError.credentialStorage

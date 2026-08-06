@@ -49,11 +49,11 @@ struct GitHubView: View {
             }
             return .connected(connection.account)
         }
-        if presentedAccountID != nil {
-            return .disconnected
-        }
         if case let .needsAttention(message) = viewModel.state {
             return .needsAttention(message)
+        }
+        if presentedAccountID != nil {
+            return .disconnected
         }
         if viewModel.accounts.isEmpty, viewModel.state == .loading {
             return .loading

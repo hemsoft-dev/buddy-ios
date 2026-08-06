@@ -714,6 +714,42 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(state, .disconnected)
     }
 
+    func testMissingAccountRouteShowsReconnectFailure() async throws {
+        let accountID = ConnectedAccountID(provider: .github, subject: "42")
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(deviceResults: [.failure(.server(503))]),
+            credentials: MockCredentialStore()
+        )
+        let (viewModel, openURL) = await MainActor.run {
+            (
+                GitHubViewModel(integration: integration),
+                OpenURLAction { _ in .handled }
+            )
+        }
+
+        await MainActor.run {
+            viewModel.reconnect(accountID, openURL: openURL)
+        }
+        let reconnectFailed = try await waitUntil {
+            await MainActor.run {
+                viewModel.activeAccountAuthorizationTarget == nil
+                    && viewModel.state == .needsAttention(
+                        GitHubConnectionError.server(503).localizedDescription
+                    )
+            }
+        }
+        XCTAssertTrue(reconnectFailed)
+
+        let presentationState = await MainActor.run {
+            GitHubView(viewModel: viewModel, accountID: accountID).presentationState
+        }
+        XCTAssertEqual(
+            presentationState,
+            .needsAttention(GitHubConnectionError.server(503).localizedDescription)
+        )
+    }
+
     func testValidationRetryDoesNotSupersedeUnrelatedAccountAuthorization() async throws {
         let failed = GitHubAccount(id: 7, login: "failed", name: nil, avatarURL: nil)
         let reconnecting = GitHubAccount(id: 42, login: "reconnecting", name: nil, avatarURL: nil)
@@ -1308,6 +1344,39 @@ final class GitHubIntegrationTests: XCTestCase {
         )
         XCTAssertNil(legacyToken)
         XCTAssertEqual(migratedToken, "legacy-token")
+    }
+
+    func testDisconnectDuringLegacyValidationCannotRemigrateAccount() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let scopedKey = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let credentials = MockCredentialStore(values: [
+            "github.oauth-token": "legacy-token",
+            scopedKey: "scoped-token",
+        ])
+        let accountStore = InMemoryConnectedAccountStore(records: [account.connectedAccountRecord])
+        let api = SuspendedUserGitHubAPI(account: account)
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: credentials,
+            accountStore: accountStore
+        )
+        let restoration = Task {
+            try await integration.restoreAccounts()
+        }
+        await api.waitUntilUserRequestBegins()
+
+        try await integration.disconnect(accountID: account.connectedAccountID)
+        await api.finishUserRequest()
+
+        let restored = try await restoration.value
+        let legacyToken = await credentials.stringValue(for: "github.oauth-token")
+        let scopedToken = await credentials.stringValue(for: scopedKey)
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertTrue(restored.isEmpty)
+        XCTAssertNil(legacyToken)
+        XCTAssertNil(scopedToken)
+        XCTAssertTrue(records.isEmpty)
     }
 
     func testDisconnectRemovesLegacyCredentialBelongingToSameAccount() async throws {
