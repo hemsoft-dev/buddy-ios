@@ -743,8 +743,14 @@ actor GitHubIntegration: IntegrationProviding {
                     recoveryAction: .reconnect
                 )
             }
-            try? await accountStore.upsert(refreshed.connectedAccountRecord)
-            guard generation == accountGenerations[record.id, default: 0] else { return nil }
+            let refreshedRecord = refreshed.connectedAccountRecord
+            try? await accountStore.upsert(refreshedRecord)
+            guard generation == accountGenerations[record.id, default: 0] else {
+                if accountMutationIntents[record.id] == .disconnect {
+                    _ = try? await accountStore.replace(refreshedRecord, with: nil)
+                }
+                return nil
+            }
             return GitHubAccountConnection(account: refreshed, state: .connected)
         } catch GitHubAPIError.unauthorized {
             guard generation == accountGenerations[record.id, default: 0] else { return nil }

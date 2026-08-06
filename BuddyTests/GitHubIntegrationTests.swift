@@ -1575,6 +1575,33 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertNil(scopedToken)
     }
 
+    func testDisconnectDuringRestoreMetadataRefreshCannotResurrectAccount() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let scopedKey = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let credentials = MockCredentialStore(values: [scopedKey: "stored-token"])
+        let accountStore = SuspendedSuccessfulUpsertConnectedAccountStore(
+            records: [account.connectedAccountRecord]
+        )
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(userResults: [.success(account)]),
+            credentials: credentials,
+            accountStore: accountStore
+        )
+        let restore = Task { try await integration.restoreAccounts() }
+        await accountStore.waitUntilUpsertBegins()
+
+        try await integration.disconnect(accountID: account.connectedAccountID)
+        await accountStore.finishUpsert()
+
+        let restored = try await restore.value
+        let records = await accountStore.accounts(for: .github)
+        let scopedToken = await credentials.stringValue(for: scopedKey)
+        XCTAssertTrue(restored.isEmpty)
+        XCTAssertTrue(records.isEmpty)
+        XCTAssertNil(scopedToken)
+    }
+
     func testRestoreSnapshotCannotResurrectAccountDisconnectedBeforeItsValidation() async throws {
         let first = GitHubAccount(id: 7, login: "first", name: nil, avatarURL: nil)
         let second = GitHubAccount(id: 42, login: "second", name: nil, avatarURL: nil)
@@ -2951,10 +2978,14 @@ private actor SuspendedFailingUpsertConnectedAccountStore: ConnectedAccountStori
 }
 
 private actor SuspendedSuccessfulUpsertConnectedAccountStore: ConnectedAccountStoring {
-    private var records: [ConnectedAccountRecord] = []
+    private var records: [ConnectedAccountRecord]
     private var upsertIsSuspended = false
     private var upsertStartedWaiter: CheckedContinuation<Void, Never>?
     private var upsertCompletion: CheckedContinuation<Void, Never>?
+
+    init(records: [ConnectedAccountRecord] = []) {
+        self.records = records
+    }
 
     func accounts(for provider: IntegrationProvider) -> [ConnectedAccountRecord] {
         records.filter { $0.id.provider == provider }.sorted { $0.id < $1.id }
