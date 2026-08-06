@@ -153,7 +153,7 @@ struct GitHubView: View {
                 if let accountID {
                     viewModel.retry(accountID, openURL: openURL)
                 } else {
-                    viewModel.addAccount(openURL: openURL) { addedAccountID = $0 }
+                    viewModel.retryAccountSetup(openURL: openURL) { addedAccountID = $0 }
                 }
             }
             .buttonStyle(.borderedProminent)
@@ -183,6 +183,7 @@ final class GitHubViewModel {
     private var cancellationTask: Task<Void, Error>?
     private var retryAction = RetryAction.restore
     private var operationGeneration = 0
+    private var accountOperationGenerations: [ConnectedAccountID: Int] = [:]
 
     init(integration: GitHubIntegration = IntegrationCatalog.github) {
         self.integration = integration
@@ -234,6 +235,7 @@ final class GitHubViewModel {
         openURL: OpenURLAction,
         onConnected: ((ConnectedAccountID) -> Void)? = nil
     ) {
+        retryAction = .connect
         authorizeAccount(reconnecting: nil, openURL: openURL, onConnected: onConnected)
     }
 
@@ -256,6 +258,9 @@ final class GitHubViewModel {
         openURL: OpenURLAction,
         onConnected: ((ConnectedAccountID) -> Void)? = nil
     ) {
+        if let id {
+            accountOperationGenerations[id, default: 0] &+= 1
+        }
         operationGeneration &+= 1
         let generation = operationGeneration
         accountConnectionTask?.cancel()
@@ -328,17 +333,17 @@ final class GitHubViewModel {
         if activeAccountAuthorizationTarget == id {
             cancelAccountAuthorization()
         }
-        operationGeneration &+= 1
-        let generation = operationGeneration
+        accountOperationGenerations[id, default: 0] &+= 1
+        let generation = accountOperationGenerations[id, default: 0]
         do {
             try await integration.disconnect(accountID: id)
-            guard generation == operationGeneration else { return }
+            guard generation == accountOperationGenerations[id, default: 0] else { return }
             accounts.removeAll { $0.id == id }
             state = preferredRestingState
         } catch is CancellationError {
             return
         } catch {
-            guard generation == operationGeneration else { return }
+            guard generation == accountOperationGenerations[id, default: 0] else { return }
             if let index = accounts.firstIndex(where: { $0.id == id }) {
                 accounts[index].state = .needsAttention
                 accounts[index].message = error.localizedDescription
@@ -416,6 +421,22 @@ final class GitHubViewModel {
             connect(openURL: openURL)
         case .restore:
             Task { await performRestore() }
+        case .cancel:
+            cancel()
+        case .disconnect:
+            Task { await disconnect() }
+        }
+    }
+
+    func retryAccountSetup(
+        openURL: OpenURLAction,
+        onConnected: ((ConnectedAccountID) -> Void)? = nil
+    ) {
+        switch retryAction {
+        case .restore:
+            Task { await performRestore() }
+        case .connect:
+            addAccount(openURL: openURL, onConnected: onConnected)
         case .cancel:
             cancel()
         case .disconnect:
