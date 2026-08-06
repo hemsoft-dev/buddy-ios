@@ -504,15 +504,23 @@ actor GitHubIntegration: IntegrationProviding {
         writtenRecord: ConnectedAccountRecord
     ) async {
         let credentialAccount = Self.credentialAccount(for: id)
-        let removedWrittenToken = try? await credentials.removeData(
-            for: credentialAccount,
-            ifMatches: writtenToken
-        )
+        let removedWrittenToken: Bool
+        do {
+            removedWrittenToken = try await credentials.removeData(
+                for: credentialAccount,
+                ifMatches: writtenToken
+            )
+        } catch {
+            // If Keychain cleanup fails, preserve recoverable metadata rather than
+            // leaving an invisible credential that the user cannot retry or remove.
+            _ = try? await accountStore.upsertIfMissing(writtenRecord)
+            return
+        }
         if accountMutationIntents[id] == .disconnect {
             _ = try? await accountStore.replace(writtenRecord, with: nil)
             return
         }
-        guard removedWrittenToken == true else { return }
+        guard removedWrittenToken else { return }
         _ = try? await accountStore.replace(writtenRecord, with: previousRecord)
     }
 

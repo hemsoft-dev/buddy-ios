@@ -2387,6 +2387,48 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertTrue(records.isEmpty)
     }
 
+    func testSupersededPersistenceCleanupFailureKeepsAccountVisibleForRecovery() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let credentials = FailingConditionalRemovalCredentialStore(values: [:])
+        let accountStore = SuspendedFailingUpsertConnectedAccountStore()
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(
+                deviceResults: [.success(testAuthorization)],
+                pollResults: [.success(.authorized(token: "recoverable-token"))],
+                userResults: [.success(account)]
+            ),
+            credentials: credentials,
+            accountStore: accountStore,
+            sleep: { _ in }
+        )
+        let authorization = try await integration.beginAccountAuthorization()
+        let completion = Task {
+            try await integration.completeAccountAuthorization(authorization)
+        }
+        await accountStore.waitUntilUpsertBegins()
+
+        do {
+            try await integration.disconnect(accountID: account.connectedAccountID)
+            XCTFail("Expected disconnect credential cleanup to fail")
+        } catch let error as GitHubConnectionError {
+            XCTAssertEqual(error, .credentialStorage)
+        }
+        await accountStore.finishUpsert()
+
+        do {
+            _ = try await completion.value
+            XCTFail("Expected account persistence to fail")
+        } catch let error as GitHubConnectionError {
+            XCTAssertEqual(error, .credentialStorage)
+        }
+        let storedToken = await credentials.stringValue(for: credentialAccount)
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertEqual(storedToken, "recoverable-token")
+        XCTAssertEqual(records, [account.connectedAccountRecord])
+    }
+
     func testNewerDisconnectPreventsOlderDisconnectFromRestoringAccount() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
