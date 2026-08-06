@@ -66,6 +66,20 @@ actor KeychainStore {
         return true
     }
 
+    func replaceData(
+        for account: String,
+        ifMatches expectedData: Data,
+        with replacementData: Data?
+    ) throws -> Bool {
+        guard try data(for: account) == expectedData else { return false }
+        if let replacementData {
+            try set(replacementData, for: account)
+        } else {
+            try removeData(for: account)
+        }
+        return true
+    }
+
     private func baseQuery(for account: String) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,

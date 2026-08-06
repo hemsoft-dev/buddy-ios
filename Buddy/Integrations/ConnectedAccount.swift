@@ -31,6 +31,10 @@ protocol ConnectedAccountStoring: Sendable {
     func accounts(for provider: IntegrationProvider) async throws -> [ConnectedAccountRecord]
     func upsert(_ account: ConnectedAccountRecord) async throws
     func upsertIfMissing(_ account: ConnectedAccountRecord) async throws -> Bool
+    func replace(
+        _ expected: ConnectedAccountRecord,
+        with replacement: ConnectedAccountRecord?
+    ) async throws -> Bool
     func remove(_ id: ConnectedAccountID) async throws
 }
 
@@ -77,6 +81,25 @@ actor UserDefaultsConnectedAccountStore: ConnectedAccountStoring {
         return true
     }
 
+    func replace(
+        _ expected: ConnectedAccountRecord,
+        with replacement: ConnectedAccountRecord?
+    ) throws -> Bool {
+        try ensureLoaded()
+        guard let index = records.firstIndex(where: { $0.id == expected.id }),
+              records[index] == expected
+        else {
+            return false
+        }
+        if let replacement {
+            records[index] = replacement
+        } else {
+            records.remove(at: index)
+        }
+        try persist()
+        return true
+    }
+
     func remove(_ id: ConnectedAccountID) throws {
         try ensureLoaded()
         records.removeAll { $0.id == id }
@@ -111,6 +134,23 @@ actor InMemoryConnectedAccountStore: ConnectedAccountStoring {
     func upsertIfMissing(_ account: ConnectedAccountRecord) -> Bool {
         guard !records.contains(where: { $0.id == account.id }) else { return false }
         records.append(account)
+        return true
+    }
+
+    func replace(
+        _ expected: ConnectedAccountRecord,
+        with replacement: ConnectedAccountRecord?
+    ) -> Bool {
+        guard let index = records.firstIndex(where: { $0.id == expected.id }),
+              records[index] == expected
+        else {
+            return false
+        }
+        if let replacement {
+            records[index] = replacement
+        } else {
+            records.remove(at: index)
+        }
         return true
     }
 

@@ -7,6 +7,11 @@ protocol CredentialStoring: Sendable {
     func data(for account: String) async throws -> Data?
     func removeData(for account: String) async throws
     func removeData(for account: String, ifMatches expectedData: Data) async throws -> Bool
+    func replaceData(
+        for account: String,
+        ifMatches expectedData: Data,
+        with replacementData: Data?
+    ) async throws -> Bool
 }
 
 extension CredentialStoring {
@@ -21,11 +26,29 @@ extension CredentialStoring {
         try await removeData(for: account)
         return true
     }
+
+    func replaceData(
+        for account: String,
+        ifMatches expectedData: Data,
+        with replacementData: Data?
+    ) async throws -> Bool {
+        guard try await data(for: account) == expectedData else { return false }
+        if let replacementData {
+            try await set(replacementData, for: account)
+        } else {
+            try await removeData(for: account)
+        }
+        return true
+    }
 }
 
 extension KeychainStore: CredentialStoring {}
 
 actor GitHubIntegration: IntegrationProviding {
+    private enum AccountMutationIntent: Sendable {
+        case reconnect
+        case disconnect
+    }
     private struct AccountAuthorizationSession: Sendable {
         let targetID: ConnectedAccountID?
         let targetGeneration: Int?
@@ -63,6 +86,7 @@ actor GitHubIntegration: IntegrationProviding {
     private var activeDeviceCode: String?
     private var accountAuthorizations: [String: AccountAuthorizationSession] = [:]
     private var accountGenerations: [ConnectedAccountID: Int] = [:]
+    private var accountMutationIntents: [ConnectedAccountID: AccountMutationIntent] = [:]
 
     init(
         clientID: String? = AppConfiguration.current.githubClientID,
@@ -159,6 +183,7 @@ actor GitHubIntegration: IntegrationProviding {
         guard let clientID else { throw GitHubConnectionError.missingClientID }
         let targetGeneration = id.map { id in
             accountGenerations[id, default: 0] &+= 1
+            accountMutationIntents[id] = .reconnect
             return accountGenerations[id, default: 0]
         }
         do {
@@ -224,6 +249,7 @@ actor GitHubIntegration: IntegrationProviding {
                     }
 
                     accountGenerations[accountID, default: 0] &+= 1
+                    accountMutationIntents[accountID] = .reconnect
                     let accountGeneration = accountGenerations[accountID, default: 0]
                     let credentialAccount = Self.credentialAccount(for: accountID)
                     let previousToken: Data?
@@ -242,8 +268,9 @@ actor GitHubIntegration: IntegrationProviding {
                         throw CancellationError()
                     }
 
+                    let writtenToken = Data(token.utf8)
                     do {
-                        try await credentials.set(Data(token.utf8), for: credentialAccount)
+                        try await credentials.set(writtenToken, for: credentialAccount)
                         guard !Task.isCancelled,
                               accountAuthorizations.keys.contains(authorization.deviceCode),
                               accountGenerations[accountID, default: 0] == accountGeneration
@@ -252,7 +279,15 @@ actor GitHubIntegration: IntegrationProviding {
                                 await rollbackAccountWrite(
                                     id: accountID,
                                     previousToken: previousToken,
-                                    previousRecord: previousRecord
+                                    previousRecord: previousRecord,
+                                    writtenToken: writtenToken,
+                                    writtenRecord: account.connectedAccountRecord,
+                                    generation: accountGeneration
+                                )
+                            } else {
+                                _ = try? await credentials.removeData(
+                                    for: credentialAccount,
+                                    ifMatches: writtenToken
                                 )
                             }
                             throw CancellationError()
@@ -264,7 +299,10 @@ actor GitHubIntegration: IntegrationProviding {
                             await rollbackAccountWrite(
                                 id: accountID,
                                 previousToken: previousToken,
-                                previousRecord: previousRecord
+                                previousRecord: previousRecord,
+                                writtenToken: writtenToken,
+                                writtenRecord: account.connectedAccountRecord,
+                                generation: accountGeneration
                             )
                         }
                         throw GitHubConnectionError.credentialStorage
@@ -278,7 +316,15 @@ actor GitHubIntegration: IntegrationProviding {
                             await rollbackAccountWrite(
                                 id: accountID,
                                 previousToken: previousToken,
-                                previousRecord: previousRecord
+                                previousRecord: previousRecord,
+                                writtenToken: writtenToken,
+                                writtenRecord: account.connectedAccountRecord,
+                                generation: accountGeneration
+                            )
+                        } else {
+                            _ = try? await credentials.removeData(
+                                for: credentialAccount,
+                                ifMatches: writtenToken
                             )
                         }
                         throw CancellationError()
@@ -303,6 +349,7 @@ actor GitHubIntegration: IntegrationProviding {
 
     func disconnect(accountID: ConnectedAccountID) async throws {
         accountGenerations[accountID, default: 0] &+= 1
+        accountMutationIntents[accountID] = .disconnect
         let generation = accountGenerations[accountID, default: 0]
         accountAuthorizations = accountAuthorizations.filter { $0.value.targetID != accountID }
         var previousRecord: ConnectedAccountRecord?
@@ -329,9 +376,11 @@ actor GitHubIntegration: IntegrationProviding {
             try await accountStore.remove(accountID)
             guard generation == accountGenerations[accountID, default: 0] else {
                 await restoreDisconnectedAccount(
+                    accountID: accountID,
                     record: previousRecord,
                     tokenData: tokenData,
-                    credentialAccount: credentialAccount
+                    credentialAccount: credentialAccount,
+                    generation: generation
                 )
                 throw CancellationError()
             }
@@ -343,9 +392,11 @@ actor GitHubIntegration: IntegrationProviding {
                 )
                 guard removed else {
                     await restoreDisconnectedAccount(
+                        accountID: accountID,
                         record: previousRecord,
                         tokenData: tokenData,
-                        credentialAccount: credentialAccount
+                        credentialAccount: credentialAccount,
+                        generation: generation
                     )
                     if generation != accountGenerations[accountID, default: 0] {
                         throw CancellationError()
@@ -355,9 +406,11 @@ actor GitHubIntegration: IntegrationProviding {
             }
             guard generation == accountGenerations[accountID, default: 0] else {
                 await restoreDisconnectedAccount(
+                    accountID: accountID,
                     record: previousRecord,
                     tokenData: tokenData,
-                    credentialAccount: credentialAccount
+                    credentialAccount: credentialAccount,
+                    generation: generation
                 )
                 throw CancellationError()
             }
@@ -365,19 +418,27 @@ actor GitHubIntegration: IntegrationProviding {
             throw CancellationError()
         } catch {
             await restoreDisconnectedAccount(
+                accountID: accountID,
                 record: previousRecord,
                 tokenData: tokenData,
-                credentialAccount: credentialAccount
+                credentialAccount: credentialAccount,
+                generation: generation
             )
             throw GitHubConnectionError.credentialStorage
         }
     }
 
     private func restoreDisconnectedAccount(
+        accountID: ConnectedAccountID,
         record: ConnectedAccountRecord?,
         tokenData: Data?,
-        credentialAccount: String
+        credentialAccount: String,
+        generation: Int
     ) async {
+        if generation != accountGenerations[accountID, default: 0],
+           accountMutationIntents[accountID] != .reconnect {
+            return
+        }
         if let record {
             _ = try? await accountStore.upsertIfMissing(record)
         }
@@ -389,20 +450,19 @@ actor GitHubIntegration: IntegrationProviding {
     private func rollbackAccountWrite(
         id: ConnectedAccountID,
         previousToken: Data?,
-        previousRecord: ConnectedAccountRecord?
+        previousRecord: ConnectedAccountRecord?,
+        writtenToken: Data,
+        writtenRecord: ConnectedAccountRecord,
+        generation: Int
     ) async {
         let credentialAccount = Self.credentialAccount(for: id)
-        if let previousToken {
-            try? await credentials.set(previousToken, for: credentialAccount)
-        } else {
-            try? await credentials.removeData(for: credentialAccount)
-        }
-
-        if let previousRecord {
-            try? await accountStore.upsert(previousRecord)
-        } else {
-            try? await accountStore.remove(id)
-        }
+        _ = try? await credentials.replaceData(
+            for: credentialAccount,
+            ifMatches: writtenToken,
+            with: previousToken
+        )
+        guard generation == accountGenerations[id, default: 0] else { return }
+        _ = try? await accountStore.replace(writtenRecord, with: previousRecord)
     }
 
     private func migrateLegacyCredential() async throws -> LegacyMigrationResult? {

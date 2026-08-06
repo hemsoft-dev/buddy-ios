@@ -1730,6 +1730,138 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(records, [])
     }
 
+    func testDisconnectWhileCredentialWriteIsDelayedRemovesOrphanedToken() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let credentials = SuspendedDelayedSetCredentialStore(
+            values: [credentialAccount: "old-token"]
+        )
+        let accountStore = InMemoryConnectedAccountStore(records: [account.connectedAccountRecord])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(
+                deviceResults: [.success(testAuthorization)],
+                pollResults: [.success(.authorized(token: "new-token"))],
+                userResults: [.success(account)]
+            ),
+            credentials: credentials,
+            accountStore: accountStore,
+            sleep: { _ in }
+        )
+        let authorization = try await integration.beginAccountAuthorization(
+            reconnecting: account.connectedAccountID
+        )
+        let completion = Task {
+            try await integration.completeAccountAuthorization(authorization)
+        }
+        await credentials.waitUntilSetBegins()
+
+        try await integration.disconnect(accountID: account.connectedAccountID)
+        await credentials.finishSet()
+
+        do {
+            _ = try await completion.value
+            XCTFail("Expected disconnect to supersede the delayed credential write")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let storedToken = await credentials.stringValue(for: credentialAccount)
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertNil(storedToken)
+        XCTAssertTrue(records.isEmpty)
+    }
+
+    func testStaleAuthorizationRollbackCannotOverwriteNewerReconnect() async throws {
+        let original = GitHubAccount(id: 42, login: "original", name: nil, avatarURL: nil)
+        let failedAttempt = GitHubAccount(id: 42, login: "failed-attempt", name: nil, avatarURL: nil)
+        let latest = GitHubAccount(id: 42, login: "latest", name: nil, avatarURL: nil)
+        let credentialAccount = GitHubIntegration.credentialAccount(for: original.connectedAccountID)
+        let credentials = SuspendedRollbackCredentialStore(
+            values: [credentialAccount: "old-token"]
+        )
+        let accountStore = FailFirstUpsertConnectedAccountStore(
+            records: [original.connectedAccountRecord]
+        )
+        let secondAuthorization = GitHubDeviceAuthorization(
+            deviceCode: "second-device-code",
+            userCode: "IJKL-MNOP",
+            verificationURI: testAuthorization.verificationURI,
+            expiresIn: 900,
+            interval: 5
+        )
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(
+                deviceResults: [.success(testAuthorization), .success(secondAuthorization)],
+                pollResults: [
+                    .success(.authorized(token: "failed-token")),
+                    .success(.authorized(token: "latest-token")),
+                ],
+                userResults: [.success(failedAttempt), .success(latest)]
+            ),
+            credentials: credentials,
+            accountStore: accountStore,
+            sleep: { _ in }
+        )
+        let firstAuthorization = try await integration.beginAccountAuthorization(
+            reconnecting: original.connectedAccountID
+        )
+        let failedCompletion = Task {
+            try await integration.completeAccountAuthorization(firstAuthorization)
+        }
+        await credentials.waitUntilRollbackBegins()
+
+        let currentAuthorization = try await integration.beginAccountAuthorization(
+            reconnecting: original.connectedAccountID
+        )
+        _ = try await integration.completeAccountAuthorization(currentAuthorization)
+        await credentials.finishRollback()
+
+        do {
+            _ = try await failedCompletion.value
+            XCTFail("Expected the first persistence attempt to fail")
+        } catch let error as GitHubConnectionError {
+            XCTAssertEqual(error, .credentialStorage)
+        }
+        let storedToken = await credentials.stringValue(for: credentialAccount)
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertEqual(storedToken, "latest-token")
+        XCTAssertEqual(records, [latest.connectedAccountRecord])
+    }
+
+    func testNewerDisconnectPreventsOlderDisconnectFromRestoringAccount() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let credentials = SuspendedPostRemovalCredentialStore(
+            values: [credentialAccount: "stored-token"]
+        )
+        let accountStore = InMemoryConnectedAccountStore(records: [account.connectedAccountRecord])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(),
+            credentials: credentials,
+            accountStore: accountStore
+        )
+        let olderDisconnect = Task {
+            try await integration.disconnect(accountID: account.connectedAccountID)
+        }
+        await credentials.waitUntilFirstRemovalCompletes()
+
+        try await integration.disconnect(accountID: account.connectedAccountID)
+        await credentials.finishFirstRemoval()
+
+        do {
+            try await olderDisconnect.value
+            XCTFail("Expected the newer disconnect to supersede the older operation")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let storedToken = await credentials.stringValue(for: credentialAccount)
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertNil(storedToken)
+        XCTAssertTrue(records.isEmpty)
+    }
+
     func testViewModelRestoresAllAccountsInDeterministicOrder() async throws {
         let later = GitHubAccount(id: 42, login: "later", name: nil, avatarURL: nil)
         let earlier = GitHubAccount(id: 7, login: "earlier", name: nil, avatarURL: nil)
@@ -1933,6 +2065,228 @@ private actor SuspendedFirstReadCredentialStore: CredentialStoring {
 
     func stringValue(for account: String) -> String? {
         values[account].flatMap { String(data: $0, encoding: .utf8) }
+    }
+}
+
+private actor SuspendedDelayedSetCredentialStore: CredentialStoring {
+    private var values: [String: Data]
+    private var didSuspendSet = false
+    private var setStartedWaiter: CheckedContinuation<Void, Never>?
+    private var setCompletion: CheckedContinuation<Void, Never>?
+
+    init(values: [String: String]) {
+        self.values = values.mapValues { Data($0.utf8) }
+    }
+
+    func set(_ data: Data, for account: String) async {
+        if !didSuspendSet {
+            didSuspendSet = true
+            setStartedWaiter?.resume()
+            setStartedWaiter = nil
+            await withCheckedContinuation { continuation in
+                setCompletion = continuation
+            }
+        }
+        values[account] = data
+    }
+
+    func data(for account: String) -> Data? {
+        values[account]
+    }
+
+    func removeData(for account: String) {
+        values.removeValue(forKey: account)
+    }
+
+    func removeData(for account: String, ifMatches expectedData: Data) -> Bool {
+        guard values[account] == expectedData else { return false }
+        values.removeValue(forKey: account)
+        return true
+    }
+
+    func waitUntilSetBegins() async {
+        guard setCompletion == nil else { return }
+        await withCheckedContinuation { continuation in
+            setStartedWaiter = continuation
+        }
+    }
+
+    func finishSet() {
+        setCompletion?.resume()
+        setCompletion = nil
+    }
+
+    func stringValue(for account: String) -> String? {
+        values[account].flatMap { String(data: $0, encoding: .utf8) }
+    }
+}
+
+private actor SuspendedRollbackCredentialStore: CredentialStoring {
+    private var values: [String: Data]
+    private var didSuspendRollback = false
+    private var rollbackStartedWaiter: CheckedContinuation<Void, Never>?
+    private var rollbackCompletion: CheckedContinuation<Void, Never>?
+
+    init(values: [String: String]) {
+        self.values = values.mapValues { Data($0.utf8) }
+    }
+
+    func set(_ data: Data, for account: String) {
+        values[account] = data
+    }
+
+    func data(for account: String) -> Data? {
+        values[account]
+    }
+
+    func removeData(for account: String) {
+        values.removeValue(forKey: account)
+    }
+
+    func removeData(for account: String, ifMatches expectedData: Data) -> Bool {
+        guard values[account] == expectedData else { return false }
+        values.removeValue(forKey: account)
+        return true
+    }
+
+    func replaceData(
+        for account: String,
+        ifMatches expectedData: Data,
+        with replacementData: Data?
+    ) async -> Bool {
+        guard values[account] == expectedData else { return false }
+        values[account] = replacementData
+        if !didSuspendRollback {
+            didSuspendRollback = true
+            rollbackStartedWaiter?.resume()
+            rollbackStartedWaiter = nil
+            await withCheckedContinuation { continuation in
+                rollbackCompletion = continuation
+            }
+        }
+        return true
+    }
+
+    func waitUntilRollbackBegins() async {
+        guard rollbackCompletion == nil else { return }
+        await withCheckedContinuation { continuation in
+            rollbackStartedWaiter = continuation
+        }
+    }
+
+    func finishRollback() {
+        rollbackCompletion?.resume()
+        rollbackCompletion = nil
+    }
+
+    func stringValue(for account: String) -> String? {
+        values[account].flatMap { String(data: $0, encoding: .utf8) }
+    }
+}
+
+private actor SuspendedPostRemovalCredentialStore: CredentialStoring {
+    private var values: [String: Data]
+    private var didSuspendRemoval = false
+    private var removalCompletedWaiter: CheckedContinuation<Void, Never>?
+    private var removalCompletion: CheckedContinuation<Void, Never>?
+
+    init(values: [String: String]) {
+        self.values = values.mapValues { Data($0.utf8) }
+    }
+
+    func set(_ data: Data, for account: String) {
+        values[account] = data
+    }
+
+    func data(for account: String) -> Data? {
+        values[account]
+    }
+
+    func removeData(for account: String) {
+        values.removeValue(forKey: account)
+    }
+
+    func removeData(for account: String, ifMatches expectedData: Data) async -> Bool {
+        guard values[account] == expectedData else { return false }
+        values.removeValue(forKey: account)
+        if !didSuspendRemoval {
+            didSuspendRemoval = true
+            removalCompletedWaiter?.resume()
+            removalCompletedWaiter = nil
+            await withCheckedContinuation { continuation in
+                removalCompletion = continuation
+            }
+        }
+        return true
+    }
+
+    func waitUntilFirstRemovalCompletes() async {
+        guard removalCompletion == nil else { return }
+        await withCheckedContinuation { continuation in
+            removalCompletedWaiter = continuation
+        }
+    }
+
+    func finishFirstRemoval() {
+        removalCompletion?.resume()
+        removalCompletion = nil
+    }
+
+    func stringValue(for account: String) -> String? {
+        values[account].flatMap { String(data: $0, encoding: .utf8) }
+    }
+}
+
+private actor FailFirstUpsertConnectedAccountStore: ConnectedAccountStoring {
+    enum StoreError: Error {
+        case firstUpsertFailed
+    }
+
+    private var records: [ConnectedAccountRecord]
+    private var shouldFailUpsert = true
+
+    init(records: [ConnectedAccountRecord]) {
+        self.records = records
+    }
+
+    func accounts(for provider: IntegrationProvider) -> [ConnectedAccountRecord] {
+        records.filter { $0.id.provider == provider }.sorted { $0.id < $1.id }
+    }
+
+    func upsert(_ account: ConnectedAccountRecord) throws {
+        records.removeAll { $0.id == account.id }
+        records.append(account)
+        if shouldFailUpsert {
+            shouldFailUpsert = false
+            throw StoreError.firstUpsertFailed
+        }
+    }
+
+    func upsertIfMissing(_ account: ConnectedAccountRecord) -> Bool {
+        guard !records.contains(where: { $0.id == account.id }) else { return false }
+        records.append(account)
+        return true
+    }
+
+    func replace(
+        _ expected: ConnectedAccountRecord,
+        with replacement: ConnectedAccountRecord?
+    ) -> Bool {
+        guard let index = records.firstIndex(where: { $0.id == expected.id }),
+              records[index] == expected
+        else {
+            return false
+        }
+        if let replacement {
+            records[index] = replacement
+        } else {
+            records.remove(at: index)
+        }
+        return true
+    }
+
+    func remove(_ id: ConnectedAccountID) {
+        records.removeAll { $0.id == id }
     }
 }
 
