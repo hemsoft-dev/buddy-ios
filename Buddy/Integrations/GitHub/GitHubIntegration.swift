@@ -151,24 +151,30 @@ actor GitHubIntegration: IntegrationProviding {
         }
 
         var connections: [GitHubAccountConnection] = []
+        var connectionGenerations: [ConnectedAccountID: Int] = [:]
         if let migrated {
             if migrated.requiresScopedValidation {
                 if let connection = await restoreRegisteredAccount(migrated.record) {
                     connections.append(connection)
+                    connectionGenerations[connection.id] = accountGenerations[connection.id, default: 0]
                 }
             } else {
-                connections.append(
-                    GitHubAccountConnection(
-                        account: GitHubAccount(record: migrated.record),
-                        state: .connected
-                    )
+                let connection = GitHubAccountConnection(
+                    account: GitHubAccount(record: migrated.record),
+                    state: .connected
                 )
+                connections.append(connection)
+                connectionGenerations[connection.id] = accountGenerations[connection.id, default: 0]
             }
         }
         for record in records.sorted(by: { $0.id < $1.id }) {
             if let connection = await restoreRegisteredAccount(record) {
                 connections.append(connection)
+                connectionGenerations[connection.id] = accountGenerations[connection.id, default: 0]
             }
+        }
+        connections.removeAll { connection in
+            connectionGenerations[connection.id] != accountGenerations[connection.id, default: 0]
         }
         connections.sort { $0.id < $1.id }
 

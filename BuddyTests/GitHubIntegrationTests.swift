@@ -751,6 +751,34 @@ final class GitHubIntegrationTests: XCTestCase {
         )
     }
 
+    func testAddAccountRouteIgnoresUnrelatedAccountFailure() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(),
+            credentials: MockCredentialStore(),
+            accountStore: InMemoryConnectedAccountStore(records: [account.connectedAccountRecord])
+        )
+        let viewModel = await MainActor.run { GitHubViewModel(integration: integration) }
+        await viewModel.restore()
+
+        let (addRouteState, accountRouteState) = await MainActor.run {
+            (
+                GitHubView(viewModel: viewModel).presentationState,
+                GitHubView(
+                    viewModel: viewModel,
+                    accountID: account.connectedAccountID
+                ).presentationState
+            )
+        }
+
+        XCTAssertEqual(addRouteState, .disconnected)
+        XCTAssertEqual(
+            accountRouteState,
+            .needsAttention(GitHubConnectionError.invalidToken.localizedDescription)
+        )
+    }
+
     func testValidationRetryDoesNotSupersedeUnrelatedAccountAuthorization() async throws {
         let failed = GitHubAccount(id: 7, login: "failed", name: nil, avatarURL: nil)
         let reconnecting = GitHubAccount(id: 42, login: "reconnecting", name: nil, avatarURL: nil)
@@ -1586,6 +1614,41 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(requestCount, 3)
         XCTAssertEqual(accounts, [GitHubAccountConnection(account: first, state: .connected)])
         XCTAssertEqual(records, [first.connectedAccountRecord])
+    }
+
+    func testRestoreResultCannotResurrectAccountDisconnectedDuringLaterValidation() async throws {
+        let first = GitHubAccount(id: 7, login: "first", name: nil, avatarURL: nil)
+        let second = GitHubAccount(id: 42, login: "second", name: nil, avatarURL: nil)
+        let api = SequencedSuspendedUserGitHubAPI()
+        let credentials = MockCredentialStore(values: [
+            GitHubIntegration.credentialAccount(for: first.connectedAccountID): "first-token",
+            GitHubIntegration.credentialAccount(for: second.connectedAccountID): "second-token",
+        ])
+        let accountStore = InMemoryConnectedAccountStore(records: [
+            first.connectedAccountRecord,
+            second.connectedAccountRecord,
+        ])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: credentials,
+            accountStore: accountStore
+        )
+        let viewModel = await MainActor.run { GitHubViewModel(integration: integration) }
+
+        let restore = Task { await viewModel.restore() }
+        await api.waitForRequest(count: 1)
+        await api.finishRequest(at: 0, with: .success(first))
+        await api.waitForRequest(count: 2)
+
+        await viewModel.disconnect(first.connectedAccountID)
+        await api.finishRequest(at: 1, with: .success(second))
+        await restore.value
+
+        let accounts = await MainActor.run { viewModel.accounts }
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertEqual(accounts, [GitHubAccountConnection(account: second, state: .connected)])
+        XCTAssertEqual(records, [second.connectedAccountRecord])
     }
 
     func testMalformedPersistedAccountMetadataSurfacesStorageFailure() async throws {

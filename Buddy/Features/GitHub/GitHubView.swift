@@ -50,7 +50,16 @@ struct GitHubView: View {
             return .connected(connection.account)
         }
         if case let .needsAttention(message) = viewModel.state {
-            return .needsAttention(message)
+            switch viewModel.stateScope {
+            case .global:
+                return .needsAttention(message)
+            case .accountSetup where presentedAccountID == nil:
+                return .needsAttention(message)
+            case let .account(id) where presentedAccountID == id:
+                return .needsAttention(message)
+            default:
+                break
+            }
         }
         if presentedAccountID != nil {
             return .disconnected
@@ -187,6 +196,7 @@ struct GitHubView: View {
 @Observable
 final class GitHubViewModel {
     private(set) var state: GitHubViewState = .loading
+    private(set) var stateScope: GitHubViewStateScope = .global
     private(set) var accounts: [GitHubAccountConnection] = []
     private(set) var activeAccountAuthorizationTarget: ConnectedAccountID?
 
@@ -221,6 +231,7 @@ final class GitHubViewModel {
         operationGeneration &+= 1
         let generation = operationGeneration
         connectionTask?.cancel()
+        stateScope = .global
         state = .loading
 
         do {
@@ -229,11 +240,15 @@ final class GitHubViewModel {
             accounts = restoredAccounts
             if let account = restoredAccounts.first(where: { $0.state == .connected })?.account {
                 guard generation == operationGeneration else { return }
+                stateScope = .account(account.connectedAccountID)
                 state = .connected(account)
-            } else if let message = restoredAccounts.first?.message {
+            } else if let connection = restoredAccounts.first,
+                      let message = connection.message {
+                stateScope = .account(connection.id)
                 state = .needsAttention(message)
             } else {
                 guard generation == operationGeneration else { return }
+                stateScope = .global
                 state = disconnectedState
             }
         } catch is CancellationError {
@@ -241,6 +256,7 @@ final class GitHubViewModel {
         } catch {
             guard generation == operationGeneration else { return }
             retryAction = (error as? GitHubConnectionError) == .invalidToken ? .connect : .restore
+            stateScope = .global
             state = .needsAttention(error.localizedDescription)
         }
     }
@@ -279,6 +295,7 @@ final class GitHubViewModel {
         let generation = operationGeneration
         accountConnectionTask?.cancel()
         activeAccountAuthorizationTarget = id
+        stateScope = id.map(GitHubViewStateScope.account) ?? .accountSetup
         accountConnectionTask = Task {
             var authorization: GitHubDeviceAuthorization?
             defer {
@@ -306,6 +323,7 @@ final class GitHubViewModel {
                 accounts.removeAll { $0.id == connection.id }
                 accounts.append(connection)
                 accounts.sort { $0.id < $1.id }
+                stateScope = .account(connection.id)
                 state = .connected(connection.account)
                 onConnected?(connection.id)
             } catch is CancellationError {
@@ -313,12 +331,14 @@ final class GitHubViewModel {
                     await integration.cancelAccountAuthorization(authorization)
                 }
                 guard generation == operationGeneration else { return }
+                stateScope = preferredRestingStateScope
                 state = preferredRestingState
             } catch {
                 guard generation == operationGeneration else { return }
                 if let id,
                    let index = accounts.firstIndex(where: { $0.id == id }) {
                     if accounts[index].state == .connected {
+                        stateScope = .account(id)
                         state = .connected(accounts[index].account)
                         return
                     }
@@ -326,6 +346,7 @@ final class GitHubViewModel {
                     accounts[index].message = error.localizedDescription
                     accounts[index].recoveryAction = .reconnect
                 }
+                stateScope = id.map(GitHubViewStateScope.account) ?? .accountSetup
                 state = .needsAttention(error.localizedDescription)
             }
         }
@@ -340,6 +361,7 @@ final class GitHubViewModel {
         }
         activeAccountAuthorization = nil
         activeAccountAuthorizationTarget = nil
+        stateScope = preferredRestingStateScope
         state = preferredRestingState
     }
 
@@ -353,6 +375,7 @@ final class GitHubViewModel {
             try await integration.disconnect(accountID: id)
             guard generation == accountOperationGenerations[id, default: 0] else { return }
             accounts.removeAll { $0.id == id }
+            stateScope = preferredRestingStateScope
             state = preferredRestingState
         } catch is CancellationError {
             return
@@ -362,6 +385,7 @@ final class GitHubViewModel {
                 accounts[index].state = .needsAttention
                 accounts[index].message = error.localizedDescription
             }
+            stateScope = .account(id)
             state = .needsAttention(error.localizedDescription)
         }
     }
@@ -371,6 +395,7 @@ final class GitHubViewModel {
         accounts[index].state = .needsAttention
         accounts[index].message = GitHubConnectionError.invalidToken.localizedDescription
         accounts[index].recoveryAction = .reconnect
+        stateScope = preferredRestingStateScope
         state = preferredRestingState
     }
 
@@ -384,11 +409,22 @@ final class GitHubViewModel {
         return disconnectedState
     }
 
+    private var preferredRestingStateScope: GitHubViewStateScope {
+        if let connection = accounts.first(where: { $0.state == .connected }) {
+            return .account(connection.id)
+        }
+        if let connection = accounts.first {
+            return .account(connection.id)
+        }
+        return .global
+    }
+
     func connect(openURL: OpenURLAction) {
         operationGeneration &+= 1
         let generation = operationGeneration
         connectionTask?.cancel()
         retryAction = .connect
+        stateScope = .accountSetup
         connectionTask = Task {
             defer {
                 if generation == operationGeneration {
@@ -406,23 +442,28 @@ final class GitHubViewModel {
                 let authorization = try await integration.beginAuthorization()
                 try Task.checkCancellation()
                 guard generation == operationGeneration else { return }
+                stateScope = .accountSetup
                 state = .authorizing(authorization)
                 openURL(authorization.verificationURI)
 
                 let account = try await integration.completeAuthorization(authorization)
                 try Task.checkCancellation()
                 guard generation == operationGeneration else { return }
+                stateScope = .account(account.connectedAccountID)
                 state = .connected(account)
             } catch is CancellationError {
                 guard generation == operationGeneration else { return }
                 cancellationTask = nil
+                stateScope = .global
                 state = disconnectedState
             } catch {
                 guard generation == operationGeneration else { return }
                 cancellationTask = nil
                 if (error as? GitHubConnectionError) == .missingClientID {
+                    stateScope = .global
                     state = disconnectedState
                 } else {
+                    stateScope = .accountSetup
                     state = .needsAttention(error.localizedDescription)
                 }
             }
@@ -463,6 +504,7 @@ final class GitHubViewModel {
         let generation = operationGeneration
         connectionTask?.cancel()
         connectionTask = nil
+        stateScope = .accountSetup
         state = .loading
         let cleanupTask = Task {
             try await integration.cancelAuthorization()
@@ -473,11 +515,13 @@ final class GitHubViewModel {
                 try await cleanupTask.value
                 guard generation == operationGeneration else { return }
                 cancellationTask = nil
+                stateScope = .global
                 state = disconnectedState
             } catch {
                 guard generation == operationGeneration else { return }
                 cancellationTask = nil
                 retryAction = .cancel
+                stateScope = .accountSetup
                 state = .needsAttention(error.localizedDescription)
             }
         }
@@ -492,10 +536,12 @@ final class GitHubViewModel {
         do {
             try await integration.disconnect()
             guard generation == operationGeneration else { return }
+            stateScope = .global
             state = disconnectedState
         } catch {
             guard generation == operationGeneration else { return }
             retryAction = .disconnect
+            stateScope = .global
             state = .needsAttention(error.localizedDescription)
         }
     }
@@ -505,6 +551,7 @@ final class GitHubViewModel {
         connectionTask?.cancel()
         connectionTask = nil
         retryAction = .connect
+        stateScope = .global
         state = .needsAttention(GitHubConnectionError.invalidToken.localizedDescription)
     }
 
@@ -521,6 +568,12 @@ final class GitHubViewModel {
         }
         return .configurationRequired(GitHubConnectionError.missingClientID.localizedDescription)
     }
+}
+
+enum GitHubViewStateScope: Equatable {
+    case global
+    case accountSetup
+    case account(ConnectedAccountID)
 }
 
 enum GitHubViewState: Equatable {
