@@ -237,6 +237,42 @@ final class GitHubAPITests: XCTestCase {
         }
     }
 
+    func testBrowserAuthorizationReportsMissingCodeAsTerminalCallbackError() async throws {
+        let service = GitHubWebOAuthService(
+            callbackTimeout: .seconds(15),
+            randomBytes: { count in Data(repeating: UInt8(count), count: count) }
+        )
+        let authorization = try await service.beginAuthorization(
+            configuration: GitHubOAuthConfiguration(clientID: "client", clientSecret: "public-secret")
+        )
+        let authorizationComponents = try XCTUnwrap(
+            URLComponents(url: authorization.authorizationURL, resolvingAgainstBaseURL: false)
+        )
+        let query = Dictionary(
+            uniqueKeysWithValues: (authorizationComponents.queryItems ?? []).compactMap { item in
+                item.value.map { (item.name, $0) }
+            }
+        )
+        var callbackComponents = try XCTUnwrap(
+            URLComponents(string: try XCTUnwrap(query["redirect_uri"]))
+        )
+        callbackComponents.queryItems = [
+            URLQueryItem(name: "state", value: try XCTUnwrap(query["state"])),
+        ]
+
+        let completion = Task { try await service.completeAuthorization(authorization) }
+        let (_, callbackResponse) = try await URLSession.shared.data(
+            from: try XCTUnwrap(callbackComponents.url)
+        )
+        XCTAssertEqual((callbackResponse as? HTTPURLResponse)?.statusCode, 400)
+        do {
+            _ = try await completion.value
+            XCTFail("Expected a missing authorization code failure")
+        } catch let error as GitHubOAuthError {
+            XCTAssertEqual(error, .missingAuthorizationCode)
+        }
+    }
+
     func testTokenExchangeTreatsBadVerificationCodeAsRetryableAuthorizationFailure() async throws {
         let httpClient = MockHTTPClient(responses: [
             .success(#"{"error":"bad_verification_code"}"#, statusCode: 200),

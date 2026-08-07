@@ -853,7 +853,9 @@ final class GitHubOAuthCallbackServer: @unchecked Sendable {
         switch result {
         case let .success(url):
             finishCallback(.success(url))
-        case let .failure(error) where error == .accessDenied || error == .authorizationFailed:
+        case let .failure(error) where error == .accessDenied
+            || error == .authorizationFailed
+            || error == .missingAuthorizationCode:
             finishCallback(.failure(error))
         case .failure:
             // A malformed or unrelated request must not consume the one valid
