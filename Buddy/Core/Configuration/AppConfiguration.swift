@@ -14,8 +14,7 @@ struct AppConfiguration: Sendable {
         githubClientSecret = configuredClientSecret?.nilIfEmptyOrBuildSetting
 
         let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
-        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
-        versionDescription = "\(version) (\(build))"
+        versionDescription = version
     }
 }
 
