@@ -94,6 +94,72 @@ final class DashboardViewModelTests: XCTestCase {
         XCTAssertEqual(groups[1].pullRequests.map(\.id), [1])
     }
 
+    func testPullRequestAccountSummaryPreservesBoundedSearchTotals() {
+        XCTAssertEqual(
+            DashboardGitHubPullRequestCopy.accountSummary(
+                authoredVisible: 50,
+                authoredTotal: 72,
+                assignedVisible: 2,
+                assignedTotal: 2
+            ),
+            "50 of 72 authored · 2 assigned"
+        )
+    }
+
+    func testPullRequestAccountHeaderRemainsLoadingUntilBothSectionsResolve() {
+        XCTAssertEqual(
+            DashboardGitHubPullRequestCopy.accountHeaderSummary(
+                authoredState: .loaded(
+                    [makePullRequest(
+                        id: 1,
+                        repository: "HemSoft/Buddy",
+                        updatedAt: Date(timeIntervalSince1970: 100)
+                    )],
+                    refreshedAt: Date(timeIntervalSince1970: 100)
+                ),
+                authoredTotal: 1,
+                assignedState: .loading,
+                assignedTotal: 0
+            ),
+            "Loading pull requests"
+        )
+    }
+
+    func testPullRequestAccountHeaderKeepsLoadingAheadOfOrdinaryFailure() {
+        XCTAssertEqual(
+            DashboardGitHubPullRequestCopy.accountHeaderSummary(
+                authoredState: .failed([], refreshedAt: nil, .server),
+                authoredTotal: 0,
+                assignedState: .loading,
+                assignedTotal: 0
+            ),
+            "Loading pull requests"
+        )
+    }
+
+    func testPullRequestAccountHeaderKeepsAuthenticationFailureAheadOfLoading() {
+        XCTAssertEqual(
+            DashboardGitHubPullRequestCopy.accountHeaderSummary(
+                authoredState: .failed([], refreshedAt: nil, .authenticationRequired),
+                authoredTotal: 0,
+                assignedState: .loading,
+                assignedTotal: 0
+            ),
+            "Reconnect required · 0 authored · 0 assigned"
+        )
+    }
+
+    func testAssignedEmptyStateDisclosesPublicRepositoryLimit() {
+        let description = DashboardGitHubPullRequestCopy.emptyStateDescription(
+            login: "octocat",
+            section: .assigned
+        )
+
+        XCTAssertTrue(description.contains("No public open pull requests"))
+        XCTAssertTrue(description.contains("@octocat"))
+        XCTAssertTrue(description.contains("limited to public repositories"))
+    }
+
     func testPullRequestTreeExpansionSurvivesRefreshForExistingRepositories() {
         var expansion = DashboardGitHubPullRequestTreeExpansionState()
         expansion.reconcile(accountID: testAccount.id, repositories: ["HemSoft/Buddy", "HemSoft/Other"])
@@ -125,6 +191,28 @@ final class DashboardViewModelTests: XCTestCase {
         XCTAssertFalse(expansion.isRepositoryExpanded("HemSoft/Buddy", for: secondAccountID))
         XCTAssertTrue(expansion.isPullRequestSectionExpanded(for: testAccount.id))
         XCTAssertTrue(expansion.isRepositoryExpanded("HemSoft/Buddy", for: testAccount.id))
+    }
+
+    func testPullRequestTreeExpansionDoesNotLeakBetweenAuthoredAndAssignedSections() {
+        var expansion = DashboardGitHubPullRequestTreeExpansionState()
+        expansion.reconcile(
+            accountID: testAccount.id,
+            section: .assigned,
+            repositories: ["HemSoft/Buddy"]
+        )
+        expansion.togglePullRequestSection(for: testAccount.id, section: .assigned)
+        expansion.toggleRepository("HemSoft/Buddy", for: testAccount.id, section: .assigned)
+
+        expansion.reconcile(
+            accountID: testAccount.id,
+            section: .authored,
+            repositories: ["HemSoft/Buddy"]
+        )
+
+        XCTAssertTrue(expansion.isPullRequestSectionExpanded(for: testAccount.id, section: .assigned))
+        XCTAssertTrue(expansion.isRepositoryExpanded("HemSoft/Buddy", for: testAccount.id, section: .assigned))
+        XCTAssertFalse(expansion.isPullRequestSectionExpanded(for: testAccount.id, section: .authored))
+        XCTAssertFalse(expansion.isRepositoryExpanded("HemSoft/Buddy", for: testAccount.id, section: .authored))
     }
 
     func testPullRequestTreeDoesNotReconcileTransientAccountSwitchData() throws {
@@ -338,6 +426,25 @@ final class DashboardViewModelTests: XCTestCase {
         )
     }
 
+    func testGitHubDashboardPropagatesAuthenticationFailureToCanceledSiblingSection() async {
+        let viewModel = DashboardViewModel(
+            integrations: [],
+            github: RevokedCredentialRaceProvider()
+        )
+
+        let failure = await viewModel.refresh(account: testAccount)
+
+        XCTAssertEqual(failure, .authenticationRequired)
+        XCTAssertEqual(
+            viewModel.githubState(for: testAccount, section: .authored),
+            .failed([], refreshedAt: nil, .authenticationRequired)
+        )
+        XCTAssertEqual(
+            viewModel.githubState(for: testAccount, section: .assigned),
+            .failed([], refreshedAt: nil, .authenticationRequired)
+        )
+    }
+
     func testGitHubDashboardSurfacesIncompleteSearchAsRetryableFailure() async {
         let provider = StubPullRequestProvider(results: [.failure(.incompleteResults)])
         let viewModel = DashboardViewModel(integrations: [], github: provider)
@@ -407,6 +514,97 @@ final class DashboardViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.githubTotalCount(for: secondAccount), 1)
     }
 
+    func testGitHubDashboardLoadsIndependentAssignedReviewResultsForMultipleAccounts() async {
+        let refreshDate = Date(timeIntervalSince1970: 4_750)
+        let sharedPullRequest = makePullRequest(id: 20, updatedAt: refreshDate)
+        let firstAssigned = makePullRequest(
+            id: 21,
+            repository: "HemSoft/First",
+            updatedAt: refreshDate.addingTimeInterval(-10)
+        )
+        let secondAssigned = makePullRequest(
+            id: 22,
+            repository: "HemSoft/Second",
+            updatedAt: refreshDate.addingTimeInterval(10)
+        )
+        let secondAccount = GitHubAccount(id: 84, login: "hubot", name: nil, avatarURL: nil)
+        let provider = SectionedPullRequestProvider(
+            authored: [
+                testAccount.id: [.success(collection([]))],
+                secondAccount.id: [.success(collection([]))],
+            ],
+            assigned: [
+                testAccount.id: [.success(collection([firstAssigned, sharedPullRequest], totalCount: 2))],
+                secondAccount.id: [.success(collection([secondAssigned, sharedPullRequest], totalCount: 2))],
+            ]
+        )
+        let viewModel = DashboardViewModel(integrations: [], github: provider, now: { refreshDate })
+
+        await viewModel.refresh(account: testAccount)
+        await viewModel.refresh(account: secondAccount)
+
+        XCTAssertEqual(
+            viewModel.githubState(for: testAccount, section: .assigned),
+            .loaded([sharedPullRequest, firstAssigned], refreshedAt: refreshDate)
+        )
+        XCTAssertEqual(
+            viewModel.githubState(for: secondAccount, section: .assigned),
+            .loaded([secondAssigned, sharedPullRequest], refreshedAt: refreshDate)
+        )
+        XCTAssertEqual(viewModel.githubTotalCount(for: testAccount, section: .assigned), 2)
+        XCTAssertEqual(viewModel.githubTotalCount(for: secondAccount, section: .assigned), 2)
+    }
+
+    func testAssignedReviewRefreshFailurePreservesOnlyThatAccountsStaleResults() async {
+        let firstDate = Date(timeIntervalSince1970: 4_800)
+        let assigned = makePullRequest(id: 20, updatedAt: firstDate)
+        let provider = SectionedPullRequestProvider(
+            authored: [testAccount.id: [
+                .success(collection([])),
+                .success(collection([])),
+            ]],
+            assigned: [testAccount.id: [
+                .success(collection([assigned])),
+                .failure(.rateLimited),
+            ]]
+        )
+        let viewModel = DashboardViewModel(integrations: [], github: provider, now: { firstDate })
+        await viewModel.refresh(account: testAccount)
+
+        let failure = await viewModel.refresh(account: testAccount)
+
+        XCTAssertEqual(failure, .rateLimited)
+        XCTAssertEqual(
+            viewModel.githubState(for: testAccount, section: .assigned),
+            .failed([assigned], refreshedAt: firstDate, .rateLimited)
+        )
+        XCTAssertEqual(
+            viewModel.githubState(for: testAccount, section: .authored),
+            .loaded([], refreshedAt: firstDate)
+        )
+    }
+
+    func testGitHubDashboardAccountTimestampUsesNewestSectionRefresh() async {
+        let authoredDate = Date(timeIntervalSince1970: 4_900)
+        let assignedDate = Date(timeIntervalSince1970: 5_000)
+        let clock = MutableTestClock(now: authoredDate)
+        let provider = SectionedPullRequestProvider(
+            authored: [testAccount.id: [.success(collection([]))]],
+            assigned: [testAccount.id: [.success(collection([]))]]
+        )
+        let viewModel = DashboardViewModel(
+            integrations: [],
+            github: provider,
+            now: { clock.now }
+        )
+
+        await viewModel.refresh(account: testAccount, section: .authored)
+        clock.now = assignedDate
+        await viewModel.refresh(account: testAccount, section: .assigned)
+
+        XCTAssertEqual(viewModel.githubRefreshedAt(for: testAccount), assignedDate)
+    }
+
     func testGitHubDashboardBlocksDuplicateInitialRefreshes() async {
         let pullRequest = makePullRequest(id: 1, updatedAt: Date(timeIntervalSince1970: 5_000))
         let provider = SuspendedPullRequestProvider()
@@ -431,6 +629,15 @@ final class DashboardViewModelTests: XCTestCase {
 }
 
 private let testAccount = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+
+@MainActor
+private final class MutableTestClock {
+    var now: Date
+
+    init(now: Date) {
+        self.now = now
+    }
+}
 
 private func makePullRequest(
     id: Int,
@@ -468,6 +675,10 @@ private actor StubPullRequestProvider: GitHubPullRequestProviding {
     func authoredPullRequests(for _: GitHubAccount) throws -> GitHubPullRequestCollection {
         try results.removeFirst().get()
     }
+
+    func assignedPullRequests(for _: GitHubAccount) -> GitHubPullRequestCollection {
+        GitHubPullRequestCollection(pullRequests: [], totalCount: 0)
+    }
 }
 
 private actor SuspendedPullRequestProvider: GitHubPullRequestProviding {
@@ -484,6 +695,10 @@ private actor SuspendedPullRequestProvider: GitHubPullRequestProviding {
         }
     }
 
+    func assignedPullRequests(for _: GitHubAccount) -> GitHubPullRequestCollection {
+        GitHubPullRequestCollection(pullRequests: [], totalCount: 0)
+    }
+
     func waitUntilRequested() async {
         guard capturedRequestCount == 0 else { return }
         await withCheckedContinuation { continuation in
@@ -498,6 +713,47 @@ private actor SuspendedPullRequestProvider: GitHubPullRequestProviding {
 
     func requestCount() -> Int {
         capturedRequestCount
+    }
+}
+
+private actor SectionedPullRequestProvider: GitHubPullRequestProviding {
+    private var authored: [Int: [Result<GitHubPullRequestCollection, GitHubConnectionError>]]
+    private var assigned: [Int: [Result<GitHubPullRequestCollection, GitHubConnectionError>]]
+
+    init(
+        authored: [Int: [Result<GitHubPullRequestCollection, GitHubConnectionError>]],
+        assigned: [Int: [Result<GitHubPullRequestCollection, GitHubConnectionError>]]
+    ) {
+        self.authored = authored
+        self.assigned = assigned
+    }
+
+    func authoredPullRequests(for account: GitHubAccount) throws -> GitHubPullRequestCollection {
+        guard var results = authored[account.id], !results.isEmpty else {
+            return GitHubPullRequestCollection(pullRequests: [], totalCount: 0)
+        }
+        let result = results.removeFirst()
+        authored[account.id] = results
+        return try result.get()
+    }
+
+    func assignedPullRequests(for account: GitHubAccount) throws -> GitHubPullRequestCollection {
+        guard var results = assigned[account.id], !results.isEmpty else {
+            return GitHubPullRequestCollection(pullRequests: [], totalCount: 0)
+        }
+        let result = results.removeFirst()
+        assigned[account.id] = results
+        return try result.get()
+    }
+}
+
+private actor RevokedCredentialRaceProvider: GitHubPullRequestProviding {
+    func authoredPullRequests(for _: GitHubAccount) throws -> GitHubPullRequestCollection {
+        throw GitHubConnectionError.invalidToken
+    }
+
+    func assignedPullRequests(for _: GitHubAccount) throws -> GitHubPullRequestCollection {
+        throw CancellationError()
     }
 }
 

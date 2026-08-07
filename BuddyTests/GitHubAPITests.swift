@@ -135,6 +135,32 @@ final class GitHubAPITests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "X-GitHub-Api-Version"), "2022-11-28")
     }
 
+    func testAssignedPullRequestsUsesReviewRequestedQualifierAndAccountCredential() async throws {
+        let httpClient = MockHTTPClient(responses: [
+            .success(
+                #"{"total_count":1,"incomplete_results":false,"items":[{"id":9,"number":20,"title":"Assigned review","draft":false,"updated_at":"2026-08-06T12:00:00Z","html_url":"https://github.com/HemSoft/Buddy/pull/20","repository_url":"https://api.github.com/repos/HemSoft/Buddy"}]}"#,
+                statusCode: 200
+            ),
+        ])
+
+        let collection = try await GitHubAPI(httpClient: httpClient)
+            .assignedPullRequests(login: "franz-test", token: "account-token")
+
+        XCTAssertEqual(collection.pullRequests.map(\.id), [9])
+        let capturedRequest = await httpClient.lastRequest()
+        let request = try XCTUnwrap(capturedRequest)
+        let components = try XCTUnwrap(
+            URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)
+        )
+        let query = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).map { ($0.name, $0.value) })
+        XCTAssertEqual(query["q"]!, "is:pr is:open review-requested:franz-test")
+        XCTAssertEqual(query["sort"]!, "updated")
+        XCTAssertEqual(query["order"]!, "desc")
+        XCTAssertEqual(query["per_page"]!, "50")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer account-token")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-GitHub-Api-Version"), "2022-11-28")
+    }
+
     func testAuthoredPullRequestsSupportsEmptyResults() async throws {
         let httpClient = MockHTTPClient(responses: [.success(#"{"total_count":0,"incomplete_results":false,"items":[]}"#, statusCode: 200)])
 

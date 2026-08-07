@@ -163,7 +163,7 @@ struct DashboardView: View {
                             .font(.caption)
                             .foregroundStyle(connection.state == .connected ? githubHeaderSummaryColor(for: account) : .orange)
 
-                        if let refreshedAt = viewModel.githubState(for: account).refreshedAt {
+                        if let refreshedAt = viewModel.githubRefreshedAt(for: account) {
                             Text("Updated \(refreshedAt, style: .relative) ago")
                                 .font(.caption2)
                                 .foregroundStyle(.tertiary)
@@ -208,21 +208,35 @@ struct DashboardView: View {
     }
 
     private func githubAccountBody(_ account: GitHubAccount) -> some View {
-        pullRequestSection(account)
+        VStack(alignment: .leading, spacing: BuddyTheme.Spacing.medium) {
+            pullRequestSection(account, section: .authored)
+            Divider()
+            pullRequestSection(account, section: .assigned)
+        }
     }
 
-    private func pullRequestSection(_ account: GitHubAccount) -> some View {
-        let isExpanded = githubPullRequestTreeExpansion.isPullRequestSectionExpanded(for: account.id)
+    private func pullRequestSection(
+        _ account: GitHubAccount,
+        section: GitHubPullRequestSection
+    ) -> some View {
+        let isExpanded = githubPullRequestTreeExpansion.isPullRequestSectionExpanded(
+            for: account.id,
+            section: section
+        )
         let snapshot = DashboardGitHubPullRequestTreeSnapshot(
             accountID: account.id,
+            section: section,
             dataAccountID: account.id,
-            state: viewModel.githubState(for: account)
+            state: viewModel.githubState(for: account, section: section)
         )
 
         return VStack(alignment: .leading, spacing: BuddyTheme.Spacing.medium) {
             Button {
                 withAnimation(reduceMotion ? nil : .snappy) {
-                    githubPullRequestTreeExpansion.togglePullRequestSection(for: account.id)
+                    githubPullRequestTreeExpansion.togglePullRequestSection(
+                        for: account.id,
+                        section: section
+                    )
                 }
             } label: {
                 HStack(spacing: BuddyTheme.Spacing.small) {
@@ -233,23 +247,23 @@ struct DashboardView: View {
                         .accessibilityHidden(true)
 
                     VStack(alignment: .leading, spacing: BuddyTheme.Spacing.xSmall) {
-                        Text("My open PRs")
+                        Text(sectionTitle(section))
                             .font(.headline)
                             .foregroundStyle(.primary)
 
-                        Text(githubPullRequestSectionSummary(for: account))
+                        Text(githubPullRequestSectionSummary(for: account, section: section))
                             .font(.caption)
-                            .foregroundStyle(githubPullRequestSectionSummaryColor(for: account))
+                            .foregroundStyle(githubPullRequestSectionSummaryColor(for: account, section: section))
                     }
 
                     Spacer(minLength: BuddyTheme.Spacing.small)
 
-                    if case .loading = viewModel.githubState(for: account) {
+                    if case .loading = viewModel.githubState(for: account, section: section) {
                         ProgressView()
                             .controlSize(.small)
                             .accessibilityHidden(true)
                     } else {
-                        Text("\(viewModel.githubState(for: account).pullRequests.count)")
+                        Text("\(viewModel.githubState(for: account, section: section).pullRequests.count)")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, BuddyTheme.Spacing.small)
@@ -261,12 +275,12 @@ struct DashboardView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("My open pull requests")
-            .accessibilityValue("\(isExpanded ? "Expanded" : "Collapsed"), \(githubPullRequestSectionSummary(for: account))")
+            .accessibilityLabel(sectionAccessibilityLabel(section))
+            .accessibilityValue("\(isExpanded ? "Expanded" : "Collapsed"), \(githubPullRequestSectionSummary(for: account, section: section))")
             .accessibilityHint(isExpanded ? "Collapses pull request status and repositories" : "Expands pull request status and repositories")
 
             if isExpanded {
-                githubPullRequestSectionContent(account)
+                githubPullRequestSectionContent(account, section: section)
                     .padding(.leading, BuddyTheme.Spacing.medium)
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }
@@ -276,24 +290,28 @@ struct DashboardView: View {
             guard let snapshot else { return }
             githubPullRequestTreeExpansion.reconcile(
                 accountID: snapshot.accountID,
+                section: snapshot.section,
                 repositories: snapshot.repositories
             )
         }
     }
 
     @ViewBuilder
-    private func githubPullRequestSectionContent(_ account: GitHubAccount) -> some View {
-        switch viewModel.githubState(for: account) {
+    private func githubPullRequestSectionContent(
+        _ account: GitHubAccount,
+        section: GitHubPullRequestSection
+    ) -> some View {
+        switch viewModel.githubState(for: account, section: section) {
         case .loading:
             HStack(spacing: BuddyTheme.Spacing.small) {
                 ProgressView()
-                Text("Loading authored pull requests…")
+                Text(section == .authored ? "Loading authored pull requests…" : "Loading assigned reviews…")
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
         case let .loaded(pullRequests, _):
-            pullRequestContent(pullRequests, account: account)
+            pullRequestContent(pullRequests, account: account, section: section)
 
         case let .refreshing(pullRequests, _):
             VStack(alignment: .leading, spacing: BuddyTheme.Spacing.medium) {
@@ -304,7 +322,7 @@ struct DashboardView: View {
                         .foregroundStyle(.secondary)
                 }
                 if !pullRequests.isEmpty {
-                    repositoryGroupList(pullRequests, accountID: account.id)
+                    repositoryGroupList(pullRequests, accountID: account.id, section: section)
                 }
             }
 
@@ -319,36 +337,50 @@ struct DashboardView: View {
                     if failure == .authenticationRequired {
                         openAccounts()
                     } else {
-                        Task { await refreshPullRequests(for: account) }
+                        Task { await refreshPullRequests(for: account, section: section) }
                     }
                 }
                 .buttonStyle(.bordered)
 
                 if !pullRequests.isEmpty {
-                    repositoryGroupList(pullRequests, accountID: account.id)
+                    repositoryGroupList(pullRequests, accountID: account.id, section: section)
                 }
             }
         }
     }
 
     @ViewBuilder
-    private func pullRequestContent(_ pullRequests: [GitHubPullRequest], account: GitHubAccount) -> some View {
+    private func pullRequestContent(
+        _ pullRequests: [GitHubPullRequest],
+        account: GitHubAccount,
+        section: GitHubPullRequestSection
+    ) -> some View {
         if pullRequests.isEmpty {
             VStack(alignment: .leading, spacing: BuddyTheme.Spacing.small) {
-                Label("No open pull requests", systemImage: "checkmark.circle.fill")
+                Label(
+                    section == .authored ? "No open pull requests" : "No reviews requested",
+                    systemImage: "checkmark.circle.fill"
+                )
                     .font(.headline)
                     .foregroundStyle(.green)
-                Text("@\(account.login) has no public authored pull requests open right now. Buddy's current GitHub authorization is limited to public repositories.")
+                Text(DashboardGitHubPullRequestCopy.emptyStateDescription(
+                    login: account.login,
+                    section: section
+                ))
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         } else {
-            repositoryGroupList(pullRequests, accountID: account.id)
+            repositoryGroupList(pullRequests, accountID: account.id, section: section)
         }
     }
 
-    private func repositoryGroupList(_ pullRequests: [GitHubPullRequest], accountID: Int) -> some View {
+    private func repositoryGroupList(
+        _ pullRequests: [GitHubPullRequest],
+        accountID: Int,
+        section: GitHubPullRequestSection
+    ) -> some View {
         let groups = GitHubPullRequestRepositoryGroup.grouped(pullRequests)
 
         return LazyVStack(alignment: .leading, spacing: 0) {
@@ -356,7 +388,7 @@ struct DashboardView: View {
                 if index > 0 {
                     Divider()
                 }
-                repositoryGroup(group, accountID: accountID)
+                repositoryGroup(group, accountID: accountID, section: section)
                     .padding(.vertical, BuddyTheme.Spacing.small)
             }
         }
@@ -364,14 +396,23 @@ struct DashboardView: View {
 
     private func repositoryGroup(
         _ group: GitHubPullRequestRepositoryGroup,
-        accountID: Int
+        accountID: Int,
+        section: GitHubPullRequestSection
     ) -> some View {
-        let isExpanded = githubPullRequestTreeExpansion.isRepositoryExpanded(group.id, for: accountID)
+        let isExpanded = githubPullRequestTreeExpansion.isRepositoryExpanded(
+            group.id,
+            for: accountID,
+            section: section
+        )
 
         return VStack(alignment: .leading, spacing: BuddyTheme.Spacing.small) {
             Button {
                 withAnimation(reduceMotion ? nil : .snappy) {
-                    githubPullRequestTreeExpansion.toggleRepository(group.id, for: accountID)
+                    githubPullRequestTreeExpansion.toggleRepository(
+                        group.id,
+                        for: accountID,
+                        section: section
+                    )
                 }
             } label: {
                 HStack(spacing: BuddyTheme.Spacing.small) {
@@ -454,8 +495,25 @@ struct DashboardView: View {
         .accessibilityHint("Opens on GitHub")
     }
 
-    private func githubPullRequestSectionSummary(for account: GitHubAccount) -> String {
-        let state = viewModel.githubState(for: account)
+    private func sectionTitle(_ section: GitHubPullRequestSection) -> String {
+        switch section {
+        case .authored: "My open PRs"
+        case .assigned: "PRs assigned to me"
+        }
+    }
+
+    private func sectionAccessibilityLabel(_ section: GitHubPullRequestSection) -> String {
+        switch section {
+        case .authored: "My open pull requests"
+        case .assigned: "Pull requests assigned to me for review"
+        }
+    }
+
+    private func githubPullRequestSectionSummary(
+        for account: GitHubAccount,
+        section: GitHubPullRequestSection
+    ) -> String {
+        let state = viewModel.githubState(for: account, section: section)
         let count = state.pullRequests.count
         let countDescription = "\(count) visible pull request\(count == 1 ? "" : "s")"
 
@@ -473,8 +531,11 @@ struct DashboardView: View {
         }
     }
 
-    private func githubPullRequestSectionSummaryColor(for account: GitHubAccount) -> Color {
-        if case .failed = viewModel.githubState(for: account) {
+    private func githubPullRequestSectionSummaryColor(
+        for account: GitHubAccount,
+        section: GitHubPullRequestSection
+    ) -> Color {
+        if case .failed = viewModel.githubState(for: account, section: section) {
             return .orange
         }
         return .secondary
@@ -485,33 +546,40 @@ struct DashboardView: View {
     }
 
     private func githubHeaderSummary(for account: GitHubAccount) -> String {
-        let state = viewModel.githubState(for: account)
-        let count = state.pullRequests.count
-        let totalCount = viewModel.githubTotalCount(for: account)
-        let result = totalCount > count
-            ? "\(count) of \(totalCount) public open pull requests"
-            : "\(count) public open pull request\(count == 1 ? "" : "s")"
-        switch state {
-        case .loading:
-            return "Loading public pull requests"
-        case .loaded:
-            return result
-        case .refreshing:
-            return "Refreshing · \(result)"
-        case .failed(_, _, .authenticationRequired):
-            return "Reconnect required · \(result)"
-        case .failed:
-            return "Refresh warning · \(result)"
-        }
+        let authoredState = viewModel.githubState(for: account, section: .authored)
+        let assignedState = viewModel.githubState(for: account, section: .assigned)
+        return DashboardGitHubPullRequestCopy.accountHeaderSummary(
+            authoredState: authoredState,
+            authoredTotal: viewModel.githubTotalCount(for: account, section: .authored),
+            assignedState: assignedState,
+            assignedTotal: viewModel.githubTotalCount(for: account, section: .assigned)
+        )
     }
 
     private func githubHeaderSummaryColor(for account: GitHubAccount) -> Color {
-        if case .failed = viewModel.githubState(for: account) { return .orange }
+        let states = [
+            viewModel.githubState(for: account, section: .authored),
+            viewModel.githubState(for: account, section: .assigned),
+        ]
+        if states.contains(where: {
+            if case .failed = $0 { return true }
+            return false
+        }) { return .orange }
         return .secondary
     }
 
     private func refreshPullRequests(for account: GitHubAccount) async {
         let failure = await viewModel.refresh(account: account)
+        if failure == .authenticationRequired {
+            githubViewModel.reportDashboardAuthenticationFailure(for: account.connectedAccountID)
+        }
+    }
+
+    private func refreshPullRequests(
+        for account: GitHubAccount,
+        section: GitHubPullRequestSection
+    ) async {
+        let failure = await viewModel.refresh(account: account, section: section)
         if failure == .authenticationRequired {
             githubViewModel.reportDashboardAuthenticationFailure(for: account.connectedAccountID)
         }

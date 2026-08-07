@@ -43,6 +43,11 @@ extension CredentialStoring {
 }
 
 actor GitHubIntegration: IntegrationProviding {
+    private enum PullRequestQuery: Sendable {
+        case authored
+        case assigned
+    }
+
     private enum AccountMutationIntent: Sendable {
         case reconnect
         case disconnect
@@ -848,6 +853,17 @@ actor GitHubIntegration: IntegrationProviding {
     }
 
     func authoredPullRequests(for account: GitHubAccount) async throws -> GitHubPullRequestCollection {
+        try await pullRequests(for: account, query: .authored)
+    }
+
+    func assignedPullRequests(for account: GitHubAccount) async throws -> GitHubPullRequestCollection {
+        try await pullRequests(for: account, query: .assigned)
+    }
+
+    private func pullRequests(
+        for account: GitHubAccount,
+        query: PullRequestQuery
+    ) async throws -> GitHubPullRequestCollection {
         if let activeCredentialCleanup {
             do {
                 try await activeCredentialCleanup.task.value
@@ -893,7 +909,12 @@ actor GitHubIntegration: IntegrationProviding {
         }
 
         do {
-            let pullRequests = try await api.authoredPullRequests(login: account.login, token: token)
+            let pullRequests = switch query {
+            case .authored:
+                try await api.authoredPullRequests(login: account.login, token: token)
+            case .assigned:
+                try await api.assignedPullRequests(login: account.login, token: token)
+            }
             try Task.checkCancellation()
             guard generation == authorizationGeneration,
                   accountGeneration == accountGenerations[accountID, default: 0]
