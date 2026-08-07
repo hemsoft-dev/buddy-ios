@@ -1614,6 +1614,76 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(migratedToken, "legacy-token")
     }
 
+    func testReconnectAfterLegacyScopeUpgradeRemovesSupersededCredential() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let credentials = MockCredentialStore(initialValue: "public-only-legacy-token")
+        let accountStore = InMemoryConnectedAccountStore()
+        let api = StubGitHubAPI(
+            deviceResults: [.success(testAuthorization)],
+            pollResults: [.success(.authorized(token: "private-repository-token"))],
+            userResults: [
+                .failure(.insufficientOAuthScope),
+                .success(account),
+            ]
+        )
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: credentials,
+            accountStore: accountStore,
+            sleep: { _ in }
+        )
+
+        do {
+            _ = try await integration.restoreAccounts()
+            XCTFail("Expected repository access requirement")
+        } catch let error as GitHubConnectionError {
+            XCTAssertEqual(error, .privateRepositoryAccessRequired)
+        }
+
+        let authorization = try await integration.beginAccountAuthorization()
+        let reconnected = try await integration.completeAccountAuthorization(authorization)
+
+        XCTAssertEqual(reconnected, GitHubAccountConnection(account: account, state: .connected))
+        let legacyToken = await credentials.stringValue(for: "github.oauth-token")
+        let scopedToken = await credentials.stringValue(
+            for: GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        )
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertNil(legacyToken)
+        XCTAssertEqual(scopedToken, "private-repository-token")
+        XCTAssertEqual(records, [account.connectedAccountRecord])
+    }
+
+    func testDisconnectAfterLegacyScopeUpgradeRemovesSupersededCredential() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let scopedKey = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let credentials = MockCredentialStore(values: [
+            "github.oauth-token": "public-only-legacy-token",
+            scopedKey: "private-repository-token",
+        ])
+        let accountStore = InMemoryConnectedAccountStore(records: [account.connectedAccountRecord])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(userResults: [
+                .failure(.insufficientOAuthScope),
+                .success(account),
+            ]),
+            credentials: credentials,
+            accountStore: accountStore
+        )
+        _ = try await integration.restoreAccounts()
+
+        try await integration.disconnect(accountID: account.connectedAccountID)
+
+        let legacyToken = await credentials.stringValue(for: "github.oauth-token")
+        let scopedToken = await credentials.stringValue(for: scopedKey)
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertNil(legacyToken)
+        XCTAssertNil(scopedToken)
+        XCTAssertTrue(records.isEmpty)
+    }
+
     func testDisconnectDuringLegacyValidationCannotRemigrateAccount() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let scopedKey = GitHubIntegration.credentialAccount(for: account.connectedAccountID)

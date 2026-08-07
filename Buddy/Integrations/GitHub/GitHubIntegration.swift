@@ -61,6 +61,7 @@ actor GitHubIntegration: IntegrationProviding {
 
     private enum LegacyCredentialState: Sendable {
         case unknown(Data)
+        case scopeUpgradeRequired(Data)
         case owned(Data, ConnectedAccountID)
     }
 
@@ -339,6 +340,7 @@ actor GitHubIntegration: IntegrationProviding {
                     throw CancellationError()
                 }
                 try await accountStore.upsert(account.connectedAccountRecord)
+                try await removeLegacyCredentialReplacedByScopeUpgrade()
             } catch {
                 if error is CancellationError { throw error }
                 if let connectionError = error as? GitHubConnectionError,
@@ -623,6 +625,15 @@ actor GitHubIntegration: IntegrationProviding {
         }
     }
 
+    private func removeLegacyCredentialReplacedByScopeUpgrade() async throws {
+        guard case let .scopeUpgradeRequired(pendingData) = legacyCredentialState,
+              try await credentials.data(for: Self.credentialAccount) == pendingData
+        else {
+            return
+        }
+        try await removeLegacyCredential(ifMatches: pendingData)
+    }
+
     private func removeLegacyCredential(ifMatches legacyData: Data) async throws {
         if try await credentials.removeData(
             for: Self.credentialAccount,
@@ -664,6 +675,9 @@ actor GitHubIntegration: IntegrationProviding {
                 throw GitHubConnectionError.credentialStorage
             }
             return nil
+        } catch GitHubAPIError.insufficientOAuthScope {
+            legacyCredentialState = .scopeUpgradeRequired(legacyData)
+            throw GitHubConnectionError.privateRepositoryAccessRequired
         } catch {
             throw map(error)
         }
