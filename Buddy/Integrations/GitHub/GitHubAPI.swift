@@ -342,6 +342,7 @@ enum GitHubOAuthError: Error, Equatable, LocalizedError, Sendable {
     case malformedCallback
     case callbackTooLarge
     case accessDenied
+    case authorizationFailed
     case invalidConfiguration
     case tokenExchangeFailed(Int)
     case invalidTokenResponse
@@ -366,6 +367,8 @@ enum GitHubOAuthError: Error, Equatable, LocalizedError, Sendable {
             "GitHub returned an oversized sign-in callback."
         case .accessDenied:
             "Authorization was denied. You can try again when you're ready."
+        case .authorizationFailed:
+            "GitHub couldn't complete sign-in. Try again."
         case .invalidConfiguration:
             "GitHub rejected Buddy's OAuth configuration."
         case let .tokenExchangeFailed(statusCode):
@@ -646,7 +649,7 @@ struct GitHubOAuthCallbackRequestParser: Sendable {
         if let error = components.queryItems?.first(where: { $0.name == "error" })?.value {
             return error == "access_denied"
                 ? .failure(.accessDenied)
-                : .failure(.malformedCallback)
+                : .failure(.authorizationFailed)
         }
         guard components.queryItems?.first(where: { $0.name == "code" })?.value?.isEmpty == false else {
             return .failure(.missingAuthorizationCode)
@@ -850,8 +853,8 @@ final class GitHubOAuthCallbackServer: @unchecked Sendable {
         switch result {
         case let .success(url):
             finishCallback(.success(url))
-        case .failure(.accessDenied):
-            finishCallback(.failure(GitHubOAuthError.accessDenied))
+        case let .failure(error) where error == .accessDenied || error == .authorizationFailed:
+            finishCallback(.failure(error))
         case .failure:
             // A malformed or unrelated request must not consume the one valid
             // OAuth callback. Respond to that connection and keep listening.

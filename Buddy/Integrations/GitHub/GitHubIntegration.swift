@@ -1274,6 +1274,8 @@ actor GitHubIntegration: IntegrationProviding {
                 return .requestExpired
             case .accessDenied:
                 return .accessDenied
+            case .authorizationFailed:
+                return .malformedResponse
             case .invalidConfiguration:
                 return .invalidConfiguration
             case .missingAuthorizationCode, .stateMismatch, .malformedCallback,

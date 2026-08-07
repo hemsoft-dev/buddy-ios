@@ -36,7 +36,7 @@ struct GitHubView: View {
             }
         }
         .navigationTitle("GitHub")
-        .sheet(item: $presentedAuthorizationURL, onDismiss: authorizationSheetDismissed) { item in
+        .sheet(item: $presentedAuthorizationURL) { item in
             GitHubSafariView(url: item.url)
                 .ignoresSafeArea()
         }
@@ -216,11 +216,6 @@ struct GitHubView: View {
         presentedAuthorizationURL = PresentedGitHubAuthorizationURL(url: url)
     }
 
-    private func authorizationSheetDismissed() {
-        if case .authorizing = viewModel.state {
-            viewModel.cancelAccountAuthorization()
-        }
-    }
 }
 
 private struct PresentedGitHubAuthorizationURL: Identifiable {

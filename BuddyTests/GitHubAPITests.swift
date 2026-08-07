@@ -95,6 +95,10 @@ final class GitHubAPITests: XCTestCase {
             parser.parse(Data("GET /callback?error=access_denied&state=expected HTTP/1.1\r\n\r\n".utf8)),
             .failure(.accessDenied)
         )
+        XCTAssertEqual(
+            parser.parse(Data("GET /callback?error=server_error&state=expected HTTP/1.1\r\n\r\n".utf8)),
+            .failure(.authorizationFailed)
+        )
         XCTAssertEqual(parser.parse(Data(repeating: 65, count: 129)), .failure(.callbackTooLarge))
     }
 
@@ -191,38 +195,45 @@ final class GitHubAPITests: XCTestCase {
         }
     }
 
-    func testBrowserAuthorizationReportsAccessDeniedCallback() async throws {
-        let service = GitHubWebOAuthService(
-            callbackTimeout: .seconds(15),
-            randomBytes: { count in Data(repeating: UInt8(count), count: count) }
-        )
-        let authorization = try await service.beginAuthorization(
-            configuration: GitHubOAuthConfiguration(clientID: "client", clientSecret: "public-secret")
-        )
-        let authorizationComponents = try XCTUnwrap(
-            URLComponents(url: authorization.authorizationURL, resolvingAgainstBaseURL: false)
-        )
-        let query = Dictionary(
-            uniqueKeysWithValues: (authorizationComponents.queryItems ?? []).compactMap { item in
-                item.value.map { (item.name, $0) }
-            }
-        )
-        var callbackComponents = try XCTUnwrap(URLComponents(string: try XCTUnwrap(query["redirect_uri"])))
-        callbackComponents.queryItems = [
-            URLQueryItem(name: "error", value: "access_denied"),
-            URLQueryItem(name: "state", value: try XCTUnwrap(query["state"])),
-        ]
+    func testBrowserAuthorizationReportsTerminalOAuthErrorCallbacks() async throws {
+        for (callbackError, expectedError) in [
+            ("access_denied", GitHubOAuthError.accessDenied),
+            ("server_error", GitHubOAuthError.authorizationFailed),
+        ] {
+            let service = GitHubWebOAuthService(
+                callbackTimeout: .seconds(15),
+                randomBytes: { count in Data(repeating: UInt8(count), count: count) }
+            )
+            let authorization = try await service.beginAuthorization(
+                configuration: GitHubOAuthConfiguration(clientID: "client", clientSecret: "public-secret")
+            )
+            let authorizationComponents = try XCTUnwrap(
+                URLComponents(url: authorization.authorizationURL, resolvingAgainstBaseURL: false)
+            )
+            let query = Dictionary(
+                uniqueKeysWithValues: (authorizationComponents.queryItems ?? []).compactMap { item in
+                    item.value.map { (item.name, $0) }
+                }
+            )
+            var callbackComponents = try XCTUnwrap(
+                URLComponents(string: try XCTUnwrap(query["redirect_uri"]))
+            )
+            callbackComponents.queryItems = [
+                URLQueryItem(name: "error", value: callbackError),
+                URLQueryItem(name: "state", value: try XCTUnwrap(query["state"])),
+            ]
 
-        let completion = Task { try await service.completeAuthorization(authorization) }
-        let (_, callbackResponse) = try await URLSession.shared.data(
-            from: try XCTUnwrap(callbackComponents.url)
-        )
-        XCTAssertEqual((callbackResponse as? HTTPURLResponse)?.statusCode, 400)
-        do {
-            _ = try await completion.value
-            XCTFail("Expected access denied")
-        } catch let error as GitHubOAuthError {
-            XCTAssertEqual(error, .accessDenied)
+            let completion = Task { try await service.completeAuthorization(authorization) }
+            let (_, callbackResponse) = try await URLSession.shared.data(
+                from: try XCTUnwrap(callbackComponents.url)
+            )
+            XCTAssertEqual((callbackResponse as? HTTPURLResponse)?.statusCode, 400)
+            do {
+                _ = try await completion.value
+                XCTFail("Expected terminal OAuth callback error")
+            } catch let error as GitHubOAuthError {
+                XCTAssertEqual(error, expectedError)
+            }
         }
     }
 
