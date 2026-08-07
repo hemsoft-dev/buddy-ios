@@ -2,79 +2,315 @@ import XCTest
 @testable import Buddy
 
 final class GitHubAPITests: XCTestCase {
-    func testRequestsDeviceAuthorizationWithoutSecretOrScopes() async throws {
-        let httpClient = MockHTTPClient(responses: [
-            .success(
-                #"{"device_code":"device-secret","user_code":"ABCD-EFGH","verification_uri":"https://github.com/login/device","expires_in":900,"interval":5}"#,
-                statusCode: 200
-            ),
-        ])
-        let api = GitHubAPI(httpClient: httpClient)
+    func testBrowserAuthorizationURLUsesPKCEStateExactLoopbackRedirectAndAccountPicker() throws {
+        let redirectURI = "http://127.0.0.1:49152/callback"
+        let url = GitHubWebOAuthService.authorizationURL(
+            clientID: "buddy-client",
+            redirectURI: redirectURI,
+            state: "random-state",
+            codeChallenge: "challenge"
+        )
 
-        let authorization = try await api.requestDeviceAuthorization(clientID: "client-id")
+        let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        let query = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).map { ($0.name, $0.value) })
+        XCTAssertEqual(components.scheme, "https")
+        XCTAssertEqual(components.host, "github.com")
+        XCTAssertEqual(components.path, "/login/oauth/authorize")
+        XCTAssertEqual(query["response_type"]!, "code")
+        XCTAssertEqual(query["client_id"]!, "buddy-client")
+        XCTAssertEqual(query["redirect_uri"]!, redirectURI)
+        XCTAssertEqual(query["state"]!, "random-state")
+        XCTAssertEqual(query["code_challenge"]!, "challenge")
+        XCTAssertEqual(query["code_challenge_method"]!, "S256")
+        XCTAssertEqual(query["prompt"]!, "select_account")
+        XCTAssertFalse(query.keys.contains("scope"))
+    }
 
-        XCTAssertEqual(authorization.userCode, "ABCD-EFGH")
-        XCTAssertEqual(authorization.interval, 5)
+    func testPKCEUsesIndependentSecureMaterialAndReportsRandomnessFailure() async throws {
+        let pair = try GitHubWebOAuthService.makePKCEPair { count in
+            Data(repeating: 7, count: count)
+        }
+        XCTAssertGreaterThanOrEqual(pair.verifier.count, 43)
+        XCTAssertNotEqual(pair.verifier, pair.challenge)
 
-        let capturedRequest = await httpClient.lastRequest()
-        let request = try XCTUnwrap(capturedRequest)
-        XCTAssertEqual(request.url?.absoluteString, "https://github.com/login/device/code")
+        let service = GitHubWebOAuthService(randomBytes: { _ in throw TestOAuthError.unavailable })
+        do {
+            _ = try await service.beginAuthorization(
+                configuration: GitHubOAuthConfiguration(clientID: "client", clientSecret: "public-secret")
+            )
+            XCTFail("Expected secure randomness failure")
+        } catch let error as GitHubOAuthError {
+            XCTAssertEqual(error, .secureRandomUnavailable)
+        }
+    }
+
+    func testTokenExchangeBodyReusesRedirectAndVerifier() throws {
+        let request = GitHubWebOAuthService.tokenRequest(
+            configuration: GitHubOAuthConfiguration(clientID: "client id", clientSecret: "public/secret"),
+            code: "code+value",
+            redirectURI: "http://127.0.0.1:49152/callback",
+            codeVerifier: "verifier_value"
+        )
+        XCTAssertEqual(request.url, GitHubWebOAuthService.tokenEndpoint)
         XCTAssertEqual(request.httpMethod, "POST")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "application/json")
-
         let body = try XCTUnwrap(request.httpBody.flatMap { String(data: $0, encoding: .utf8) })
-        XCTAssertEqual(body, "client_id=client-id")
-        XCTAssertFalse(body.contains("secret"))
-        XCTAssertFalse(body.contains("scope"))
+        XCTAssertTrue(body.contains("client_id=client%20id"))
+        XCTAssertTrue(body.contains("client_secret=public%2Fsecret"))
+        XCTAssertTrue(body.contains("code=code%2Bvalue"))
+        XCTAssertTrue(body.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A49152%2Fcallback"))
+        XCTAssertTrue(body.contains("code_verifier=verifier_value"))
     }
 
-    func testPollHandlesPendingSlowDownAndAuthorization() async throws {
+    func testCallbackParserHandlesFragmentedMalformedOversizedStateAndCode() throws {
+        let parser = GitHubOAuthCallbackRequestParser(
+            expectedState: "expected",
+            callbackPath: "/callback",
+            port: 49152,
+            maximumRequestLength: 128
+        )
+        let firstFragment = Data("GET /callback?code=abc&state=expected HTTP/1.1\r\nHost:".utf8)
+        XCTAssertEqual(parser.parse(firstFragment), .incomplete)
+        var complete = firstFragment
+        complete.append(Data(" 127.0.0.1\r\n\r\n".utf8))
+        guard case let .success(url) = parser.parse(complete) else {
+            return XCTFail("Expected a valid fragmented request")
+        }
+        XCTAssertEqual(URLComponents(url: url, resolvingAgainstBaseURL: false)?.path, "/callback")
+
+        XCTAssertEqual(parser.parse(Data("POST /callback HTTP/1.1\r\n\r\n".utf8)), .failure(.malformedCallback))
+        XCTAssertEqual(
+            parser.parse(Data("GET /wrong?code=abc&state=expected HTTP/1.1\r\n\r\n".utf8)),
+            .failure(.malformedCallback)
+        )
+        XCTAssertEqual(
+            parser.parse(Data("GET /callback?code=abc&state=wrong HTTP/1.1\r\n\r\n".utf8)),
+            .failure(.stateMismatch)
+        )
+        XCTAssertEqual(
+            parser.parse(Data("GET /callback?state=expected HTTP/1.1\r\n\r\n".utf8)),
+            .failure(.missingAuthorizationCode)
+        )
+        XCTAssertEqual(
+            parser.parse(Data("GET /callback?error=access_denied&state=expected HTTP/1.1\r\n\r\n".utf8)),
+            .failure(.accessDenied)
+        )
+        XCTAssertEqual(
+            parser.parse(Data("GET /callback?error=server_error&state=expected HTTP/1.1\r\n\r\n".utf8)),
+            .failure(.authorizationFailed)
+        )
+        XCTAssertEqual(parser.parse(Data(repeating: 65, count: 129)), .failure(.callbackTooLarge))
+    }
+
+    func testBrowserAuthorizationCompletesLoopbackCallbackAndExchangesCode() async throws {
         let httpClient = MockHTTPClient(responses: [
-            .success(#"{"error":"authorization_pending"}"#, statusCode: 200),
-            .success(#"{"error":"slow_down","interval":12}"#, statusCode: 200),
-            .success(#"{"access_token":"token-value","token_type":"bearer"}"#, statusCode: 200),
+            .success(#"{"access_token":"browser-token"}"#, statusCode: 200),
         ])
-        let api = GitHubAPI(httpClient: httpClient)
+        let service = GitHubWebOAuthService(
+            httpClient: httpClient,
+            callbackTimeout: .seconds(15),
+            randomBytes: { count in Data(repeating: UInt8(count), count: count) }
+        )
+        let authorization = try await service.beginAuthorization(
+            configuration: GitHubOAuthConfiguration(
+                clientID: "buddy-client",
+                clientSecret: "public-secret"
+            )
+        )
+        let authorizationComponents = try XCTUnwrap(
+            URLComponents(url: authorization.authorizationURL, resolvingAgainstBaseURL: false)
+        )
+        let authorizationQuery = Dictionary(
+            uniqueKeysWithValues: (authorizationComponents.queryItems ?? []).compactMap { item in
+                item.value.map { (item.name, $0) }
+            }
+        )
+        let redirectURI = try XCTUnwrap(authorizationQuery["redirect_uri"])
+        let state = try XCTUnwrap(authorizationQuery["state"])
+        var callbackComponents = try XCTUnwrap(URLComponents(string: redirectURI))
+        callbackComponents.queryItems = [
+            URLQueryItem(name: "code", value: "one-time-code"),
+            URLQueryItem(name: "state", value: state),
+        ]
+        let callbackURL = try XCTUnwrap(callbackComponents.url)
 
-        let pending = try await api.pollForAccessToken(clientID: "client-id", deviceCode: "device-code")
-        let slowDown = try await api.pollForAccessToken(clientID: "client-id", deviceCode: "device-code")
-        let authorized = try await api.pollForAccessToken(clientID: "client-id", deviceCode: "device-code")
+        let completion = Task { try await service.completeAuthorization(authorization) }
+        var unrelatedComponents = callbackComponents
+        unrelatedComponents.path = "/unrelated"
+        let unrelatedURL = try XCTUnwrap(unrelatedComponents.url)
+        let (_, unrelatedResponse) = try await URLSession.shared.data(from: unrelatedURL)
+        XCTAssertEqual((unrelatedResponse as? HTTPURLResponse)?.statusCode, 400)
+        let (_, callbackResponse) = try await URLSession.shared.data(from: callbackURL)
+        XCTAssertEqual((callbackResponse as? HTTPURLResponse)?.statusCode, 200)
+        let token = try await completion.value
 
-        XCTAssertEqual(pending, .pending)
-        XCTAssertEqual(slowDown, .slowDown(interval: 12))
-        XCTAssertEqual(authorized, .authorized(token: "token-value"))
+        XCTAssertEqual(token, "browser-token")
+        let capturedTokenRequest = await httpClient.lastRequest()
+        let tokenRequest = try XCTUnwrap(capturedTokenRequest)
+        let body = try XCTUnwrap(tokenRequest.httpBody.flatMap { String(data: $0, encoding: .utf8) })
+        var bodyComponents = URLComponents()
+        bodyComponents.query = body
+        let tokenQuery = Dictionary(
+            uniqueKeysWithValues: (bodyComponents.queryItems ?? []).compactMap { item in
+                item.value?.removingPercentEncoding.map { (item.name, $0) }
+            }
+        )
+        XCTAssertEqual(tokenQuery["code"], "one-time-code")
+        XCTAssertEqual(tokenQuery["redirect_uri"], redirectURI)
+        XCTAssertEqual(tokenQuery["client_id"], "buddy-client")
+        XCTAssertEqual(tokenQuery["client_secret"], "public-secret")
+        XCTAssertFalse(try XCTUnwrap(tokenQuery["code_verifier"]).isEmpty)
     }
 
-    func testPollReportsDeniedExpiredAndMalformedResponses() async throws {
-        let cases: [(String, GitHubAPIError)] = [
-            (#"{"error":"access_denied"}"#, .accessDenied),
-            (#"{"error":"expired_token"}"#, .expiredRequest),
-            (#"{"unexpected":true}"#, .malformedResponse),
-        ]
+    func testBrowserAuthorizationTimesOut() async throws {
+        let configuration = GitHubOAuthConfiguration(clientID: "client", clientSecret: "public-secret")
+        let timeoutService = GitHubWebOAuthService(
+            callbackTimeout: .milliseconds(10),
+            randomBytes: { count in Data(repeating: UInt8(count), count: count) }
+        )
+        let timedAuthorization = try await timeoutService.beginAuthorization(configuration: configuration)
+        do {
+            _ = try await timeoutService.completeAuthorization(timedAuthorization)
+            XCTFail("Expected callback timeout")
+        } catch let error as GitHubOAuthError {
+            XCTAssertEqual(error, .callbackTimedOut)
+        }
+    }
 
-        for (body, expectedError) in cases {
-            let httpClient = MockHTTPClient(responses: [.success(body, statusCode: 200)])
-            let api = GitHubAPI(httpClient: httpClient)
+    func testBrowserAuthorizationCancellationStopsPendingCallback() async throws {
+        let configuration = GitHubOAuthConfiguration(clientID: "client", clientSecret: "public-secret")
+        let cancellationService = GitHubWebOAuthService(
+            callbackTimeout: .seconds(2),
+            randomBytes: { count in Data(repeating: UInt8(count), count: count) }
+        )
+        let canceledAuthorization = try await cancellationService.beginAuthorization(configuration: configuration)
+        let completion = Task { try await cancellationService.completeAuthorization(canceledAuthorization) }
+        await Task.yield()
+        completion.cancel()
+        do {
+            _ = try await completion.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {
+            // Expected.
+        }
+    }
 
+    func testBrowserAuthorizationReportsTerminalOAuthErrorCallbacks() async throws {
+        for (callbackError, expectedError) in [
+            ("access_denied", GitHubOAuthError.accessDenied),
+            ("server_error", GitHubOAuthError.authorizationFailed),
+        ] {
+            let service = GitHubWebOAuthService(
+                callbackTimeout: .seconds(15),
+                randomBytes: { count in Data(repeating: UInt8(count), count: count) }
+            )
+            let authorization = try await service.beginAuthorization(
+                configuration: GitHubOAuthConfiguration(clientID: "client", clientSecret: "public-secret")
+            )
+            let authorizationComponents = try XCTUnwrap(
+                URLComponents(url: authorization.authorizationURL, resolvingAgainstBaseURL: false)
+            )
+            let query = Dictionary(
+                uniqueKeysWithValues: (authorizationComponents.queryItems ?? []).compactMap { item in
+                    item.value.map { (item.name, $0) }
+                }
+            )
+            var callbackComponents = try XCTUnwrap(
+                URLComponents(string: try XCTUnwrap(query["redirect_uri"]))
+            )
+            callbackComponents.queryItems = [
+                URLQueryItem(name: "error", value: callbackError),
+                URLQueryItem(name: "state", value: try XCTUnwrap(query["state"])),
+            ]
+
+            let completion = Task { try await service.completeAuthorization(authorization) }
+            let (_, callbackResponse) = try await URLSession.shared.data(
+                from: try XCTUnwrap(callbackComponents.url)
+            )
+            XCTAssertEqual((callbackResponse as? HTTPURLResponse)?.statusCode, 400)
             do {
-                _ = try await api.pollForAccessToken(clientID: "client-id", deviceCode: "device-code")
-                XCTFail("Expected \(expectedError)")
-            } catch let error as GitHubAPIError {
+                _ = try await completion.value
+                XCTFail("Expected terminal OAuth callback error")
+            } catch let error as GitHubOAuthError {
                 XCTAssertEqual(error, expectedError)
             }
         }
     }
 
-    func testDeviceFlowDisabledResponseIsReportedClearly() async throws {
-        let httpClient = MockHTTPClient(responses: [
-            .success(#"{"error":"device_flow_disabled"}"#, statusCode: 200),
-        ])
+    func testBrowserAuthorizationReportsMissingCodeAsTerminalCallbackError() async throws {
+        let service = GitHubWebOAuthService(
+            callbackTimeout: .seconds(15),
+            randomBytes: { count in Data(repeating: UInt8(count), count: count) }
+        )
+        let authorization = try await service.beginAuthorization(
+            configuration: GitHubOAuthConfiguration(clientID: "client", clientSecret: "public-secret")
+        )
+        let authorizationComponents = try XCTUnwrap(
+            URLComponents(url: authorization.authorizationURL, resolvingAgainstBaseURL: false)
+        )
+        let query = Dictionary(
+            uniqueKeysWithValues: (authorizationComponents.queryItems ?? []).compactMap { item in
+                item.value.map { (item.name, $0) }
+            }
+        )
+        var callbackComponents = try XCTUnwrap(
+            URLComponents(string: try XCTUnwrap(query["redirect_uri"]))
+        )
+        callbackComponents.queryItems = [
+            URLQueryItem(name: "state", value: try XCTUnwrap(query["state"])),
+        ]
 
+        let completion = Task { try await service.completeAuthorization(authorization) }
+        let (_, callbackResponse) = try await URLSession.shared.data(
+            from: try XCTUnwrap(callbackComponents.url)
+        )
+        XCTAssertEqual((callbackResponse as? HTTPURLResponse)?.statusCode, 400)
         do {
-            _ = try await GitHubAPI(httpClient: httpClient).requestDeviceAuthorization(clientID: "client-id")
-            XCTFail("Expected disabled device flow")
-        } catch let error as GitHubAPIError {
-            XCTAssertEqual(error, .deviceFlowDisabled)
+            _ = try await completion.value
+            XCTFail("Expected a missing authorization code failure")
+        } catch let error as GitHubOAuthError {
+            XCTAssertEqual(error, .missingAuthorizationCode)
+        }
+    }
+
+    func testTokenExchangeTreatsBadVerificationCodeAsRetryableAuthorizationFailure() async throws {
+        let httpClient = MockHTTPClient(responses: [
+            .success(#"{"error":"bad_verification_code"}"#, statusCode: 200),
+        ])
+        let service = GitHubWebOAuthService(
+            httpClient: httpClient,
+            callbackTimeout: .seconds(15),
+            randomBytes: { count in Data(repeating: UInt8(count), count: count) }
+        )
+        let authorization = try await service.beginAuthorization(
+            configuration: GitHubOAuthConfiguration(clientID: "client", clientSecret: "public-secret")
+        )
+        let authorizationComponents = try XCTUnwrap(
+            URLComponents(url: authorization.authorizationURL, resolvingAgainstBaseURL: false)
+        )
+        let query = Dictionary(
+            uniqueKeysWithValues: (authorizationComponents.queryItems ?? []).compactMap { item in
+                item.value.map { (item.name, $0) }
+            }
+        )
+        var callbackComponents = try XCTUnwrap(
+            URLComponents(string: try XCTUnwrap(query["redirect_uri"]))
+        )
+        callbackComponents.queryItems = [
+            URLQueryItem(name: "code", value: "expired-code"),
+            URLQueryItem(name: "state", value: try XCTUnwrap(query["state"])),
+        ]
+
+        let completion = Task { try await service.completeAuthorization(authorization) }
+        let (_, callbackResponse) = try await URLSession.shared.data(
+            from: try XCTUnwrap(callbackComponents.url)
+        )
+        XCTAssertEqual((callbackResponse as? HTTPURLResponse)?.statusCode, 200)
+        do {
+            _ = try await completion.value
+            XCTFail("Expected a rejected authorization code")
+        } catch let error as GitHubOAuthError {
+            XCTAssertEqual(error, .authorizationFailed)
         }
     }
 
@@ -245,6 +481,10 @@ final class GitHubAPITests: XCTestCase {
             XCTAssertEqual(error.code, .notConnectedToInternet)
         }
     }
+}
+
+private enum TestOAuthError: Error {
+    case unavailable
 }
 
 private enum ErrorExpectation: Equatable {

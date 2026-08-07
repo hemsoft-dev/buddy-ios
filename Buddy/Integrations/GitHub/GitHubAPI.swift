@@ -1,11 +1,22 @@
+import CryptoKit
 import Foundation
+import Network
+import Security
 
-struct GitHubDeviceAuthorization: Equatable, Sendable {
-    let deviceCode: String
-    let userCode: String
-    let verificationURI: URL
-    let expiresIn: Int
-    let interval: Int
+struct GitHubBrowserAuthorization: Equatable, Identifiable, Sendable {
+    let id: UUID
+    let authorizationURL: URL
+}
+
+struct GitHubOAuthConfiguration: Equatable, Sendable {
+    let clientID: String
+    let clientSecret: String
+}
+
+protocol GitHubOAuthAuthorizing: Sendable {
+    func beginAuthorization(configuration: GitHubOAuthConfiguration) async throws -> GitHubBrowserAuthorization
+    func completeAuthorization(_ authorization: GitHubBrowserAuthorization) async throws -> String
+    func cancelAuthorization(_ authorization: GitHubBrowserAuthorization) async
 }
 
 struct GitHubAccount: Hashable, Sendable {
@@ -57,15 +68,7 @@ struct GitHubPullRequestCollection: Equatable, Sendable {
     let totalCount: Int
 }
 
-enum GitHubTokenPollResult: Equatable, Sendable {
-    case pending
-    case slowDown(interval: Int?)
-    case authorized(token: String)
-}
-
 protocol GitHubAPIProviding: Sendable {
-    func requestDeviceAuthorization(clientID: String) async throws -> GitHubDeviceAuthorization
-    func pollForAccessToken(clientID: String, deviceCode: String) async throws -> GitHubTokenPollResult
     func authenticatedUser(token: String) async throws -> GitHubAccount
     func authoredPullRequests(login: String, token: String) async throws -> GitHubPullRequestCollection
     func assignedPullRequests(login: String, token: String) async throws -> GitHubPullRequestCollection
@@ -86,85 +89,6 @@ struct GitHubAPI: GitHubAPIProviding {
 
     init(httpClient: any HTTPClient = URLSessionHTTPClient()) {
         self.httpClient = httpClient
-    }
-
-    func requestDeviceAuthorization(clientID: String) async throws -> GitHubDeviceAuthorization {
-        let request = try formRequest(
-            url: "https://github.com/login/device/code",
-            fields: ["client_id": clientID]
-        )
-        let data = try await perform(request)
-
-        if let errorResponse = try? JSONDecoder().decode(TokenResponse.self, from: data),
-           let error = errorResponse.error {
-            throw mapOAuthError(error)
-        }
-
-        let response: DeviceAuthorizationResponse
-        do {
-            response = try JSONDecoder().decode(DeviceAuthorizationResponse.self, from: data)
-        } catch {
-            throw GitHubAPIError.malformedResponse
-        }
-
-        guard !response.deviceCode.isEmpty,
-              !response.userCode.isEmpty,
-              response.expiresIn > 0,
-              response.interval > 0,
-              let verificationURI = URL(string: response.verificationURI),
-              verificationURI.scheme == "https",
-              verificationURI.host == "github.com"
-        else {
-            throw GitHubAPIError.malformedResponse
-        }
-
-        return GitHubDeviceAuthorization(
-            deviceCode: response.deviceCode,
-            userCode: response.userCode,
-            verificationURI: verificationURI,
-            expiresIn: response.expiresIn,
-            interval: response.interval
-        )
-    }
-
-    func pollForAccessToken(clientID: String, deviceCode: String) async throws -> GitHubTokenPollResult {
-        let request = try formRequest(
-            url: "https://github.com/login/oauth/access_token",
-            fields: [
-                "client_id": clientID,
-                "device_code": deviceCode,
-                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-            ]
-        )
-        let data = try await perform(request)
-
-        let response: TokenResponse
-        do {
-            response = try JSONDecoder().decode(TokenResponse.self, from: data)
-        } catch {
-            throw GitHubAPIError.malformedResponse
-        }
-
-        if let token = response.accessToken, !token.isEmpty {
-            return .authorized(token: token)
-        }
-
-        switch response.error {
-        case "authorization_pending":
-            return .pending
-        case "slow_down":
-            return .slowDown(interval: response.interval)
-        case "expired_token", "token_expired":
-            throw GitHubAPIError.expiredRequest
-        case "access_denied":
-            throw GitHubAPIError.accessDenied
-        case "device_flow_disabled":
-            throw GitHubAPIError.deviceFlowDisabled
-        case "incorrect_client_credentials", "incorrect_device_code":
-            throw GitHubAPIError.incorrectClientCredentials
-        default:
-            throw GitHubAPIError.malformedResponse
-        }
     }
 
     func authenticatedUser(token: String) async throws -> GitHubAccount {
@@ -293,28 +217,6 @@ struct GitHubAPI: GitHubAPIProviding {
         )
     }
 
-    private func formRequest(url urlString: String, fields: [String: String]) throws -> URLRequest {
-        guard let url = URL(string: urlString) else {
-            throw GitHubAPIError.malformedResponse
-        }
-
-        var components = URLComponents()
-        components.queryItems = fields
-            .sorted { $0.key < $1.key }
-            .map { URLQueryItem(name: $0.key, value: $0.value) }
-
-        guard let body = components.percentEncodedQuery?.data(using: .utf8) else {
-            throw GitHubAPIError.malformedResponse
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.httpBody = body
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        return request
-    }
-
     private func perform(_ request: URLRequest) async throws -> Data {
         do {
             let (data, _) = try await httpClient.data(for: request)
@@ -371,15 +273,6 @@ struct GitHubAPI: GitHubAPIProviding {
         return url
     }
 
-    private func mapOAuthError(_ error: String) -> GitHubAPIError {
-        switch error {
-        case "expired_token", "token_expired": .expiredRequest
-        case "access_denied": .accessDenied
-        case "device_flow_disabled": .deviceFlowDisabled
-        case "incorrect_client_credentials", "incorrect_device_code": .incorrectClientCredentials
-        default: .malformedResponse
-        }
-    }
 }
 
 enum GitHubAPIError: Error, Equatable, Sendable {
@@ -387,39 +280,10 @@ enum GitHubAPIError: Error, Equatable, Sendable {
     case expiredRequest
     case unauthorized
     case malformedResponse
-    case deviceFlowDisabled
     case incorrectClientCredentials
     case rateLimited
     case incompleteResults
     case server(Int)
-}
-
-private struct DeviceAuthorizationResponse: Decodable {
-    let deviceCode: String
-    let userCode: String
-    let verificationURI: String
-    let expiresIn: Int
-    let interval: Int
-
-    enum CodingKeys: String, CodingKey {
-        case deviceCode = "device_code"
-        case userCode = "user_code"
-        case verificationURI = "verification_uri"
-        case expiresIn = "expires_in"
-        case interval
-    }
-}
-
-private struct TokenResponse: Decodable {
-    let accessToken: String?
-    let error: String?
-    let interval: Int?
-
-    enum CodingKeys: String, CodingKey {
-        case accessToken = "access_token"
-        case error
-        case interval
-    }
 }
 
 private struct UserResponse: Decodable {
@@ -465,5 +329,538 @@ private struct PullRequestSearchItem: Decodable {
         case updatedAt = "updated_at"
         case htmlURL = "html_url"
         case repositoryURL = "repository_url"
+    }
+}
+
+enum GitHubOAuthError: Error, Equatable, LocalizedError, Sendable {
+    case couldNotStartCallbackServer
+    case missingConfiguration
+    case secureRandomUnavailable
+    case missingAuthorizationCode
+    case stateMismatch
+    case callbackTimedOut
+    case malformedCallback
+    case callbackTooLarge
+    case accessDenied
+    case authorizationFailed
+    case invalidConfiguration
+    case tokenExchangeFailed(Int)
+    case invalidTokenResponse
+
+    var errorDescription: String? {
+        switch self {
+        case .couldNotStartCallbackServer:
+            "Buddy couldn't start the local GitHub sign-in callback."
+        case .missingConfiguration:
+            "GitHub browser sign-in is not configured in this build."
+        case .secureRandomUnavailable:
+            "Buddy couldn't create a secure GitHub sign-in request. Try again."
+        case .missingAuthorizationCode:
+            "GitHub sign-in did not return an authorization code."
+        case .stateMismatch:
+            "GitHub sign-in returned an unexpected security state. Start again."
+        case .callbackTimedOut:
+            "GitHub sign-in timed out. Start again and finish in the browser."
+        case .malformedCallback:
+            "GitHub returned an invalid sign-in callback."
+        case .callbackTooLarge:
+            "GitHub returned an oversized sign-in callback."
+        case .accessDenied:
+            "Authorization was denied. You can try again when you're ready."
+        case .authorizationFailed:
+            "GitHub couldn't complete sign-in. Try again."
+        case .invalidConfiguration:
+            "GitHub rejected Buddy's OAuth configuration."
+        case let .tokenExchangeFailed(statusCode):
+            "GitHub token exchange failed (HTTP \(statusCode))."
+        case .invalidTokenResponse:
+            "GitHub token exchange returned an invalid response."
+        }
+    }
+}
+
+typealias GitHubOAuthRandomByteGenerator = @Sendable (Int) throws -> Data
+
+actor GitHubWebOAuthService: GitHubOAuthAuthorizing {
+    struct PKCEPair: Equatable, Sendable {
+        let verifier: String
+        let challenge: String
+    }
+
+    static let authorizationEndpoint = URL(string: "https://github.com/login/oauth/authorize")!
+    static let tokenEndpoint = URL(string: "https://github.com/login/oauth/access_token")!
+    static let callbackPath = "/callback"
+
+    private struct Session: Sendable {
+        let configuration: GitHubOAuthConfiguration
+        let codeVerifier: String
+        let redirectURI: String
+        let callbackServer: GitHubOAuthCallbackServer
+    }
+
+    private struct TokenResponse: Decodable {
+        let accessToken: String?
+        let error: String?
+
+        enum CodingKeys: String, CodingKey {
+            case accessToken = "access_token"
+            case error
+        }
+    }
+
+    private let httpClient: any HTTPClient
+    private let callbackTimeout: Duration
+    private let preferredCallbackPorts: [UInt16]
+    private let randomBytes: GitHubOAuthRandomByteGenerator
+    private var sessions: [UUID: Session] = [:]
+
+    init(
+        httpClient: any HTTPClient = URLSessionHTTPClient(),
+        callbackTimeout: Duration = .seconds(180),
+        preferredCallbackPorts: [UInt16] = [0],
+        randomBytes: GitHubOAuthRandomByteGenerator? = nil
+    ) {
+        self.httpClient = httpClient
+        self.callbackTimeout = callbackTimeout
+        self.preferredCallbackPorts = preferredCallbackPorts
+        self.randomBytes = randomBytes ?? Self.systemRandomBytes
+    }
+
+    func beginAuthorization(
+        configuration: GitHubOAuthConfiguration
+    ) async throws -> GitHubBrowserAuthorization {
+        let clientID = configuration.clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let clientSecret = configuration.clientSecret.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clientID.isEmpty, !clientSecret.isEmpty else {
+            throw GitHubOAuthError.missingConfiguration
+        }
+
+        let state: String
+        let pkce: PKCEPair
+        do {
+            state = try Self.base64URL(byteCount: 32, using: randomBytes)
+            pkce = try Self.makePKCEPair(randomBytes: randomBytes)
+        } catch {
+            throw GitHubOAuthError.secureRandomUnavailable
+        }
+
+        let callbackServer = try await GitHubOAuthCallbackServer.start(
+            preferredPorts: preferredCallbackPorts,
+            expectedState: state,
+            callbackPath: Self.callbackPath
+        )
+        let redirectURI = "http://127.0.0.1:\(callbackServer.port)\(Self.callbackPath)"
+        let normalizedConfiguration = GitHubOAuthConfiguration(
+            clientID: clientID,
+            clientSecret: clientSecret
+        )
+        let id = UUID()
+        let authorization = GitHubBrowserAuthorization(
+            id: id,
+            authorizationURL: Self.authorizationURL(
+                clientID: clientID,
+                redirectURI: redirectURI,
+                state: state,
+                codeChallenge: pkce.challenge
+            )
+        )
+        sessions[id] = Session(
+            configuration: normalizedConfiguration,
+            codeVerifier: pkce.verifier,
+            redirectURI: redirectURI,
+            callbackServer: callbackServer
+        )
+        return authorization
+    }
+
+    func completeAuthorization(_ authorization: GitHubBrowserAuthorization) async throws -> String {
+        guard let session = sessions[authorization.id] else {
+            throw CancellationError()
+        }
+        defer {
+            sessions.removeValue(forKey: authorization.id)?.callbackServer.cancel()
+        }
+
+        let callbackURL = try await session.callbackServer.waitForCallback(timeout: callbackTimeout)
+        guard sessions[authorization.id] != nil else { throw CancellationError() }
+        guard let components = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false),
+              let code = components.queryItems?.first(where: { $0.name == "code" })?.value,
+              !code.isEmpty
+        else {
+            throw GitHubOAuthError.missingAuthorizationCode
+        }
+
+        let request = Self.tokenRequest(
+            configuration: session.configuration,
+            code: code,
+            redirectURI: session.redirectURI,
+            codeVerifier: session.codeVerifier
+        )
+        let data: Data
+        do {
+            (data, _) = try await httpClient.data(for: request)
+        } catch HTTPClientError.unacceptableStatus(let statusCode) {
+            throw GitHubOAuthError.tokenExchangeFailed(statusCode)
+        } catch HTTPClientError.rateLimited {
+            throw GitHubOAuthError.tokenExchangeFailed(429)
+        } catch HTTPClientError.invalidResponse {
+            throw GitHubOAuthError.invalidTokenResponse
+        }
+        guard sessions[authorization.id] != nil else { throw CancellationError() }
+
+        guard let response = try? JSONDecoder().decode(TokenResponse.self, from: data) else {
+            throw GitHubOAuthError.invalidTokenResponse
+        }
+        if let error = response.error {
+            switch error {
+            case "access_denied": throw GitHubOAuthError.accessDenied
+            case "incorrect_client_credentials": throw GitHubOAuthError.invalidConfiguration
+            case "bad_verification_code": throw GitHubOAuthError.authorizationFailed
+            default: throw GitHubOAuthError.invalidTokenResponse
+            }
+        }
+        guard let token = response.accessToken, !token.isEmpty else {
+            throw GitHubOAuthError.invalidTokenResponse
+        }
+        return token
+    }
+
+    func cancelAuthorization(_ authorization: GitHubBrowserAuthorization) {
+        sessions.removeValue(forKey: authorization.id)?.callbackServer.cancel()
+    }
+
+    static func authorizationURL(
+        clientID: String,
+        redirectURI: String,
+        state: String,
+        codeChallenge: String
+    ) -> URL {
+        var components = URLComponents(url: authorizationEndpoint, resolvingAgainstBaseURL: false)!
+        components.queryItems = [
+            URLQueryItem(name: "response_type", value: "code"),
+            URLQueryItem(name: "client_id", value: clientID),
+            URLQueryItem(name: "redirect_uri", value: redirectURI),
+            URLQueryItem(name: "state", value: state),
+            URLQueryItem(name: "code_challenge", value: codeChallenge),
+            URLQueryItem(name: "code_challenge_method", value: "S256"),
+            URLQueryItem(name: "prompt", value: "select_account"),
+        ]
+        return components.url!
+    }
+
+    static func tokenRequest(
+        configuration: GitHubOAuthConfiguration,
+        code: String,
+        redirectURI: String,
+        codeVerifier: String
+    ) -> URLRequest {
+        var request = URLRequest(url: tokenEndpoint)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.httpBody = formEncode([
+            ("client_id", configuration.clientID),
+            ("client_secret", configuration.clientSecret),
+            ("code", code),
+            ("redirect_uri", redirectURI),
+            ("code_verifier", codeVerifier),
+        ])
+        return request
+    }
+
+    static func makePKCEPair(randomBytes: GitHubOAuthRandomByteGenerator) throws -> PKCEPair {
+        let verifier = try base64URL(byteCount: 64, using: randomBytes)
+        let digest = SHA256.hash(data: Data(verifier.utf8))
+        return PKCEPair(verifier: verifier, challenge: base64URL(Data(digest)))
+    }
+
+    private static func systemRandomBytes(byteCount: Int) throws -> Data {
+        var bytes = [UInt8](repeating: 0, count: byteCount)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
+            throw GitHubOAuthError.secureRandomUnavailable
+        }
+        return Data(bytes)
+    }
+
+    private static func base64URL(
+        byteCount: Int,
+        using generator: GitHubOAuthRandomByteGenerator
+    ) throws -> String {
+        let data = try generator(byteCount)
+        guard data.count == byteCount else { throw GitHubOAuthError.secureRandomUnavailable }
+        return base64URL(data)
+    }
+
+    private static func base64URL(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    private static func formEncode(_ pairs: [(String, String)]) -> Data {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        let body = pairs.map { key, value in
+            let encodedKey = key.addingPercentEncoding(withAllowedCharacters: allowed) ?? key
+            let encodedValue = value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+            return "\(encodedKey)=\(encodedValue)"
+        }.joined(separator: "&")
+        return Data(body.utf8)
+    }
+}
+
+enum GitHubOAuthCallbackParseResult: Equatable, Sendable {
+    case incomplete
+    case success(URL)
+    case failure(GitHubOAuthError)
+}
+
+struct GitHubOAuthCallbackRequestParser: Sendable {
+    let expectedState: String
+    let callbackPath: String
+    let port: UInt16
+    let maximumRequestLength: Int
+
+    func parse(_ data: Data) -> GitHubOAuthCallbackParseResult {
+        guard data.count <= maximumRequestLength else { return .failure(.callbackTooLarge) }
+        guard let headerRange = data.range(of: Data("\r\n\r\n".utf8)) else {
+            return data.count == maximumRequestLength ? .failure(.callbackTooLarge) : .incomplete
+        }
+        guard let request = String(data: data[..<headerRange.upperBound], encoding: .utf8),
+              let requestLine = request.components(separatedBy: "\r\n").first
+        else {
+            return .failure(.malformedCallback)
+        }
+        let pieces = requestLine.split(separator: " ", omittingEmptySubsequences: true)
+        guard pieces.count == 3, pieces[0] == "GET", pieces[2].hasPrefix("HTTP/1.") else {
+            return .failure(.malformedCallback)
+        }
+        let target = String(pieces[1])
+        guard let url = URL(string: "http://127.0.0.1:\(port)\(target)"),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.path == callbackPath
+        else {
+            return .failure(.malformedCallback)
+        }
+        guard components.queryItems?.first(where: { $0.name == "state" })?.value == expectedState else {
+            return .failure(.stateMismatch)
+        }
+        if let error = components.queryItems?.first(where: { $0.name == "error" })?.value {
+            return error == "access_denied"
+                ? .failure(.accessDenied)
+                : .failure(.authorizationFailed)
+        }
+        guard components.queryItems?.first(where: { $0.name == "code" })?.value?.isEmpty == false else {
+            return .failure(.missingAuthorizationCode)
+        }
+        return .success(url)
+    }
+}
+
+final class GitHubOAuthCallbackServer: @unchecked Sendable {
+    var port: UInt16 { lock.withLock { storedPort } }
+
+    private let expectedState: String
+    private let callbackPath: String
+    private let maximumRequestLength: Int
+    private let listener: NWListener
+    private let queue = DispatchQueue(label: "com.hemsoft.Buddy.githubOAuthCallback")
+    private let lock = NSLock()
+    private var storedPort: UInt16
+    private var readyContinuation: CheckedContinuation<Void, Error>?
+    private var callbackContinuation: CheckedContinuation<URL, Error>?
+    private var pendingCallbackResult: Result<URL, Error>?
+    private var callbackFinished = false
+
+    private init(
+        port: UInt16,
+        expectedState: String,
+        callbackPath: String,
+        maximumRequestLength: Int
+    ) throws {
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            throw GitHubOAuthError.couldNotStartCallbackServer
+        }
+        self.storedPort = port
+        self.expectedState = expectedState
+        self.callbackPath = callbackPath
+        self.maximumRequestLength = maximumRequestLength
+        let parameters = NWParameters.tcp
+        parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: nwPort)
+        listener = try NWListener(using: parameters)
+        listener.newConnectionHandler = { [weak self] connection in self?.handle(connection) }
+        listener.stateUpdateHandler = { [weak self] state in self?.handle(state) }
+    }
+
+    static func start(
+        preferredPorts: [UInt16],
+        expectedState: String,
+        callbackPath: String,
+        maximumRequestLength: Int = 8192
+    ) async throws -> GitHubOAuthCallbackServer {
+        var lastError: Error = GitHubOAuthError.couldNotStartCallbackServer
+        for port in preferredPorts {
+            do {
+                let server = try GitHubOAuthCallbackServer(
+                    port: port,
+                    expectedState: expectedState,
+                    callbackPath: callbackPath,
+                    maximumRequestLength: maximumRequestLength
+                )
+                try await server.startListening()
+                return server
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError
+    }
+
+    func waitForCallback(timeout: Duration) async throws -> URL {
+        let timeoutTask = Task { [weak self] in
+            try await Task.sleep(for: timeout)
+            self?.finishCallback(.failure(GitHubOAuthError.callbackTimedOut))
+        }
+        defer { timeoutTask.cancel() }
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                if let pendingCallbackResult {
+                    self.pendingCallbackResult = nil
+                    lock.unlock()
+                    continuation.resume(with: pendingCallbackResult)
+                } else {
+                    callbackContinuation = continuation
+                    lock.unlock()
+                }
+            }
+        } onCancel: {
+            self.finishCallback(.failure(CancellationError()))
+        }
+    }
+
+    func cancel() {
+        listener.cancel()
+        finishCallback(.failure(CancellationError()))
+    }
+
+    private func startListening() async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            readyContinuation = continuation
+            lock.unlock()
+            listener.start(queue: queue)
+        }
+    }
+
+    private func handle(_ state: NWListener.State) {
+        switch state {
+        case .ready:
+            if let boundPort = listener.port?.rawValue {
+                lock.withLock { storedPort = boundPort }
+            }
+            finishReady(.success(()))
+        case .failed(let error):
+            finishReady(.failure(error))
+            finishCallback(.failure(error))
+        case .cancelled:
+            finishReady(.failure(GitHubOAuthError.couldNotStartCallbackServer))
+        default:
+            break
+        }
+    }
+
+    private func finishReady(_ result: Result<Void, Error>) {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+            defer { readyContinuation = nil }
+            return readyContinuation
+        }
+        continuation?.resume(with: result)
+    }
+
+    private func finishCallback(_ result: Result<URL, Error>) {
+        lock.lock()
+        guard !callbackFinished else {
+            lock.unlock()
+            return
+        }
+        callbackFinished = true
+        if let continuation = callbackContinuation {
+            callbackContinuation = nil
+            lock.unlock()
+            continuation.resume(with: result)
+        } else {
+            pendingCallbackResult = result
+            lock.unlock()
+        }
+    }
+
+    private func handle(_ connection: NWConnection) {
+        connection.start(queue: queue)
+        receive(from: connection, accumulated: Data())
+    }
+
+    private func receive(from connection: NWConnection, accumulated: Data) {
+        let remaining = maximumRequestLength - accumulated.count
+        guard remaining > 0 else {
+            complete(connection, result: .failure(.callbackTooLarge))
+            return
+        }
+        connection.receive(minimumIncompleteLength: 1, maximumLength: remaining) { [weak self] data, _, complete, error in
+            guard let self else { return connection.cancel() }
+            var requestData = accumulated
+            if let data { requestData.append(data) }
+            let parser = GitHubOAuthCallbackRequestParser(
+                expectedState: expectedState,
+                callbackPath: callbackPath,
+                port: port,
+                maximumRequestLength: maximumRequestLength
+            )
+            switch parser.parse(requestData) {
+            case .incomplete where error == nil && !complete:
+                receive(from: connection, accumulated: requestData)
+            case .incomplete:
+                self.complete(connection, result: .failure(.malformedCallback))
+            case let .success(url):
+                self.complete(connection, result: .success(url))
+            case let .failure(error):
+                self.complete(connection, result: .failure(error))
+            }
+        }
+    }
+
+    private func complete(_ connection: NWConnection, result: Result<URL, GitHubOAuthError>) {
+        let success: Bool
+        let status: String
+        switch result {
+        case .success:
+            success = true
+            status = "HTTP/1.1 200 OK"
+        case .failure(.callbackTooLarge):
+            success = false
+            status = "HTTP/1.1 413 Payload Too Large"
+        case .failure:
+            success = false
+            status = "HTTP/1.1 400 Bad Request"
+        }
+        let body = success
+            ? "<h1>GitHub sign-in complete</h1><p>You can return to Buddy.</p>"
+            : "<h1>GitHub sign-in failed</h1><p>Return to Buddy and try again.</p>"
+        let response = "\(status)\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: \(Data(body.utf8).count)\r\nConnection: close\r\n\r\n\(body)"
+        connection.send(content: Data(response.utf8), completion: .contentProcessed { _ in connection.cancel() })
+        switch result {
+        case let .success(url):
+            finishCallback(.success(url))
+        case let .failure(error) where error == .accessDenied
+            || error == .authorizationFailed
+            || error == .missingAuthorizationCode:
+            finishCallback(.failure(error))
+        case .failure:
+            // A malformed or unrelated request must not consume the one valid
+            // OAuth callback. Respond to that connection and keep listening.
+            break
+        }
     }
 }

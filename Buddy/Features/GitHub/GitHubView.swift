@@ -1,9 +1,10 @@
 import Observation
+import SafariServices
 import SwiftUI
 
 struct GitHubView: View {
-    @Environment(\.openURL) private var openURL
     @State private var addedAccountID: ConnectedAccountID?
+    @State private var presentedAuthorizationURL: PresentedGitHubAuthorizationURL?
     let viewModel: GitHubViewModel
     let accountID: ConnectedAccountID?
 
@@ -35,6 +36,14 @@ struct GitHubView: View {
             }
         }
         .navigationTitle("GitHub")
+        .sheet(item: $presentedAuthorizationURL, onDismiss: authorizationSheetDismissed) { item in
+            GitHubSafariView(url: item.url)
+                .ignoresSafeArea()
+        }
+        .onChange(of: viewModel.state) { _, state in
+            if case .authorizing = state { return }
+            presentedAuthorizationURL = nil
+        }
     }
 
     var presentationState: GitHubViewState {
@@ -68,7 +77,7 @@ struct GitHubView: View {
             return .loading
         }
         if !viewModel.integrationIsAuthorizationConfigured {
-            return .configurationRequired(GitHubConnectionError.missingClientID.localizedDescription)
+            return .configurationRequired(viewModel.authorizationConfigurationError.localizedDescription)
         }
         return .disconnected
     }
@@ -83,12 +92,16 @@ struct GitHubView: View {
 
     private var disconnectedContent: some View {
         ContentUnavailableView {
-            Label("Connect GitHub", systemImage: "chevron.left.forwardslash.chevron.right")
+            Label("Choose a GitHub account", systemImage: "chevron.left.forwardslash.chevron.right")
         } description: {
-            Text("Authorize Buddy to read your public GitHub identity. Your access token stays in this device's Keychain.")
+            Text(
+                "GitHub may ask you to sign in before showing its account picker. "
+                    + "It identifies HemSoft as Buddy iOS's publisher, not as an account receiving access. "
+                    + "Buddy requests only your public GitHub identity, and its token stays in this device's Keychain."
+            )
         } actions: {
-            Button("Connect GitHub") {
-                connectPresentedAccount(openURL: openURL)
+            Button("Choose Account in GitHub") {
+                connectPresentedAccount()
             }
             .buttonStyle(.borderedProminent)
         }
@@ -96,6 +109,15 @@ struct GitHubView: View {
 
     private var presentedAccountID: ConnectedAccountID? {
         accountID ?? addedAccountID
+    }
+
+    @MainActor
+    func connectPresentedAccount() {
+        if let presentedAccountID {
+            viewModel.reconnect(presentedAccountID, presentAuthorizationURL: presentAuthorizationURL)
+        } else {
+            viewModel.addAccount(presentAuthorizationURL: presentAuthorizationURL) { addedAccountID = $0 }
+        }
     }
 
     @MainActor
@@ -107,26 +129,25 @@ struct GitHubView: View {
         }
     }
 
-    private func authorizingContent(_ authorization: GitHubDeviceAuthorization) -> some View {
+    private func authorizingContent(_ authorization: GitHubBrowserAuthorization) -> some View {
         VStack(spacing: BuddyTheme.Spacing.medium) {
             Image(systemName: "person.badge.key.fill")
                 .font(.largeTitle)
                 .foregroundStyle(BuddyTheme.accent)
 
-            Text("Enter this code on GitHub")
+            Text("Choose a GitHub account")
                 .font(.headline)
 
-            Text(authorization.userCode)
-                .font(.system(.title, design: .monospaced, weight: .bold))
-                .textSelection(.enabled)
-                .accessibilityLabel("GitHub device code \(authorization.userCode)")
-
-            Text("Buddy opened GitHub in your browser and will finish connecting after you approve access.")
+            Text(
+                "Sign in if needed, then choose an account in GitHub. "
+                    + "GitHub identifies Buddy iOS as the app and HemSoft as its publisher. "
+                    + "Buddy will finish connecting when GitHub returns to this device."
+            )
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
 
             Button("Open GitHub Again") {
-                openURL(authorization.verificationURI)
+                presentAuthorizationURL(authorization.authorizationURL)
             }
             .buttonStyle(.borderedProminent)
 
@@ -149,7 +170,10 @@ struct GitHubView: View {
 
             Section {
                 Button("Reconnect account") {
-                    viewModel.reconnect(account.connectedAccountID, openURL: openURL)
+                    viewModel.reconnect(
+                        account.connectedAccountID,
+                        presentAuthorizationURL: presentAuthorizationURL
+                    )
                 }
 
                 Button("Disconnect GitHub", role: .destructive) {
@@ -169,9 +193,14 @@ struct GitHubView: View {
         } actions: {
             Button("Try Again") {
                 if let presentedAccountID {
-                    viewModel.retry(presentedAccountID, openURL: openURL)
+                    viewModel.retry(
+                        presentedAccountID,
+                        presentAuthorizationURL: presentAuthorizationURL
+                    )
                 } else {
-                    viewModel.retryAccountSetup(openURL: openURL) { addedAccountID = $0 }
+                    viewModel.retryAccountSetup(
+                        presentAuthorizationURL: presentAuthorizationURL
+                    ) { addedAccountID = $0 }
                 }
             }
             .buttonStyle(.borderedProminent)
@@ -190,6 +219,33 @@ struct GitHubView: View {
             viewModel.cancelAccountAuthorization()
         }
     }
+
+    private func presentAuthorizationURL(_ url: URL) {
+        presentedAuthorizationURL = PresentedGitHubAuthorizationURL(url: url)
+    }
+
+    func authorizationSheetDismissed() {
+        // Dismissing Safari is not a reliable cancellation signal: GitHub may
+        // already have delivered the callback while exchange and persistence
+        // are still finishing. Keep the bounded authorization alive; the user
+        // can reopen Safari or use the explicit Cancel action instead.
+    }
+
+}
+
+private struct PresentedGitHubAuthorizationURL: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+private struct GitHubSafariView: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> SFSafariViewController {
+        SFSafariViewController(url: url)
+    }
+
+    func updateUIViewController(_ uiViewController: SFSafariViewController, context: Context) {}
 }
 
 @MainActor
@@ -203,7 +259,7 @@ final class GitHubViewModel {
     private let integration: GitHubIntegration
     private var connectionTask: Task<Void, Never>?
     private var accountConnectionTask: Task<Void, Never>?
-    private var activeAccountAuthorization: GitHubDeviceAuthorization?
+    private var activeAccountAuthorization: GitHubBrowserAuthorization?
     private var cancellationTask: Task<Void, Error>?
     private var retryAction = RetryAction.restore
     private var operationGeneration = 0
@@ -215,6 +271,10 @@ final class GitHubViewModel {
 
     var integrationIsAuthorizationConfigured: Bool {
         integration.isAuthorizationConfigured
+    }
+
+    var authorizationConfigurationError: GitHubConnectionError {
+        integration.authorizationConfigurationError ?? .missingOAuthConfiguration
     }
 
     func restore() async {
@@ -265,19 +325,41 @@ final class GitHubViewModel {
         openURL: OpenURLAction,
         onConnected: ((ConnectedAccountID) -> Void)? = nil
     ) {
+        addAccount(
+            presentAuthorizationURL: { openURL($0) },
+            onConnected: onConnected
+        )
+    }
+
+    func addAccount(
+        presentAuthorizationURL: @escaping (URL) -> Void,
+        onConnected: ((ConnectedAccountID) -> Void)? = nil
+    ) {
         retryAction = .connect
-        authorizeAccount(reconnecting: nil, openURL: openURL, onConnected: onConnected)
+        authorizeAccount(
+            reconnecting: nil,
+            presentAuthorizationURL: presentAuthorizationURL,
+            onConnected: onConnected
+        )
     }
 
     func reconnect(_ id: ConnectedAccountID, openURL: OpenURLAction) {
-        authorizeAccount(reconnecting: id, openURL: openURL)
+        reconnect(id, presentAuthorizationURL: { openURL($0) })
+    }
+
+    func reconnect(_ id: ConnectedAccountID, presentAuthorizationURL: @escaping (URL) -> Void) {
+        authorizeAccount(reconnecting: id, presentAuthorizationURL: presentAuthorizationURL)
     }
 
     func retry(_ id: ConnectedAccountID, openURL: OpenURLAction) {
+        retry(id, presentAuthorizationURL: { openURL($0) })
+    }
+
+    func retry(_ id: ConnectedAccountID, presentAuthorizationURL: @escaping (URL) -> Void) {
         guard let connection = accounts.first(where: { $0.id == id }),
               connection.recoveryAction == .validate
         else {
-            reconnect(id, openURL: openURL)
+            reconnect(id, presentAuthorizationURL: presentAuthorizationURL)
             return
         }
         Task { await restore() }
@@ -285,7 +367,7 @@ final class GitHubViewModel {
 
     private func authorizeAccount(
         reconnecting id: ConnectedAccountID?,
-        openURL: OpenURLAction,
+        presentAuthorizationURL: @escaping (URL) -> Void,
         onConnected: ((ConnectedAccountID) -> Void)? = nil
     ) {
         if let previousTarget = activeAccountAuthorizationTarget,
@@ -301,7 +383,7 @@ final class GitHubViewModel {
         activeAccountAuthorizationTarget = id
         stateScope = id.map(GitHubViewStateScope.account) ?? .accountSetup
         accountConnectionTask = Task {
-            var authorization: GitHubDeviceAuthorization?
+            var authorization: GitHubBrowserAuthorization?
             defer {
                 if generation == operationGeneration {
                     if let id {
@@ -322,7 +404,7 @@ final class GitHubViewModel {
                 activeAccountAuthorization = startedAuthorization
                 try Task.checkCancellation()
                 state = .authorizing(startedAuthorization)
-                openURL(startedAuthorization.verificationURI)
+                presentAuthorizationURL(startedAuthorization.authorizationURL)
 
                 let connection = try await integration.completeAccountAuthorization(startedAuthorization)
                 try Task.checkCancellation()
@@ -439,6 +521,10 @@ final class GitHubViewModel {
     }
 
     func connect(openURL: OpenURLAction) {
+        connect(presentAuthorizationURL: { openURL($0) })
+    }
+
+    func connect(presentAuthorizationURL: @escaping (URL) -> Void) {
         operationGeneration &+= 1
         let generation = operationGeneration
         connectionTask?.cancel()
@@ -463,7 +549,7 @@ final class GitHubViewModel {
                 guard generation == operationGeneration else { return }
                 stateScope = .accountSetup
                 state = .authorizing(authorization)
-                openURL(authorization.verificationURI)
+                presentAuthorizationURL(authorization.authorizationURL)
 
                 let account = try await integration.completeAuthorization(authorization)
                 try Task.checkCancellation()
@@ -490,9 +576,13 @@ final class GitHubViewModel {
     }
 
     func retry(openURL: OpenURLAction) {
+        retry(presentAuthorizationURL: { openURL($0) })
+    }
+
+    func retry(presentAuthorizationURL: @escaping (URL) -> Void) {
         switch retryAction {
         case .connect:
-            connect(openURL: openURL)
+            connect(presentAuthorizationURL: presentAuthorizationURL)
         case .restore:
             Task { await restore() }
         case .cancel:
@@ -506,11 +596,24 @@ final class GitHubViewModel {
         openURL: OpenURLAction,
         onConnected: ((ConnectedAccountID) -> Void)? = nil
     ) {
+        retryAccountSetup(
+            presentAuthorizationURL: { openURL($0) },
+            onConnected: onConnected
+        )
+    }
+
+    func retryAccountSetup(
+        presentAuthorizationURL: @escaping (URL) -> Void,
+        onConnected: ((ConnectedAccountID) -> Void)? = nil
+    ) {
         switch retryAction {
         case .restore:
             Task { await restore() }
         case .connect:
-            addAccount(openURL: openURL, onConnected: onConnected)
+            addAccount(
+                presentAuthorizationURL: presentAuthorizationURL,
+                onConnected: onConnected
+            )
         case .cancel:
             cancel()
         case .disconnect:
@@ -585,7 +688,7 @@ final class GitHubViewModel {
         if integration.isAuthorizationConfigured {
             return .disconnected
         }
-        return .configurationRequired(GitHubConnectionError.missingClientID.localizedDescription)
+        return .configurationRequired(authorizationConfigurationError.localizedDescription)
     }
 }
 
@@ -599,7 +702,7 @@ enum GitHubViewState: Equatable {
     case loading
     case disconnected
     case configurationRequired(String)
-    case authorizing(GitHubDeviceAuthorization)
+    case authorizing(GitHubBrowserAuthorization)
     case connected(GitHubAccount)
     case needsAttention(String)
 }

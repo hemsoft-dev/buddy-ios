@@ -279,12 +279,9 @@ final class DashboardViewModelTests: XCTestCase {
 
     func testDashboardPresentationDistinguishesAccountLifecycleStates() {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
-        let authorization = GitHubDeviceAuthorization(
-            deviceCode: "device-code",
-            userCode: "ABCD-EFGH",
-            verificationURI: URL(string: "https://github.com/login/device")!,
-            expiresIn: 900,
-            interval: 5
+        let authorization = GitHubBrowserAuthorization(
+            id: UUID(),
+            authorizationURL: URL(string: "https://github.com/login/oauth/authorize")!
         )
 
         XCTAssertEqual(DashboardPresentation(githubState: .loading), .loading)
@@ -306,12 +303,9 @@ final class DashboardViewModelTests: XCTestCase {
 
     func testSettingsStatusRepresentsEveryGitHubState() {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
-        let authorization = GitHubDeviceAuthorization(
-            deviceCode: "device-code",
-            userCode: "ABCD-EFGH",
-            verificationURI: URL(string: "https://github.com/login/device")!,
-            expiresIn: 900,
-            interval: 5
+        let authorization = GitHubBrowserAuthorization(
+            id: UUID(),
+            authorizationURL: URL(string: "https://github.com/login/oauth/authorize")!
         )
 
         XCTAssertEqual(GitHubViewState.loading.settingsStatus, "Checking connection")

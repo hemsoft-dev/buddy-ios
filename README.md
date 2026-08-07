@@ -48,45 +48,48 @@ belong in Keychain, never SwiftData or source-controlled configuration.
 
 `Config/Shared.xcconfig` contains safe defaults, including public OAuth client
 identifiers, and optionally includes the gitignored `Config/Local.xcconfig` for
-private local values. Client secrets and access tokens must never be placed in
-either configuration file. OAuth integrations should use the system browser and
-PKCE whenever the provider supports it. Buddy's callback route is:
-
-```text
-buddy://oauth/<provider>
-```
-
-Each provider's exact authorization requirements should be verified when its
-integration is implemented.
+local build values. Access tokens must never be placed in either configuration
+file. OAuth integrations use an in-app system browser and PKCE whenever the
+provider supports it.
 
 ### GitHub
 
-Buddy uses GitHub's OAuth device flow because it is a native, backend-free app
-and therefore cannot keep a client secret. The app requests no OAuth scopes for
-the initial connection; this grants only the minimum access needed to validate
-the signed-in user's public identity. Tokens are stored only in iOS Keychain.
+Buddy uses GitHub's browser authorization-code flow with a loopback callback,
+cryptographically random state, and PKCE `S256`. The authorization request uses
+`prompt=select_account`, so initial connect, Add account, and reconnect all show
+GitHub's account chooser. Buddy requests no OAuth scopes: the current features
+need only public identity and public pull-request data. Tokens are stored only in
+iOS Keychain.
 
-Buddy's source-controlled build configuration includes the public client ID for
-the HemSoft OAuth app, whose **Device Flow** setting is enabled. OAuth client IDs
-identify an app but do not authenticate it, so distributable builds can safely
-include this value without embedding a client secret.
+GitHub currently requires `client_secret` during authorization-code exchange,
+including when PKCE is supplied. A credential distributed in an iOS bundle is
+not confidential. Buddy's backend-free strategy therefore requires a dedicated
+Buddy OAuth app and explicitly treats its exchange credential as public/non-
+confidential. Never reuse another application's OAuth credentials. If that
+credential must remain confidential, route the code exchange through an owned
+backend instead of putting it in the app or Keychain.
 
 To test with a different GitHub OAuth app:
 
-1. Register a GitHub OAuth app and enable **Device Flow** in its settings.
-2. Pass its public client ID as a command-line build setting, for example
-   `xcodebuild ... BUDDY_GITHUB_CLIENT_ID=your-public-client-id`.
-3. Do not add a client secret.
+1. Register a dedicated Buddy GitHub OAuth app. Its callback URL must allow the
+   loopback-literal redirect `http://127.0.0.1:<ephemeral-port>/callback`.
+2. Pass both its client ID and public/non-confidential exchange credential as
+   higher-precedence command-line build settings, for example
+   `xcodebuild ... BUDDY_GITHUB_CLIENT_ID=... BUDDY_GITHUB_CLIENT_SECRET=...`.
+   `Config/Local.xcconfig` may provide the exchange credential only when it
+   belongs to the source-controlled client ID, because `Shared.xcconfig`
+   intentionally restores that client ID after including local settings.
+3. Do not commit a real credential, authorization code, PKCE verifier, or token.
 
-The shared client-ID assignment intentionally follows the optional local include
-so an older `Local.xcconfig` containing a blank value cannot disable connection
-in a current build. Command-line build settings retain higher precedence when a
-developer deliberately tests another OAuth app.
+The source-controlled client-ID assignment intentionally follows the optional
+local include so an older blank local value cannot disable that safe public
+identifier. No OAuth exchange credential is source-controlled. Command-line
+build settings retain higher precedence for deliberate test configuration.
 
-The device flow opens GitHub in the system browser, observes GitHub's polling
-interval and expiration, and handles `slow_down` responses. The existing
-`buddy://oauth/github` route remains available for future providers that use a
-redirect-based authorization flow.
+Buddy starts a listener bound only to `127.0.0.1` before presenting
+`SFSafariViewController`, uses the listener's exact redirect URI during exchange,
+and stops it on success, failure, timeout, or cancellation. The callback validates
+the path, state, and non-empty code and rejects malformed or oversized requests.
 
 ## Verification
 
