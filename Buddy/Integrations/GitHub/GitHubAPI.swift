@@ -68,10 +68,15 @@ protocol GitHubAPIProviding: Sendable {
     func pollForAccessToken(clientID: String, deviceCode: String) async throws -> GitHubTokenPollResult
     func authenticatedUser(token: String) async throws -> GitHubAccount
     func authoredPullRequests(login: String, token: String) async throws -> GitHubPullRequestCollection
+    func assignedPullRequests(login: String, token: String) async throws -> GitHubPullRequestCollection
 }
 
 extension GitHubAPIProviding {
     func authoredPullRequests(login _: String, token _: String) async throws -> GitHubPullRequestCollection {
+        throw GitHubAPIError.malformedResponse
+    }
+
+    func assignedPullRequests(login _: String, token _: String) async throws -> GitHubPullRequestCollection {
         throw GitHubAPIError.malformedResponse
     }
 }
@@ -195,6 +200,28 @@ struct GitHubAPI: GitHubAPIProviding {
     /// Returns the 50 most recently active open pull requests authored by `login`.
     /// This intentionally bounded first page keeps the initial dashboard request predictable.
     func authoredPullRequests(login: String, token: String) async throws -> GitHubPullRequestCollection {
+        try await pullRequests(
+            login: login,
+            token: token,
+            qualifier: "author"
+        )
+    }
+
+    /// Returns the 50 most recently active open pull requests awaiting review from `login`.
+    /// Results are intentionally scoped to the credential and validated login supplied by the caller.
+    func assignedPullRequests(login: String, token: String) async throws -> GitHubPullRequestCollection {
+        try await pullRequests(
+            login: login,
+            token: token,
+            qualifier: "review-requested"
+        )
+    }
+
+    private func pullRequests(
+        login: String,
+        token: String,
+        qualifier: String
+    ) async throws -> GitHubPullRequestCollection {
         guard isValidLogin(login),
               var components = URLComponents(string: "https://api.github.com/search/issues")
         else {
@@ -202,7 +229,7 @@ struct GitHubAPI: GitHubAPIProviding {
         }
 
         components.queryItems = [
-            URLQueryItem(name: "q", value: "is:pr is:open author:\(login)"),
+            URLQueryItem(name: "q", value: "is:pr is:open \(qualifier):\(login)"),
             URLQueryItem(name: "sort", value: "updated"),
             URLQueryItem(name: "order", value: "desc"),
             URLQueryItem(name: "per_page", value: "50"),

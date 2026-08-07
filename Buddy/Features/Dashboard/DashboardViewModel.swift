@@ -3,9 +3,15 @@ import Observation
 
 protocol GitHubPullRequestProviding: Sendable {
     func authoredPullRequests(for account: GitHubAccount) async throws -> GitHubPullRequestCollection
+    func assignedPullRequests(for account: GitHubAccount) async throws -> GitHubPullRequestCollection
 }
 
 extension GitHubIntegration: GitHubPullRequestProviding {}
+
+enum GitHubPullRequestSection: Hashable, Sendable {
+    case authored
+    case assigned
+}
 
 enum GitHubPullRequestFailure: Equatable, Sendable {
     case authenticationRequired
@@ -96,10 +102,12 @@ struct GitHubPullRequestRepositoryGroup: Identifiable, Equatable, Sendable {
 
 struct DashboardGitHubPullRequestTreeSnapshot: Equatable {
     let accountID: Int
+    let section: GitHubPullRequestSection
     let repositories: [String]
 
     init?(
         accountID: Int,
+        section: GitHubPullRequestSection = .authored,
         dataAccountID: Int?,
         state: GitHubPullRequestDashboardState
     ) {
@@ -120,40 +128,67 @@ struct DashboardGitHubPullRequestTreeSnapshot: Equatable {
         }
 
         self.accountID = accountID
+        self.section = section
         repositories = GitHubPullRequestRepositoryGroup.grouped(pullRequests).map(\.id)
     }
 }
 
 struct DashboardGitHubPullRequestTreeExpansionState: Equatable {
-    private struct AccountState: Equatable {
-        var isPullRequestSectionExpanded = false
+    private struct SectionState: Equatable {
+        var isExpanded = false
         var expandedRepositories: Set<String> = []
+    }
+
+    private struct AccountState: Equatable {
+        var sections: [GitHubPullRequestSection: SectionState] = [:]
     }
 
     private var accounts: [Int: AccountState] = [:]
 
-    func isPullRequestSectionExpanded(for accountID: Int) -> Bool {
-        accounts[accountID]?.isPullRequestSectionExpanded ?? false
+    func isPullRequestSectionExpanded(
+        for accountID: Int,
+        section: GitHubPullRequestSection = .authored
+    ) -> Bool {
+        accounts[accountID]?.sections[section]?.isExpanded ?? false
     }
 
-    func isRepositoryExpanded(_ repository: String, for accountID: Int) -> Bool {
-        accounts[accountID]?.expandedRepositories.contains(repository) ?? false
+    func isRepositoryExpanded(
+        _ repository: String,
+        for accountID: Int,
+        section: GitHubPullRequestSection = .authored
+    ) -> Bool {
+        accounts[accountID]?.sections[section]?.expandedRepositories.contains(repository) ?? false
     }
 
-    mutating func togglePullRequestSection(for accountID: Int) {
-        accounts[accountID, default: AccountState()].isPullRequestSectionExpanded.toggle()
+    mutating func togglePullRequestSection(
+        for accountID: Int,
+        section: GitHubPullRequestSection = .authored
+    ) {
+        accounts[accountID, default: AccountState()]
+            .sections[section, default: SectionState()].isExpanded.toggle()
     }
 
-    mutating func toggleRepository(_ repository: String, for accountID: Int) {
-        if accounts[accountID, default: AccountState()].expandedRepositories.contains(repository) {
-            accounts[accountID]?.expandedRepositories.remove(repository)
+    mutating func toggleRepository(
+        _ repository: String,
+        for accountID: Int,
+        section: GitHubPullRequestSection = .authored
+    ) {
+        if accounts[accountID, default: AccountState()]
+            .sections[section, default: SectionState()].expandedRepositories.contains(repository) {
+            accounts[accountID]?.sections[section]?.expandedRepositories.remove(repository)
         } else {
-            accounts[accountID]?.expandedRepositories.insert(repository)
+            accounts[accountID]?.sections[section, default: SectionState()]
+                .expandedRepositories.insert(repository)
         }
     }
 
-    mutating func reconcile(accountID: Int, repositories: [String]) {
+    mutating func reconcile(
+        accountID: Int,
+        section: GitHubPullRequestSection = .authored,
+        repositories: [String]
+    ) {
         accounts[accountID, default: AccountState()]
+            .sections[section, default: SectionState()]
             .expandedRepositories.formIntersection(repositories)
     }
 }
@@ -161,18 +196,25 @@ struct DashboardGitHubPullRequestTreeExpansionState: Equatable {
 @MainActor
 @Observable
 final class DashboardViewModel {
+    private struct RefreshKey: Hashable {
+        let accountID: ConnectedAccountID
+        let section: GitHubPullRequestSection
+    }
+
     private(set) var cards: [DashboardCard]
     private(set) var isRefreshing = false
     private(set) var lastUpdated: Date?
     private(set) var githubStates: [ConnectedAccountID: GitHubPullRequestDashboardState] = [:]
     private(set) var githubTotalCounts: [ConnectedAccountID: Int] = [:]
-    private(set) var githubRefreshesInFlight: Set<ConnectedAccountID> = []
+    private(set) var githubAssignedStates: [ConnectedAccountID: GitHubPullRequestDashboardState] = [:]
+    private(set) var githubAssignedTotalCounts: [ConnectedAccountID: Int] = [:]
+    private var githubRefreshesInFlight: Set<RefreshKey> = []
 
     private let integrations: [any IntegrationProviding]
     private let github: any GitHubPullRequestProviding
     private let now: @MainActor @Sendable () -> Date
     private(set) var githubAccountID: Int?
-    private var githubRefreshGenerations: [ConnectedAccountID: Int] = [:]
+    private var githubRefreshGenerations: [RefreshKey: Int] = [:]
 
     var githubState: GitHubPullRequestDashboardState {
         guard let githubAccountID else { return .loading }
@@ -188,16 +230,32 @@ final class DashboardViewModel {
 
     var isGitHubRefreshInFlight: Bool { !githubRefreshesInFlight.isEmpty }
 
-    func githubState(for account: GitHubAccount) -> GitHubPullRequestDashboardState {
-        githubStates[account.connectedAccountID] ?? .loading
+    func githubState(
+        for account: GitHubAccount,
+        section: GitHubPullRequestSection = .authored
+    ) -> GitHubPullRequestDashboardState {
+        switch section {
+        case .authored:
+            githubStates[account.connectedAccountID] ?? .loading
+        case .assigned:
+            githubAssignedStates[account.connectedAccountID] ?? .loading
+        }
     }
 
-    func githubTotalCount(for account: GitHubAccount) -> Int {
-        githubTotalCounts[account.connectedAccountID] ?? 0
+    func githubTotalCount(
+        for account: GitHubAccount,
+        section: GitHubPullRequestSection = .authored
+    ) -> Int {
+        switch section {
+        case .authored:
+            githubTotalCounts[account.connectedAccountID] ?? 0
+        case .assigned:
+            githubAssignedTotalCounts[account.connectedAccountID] ?? 0
+        }
     }
 
     func isGitHubRefreshInFlight(for account: GitHubAccount) -> Bool {
-        githubRefreshesInFlight.contains(account.connectedAccountID)
+        githubRefreshesInFlight.contains { $0.accountID == account.connectedAccountID }
     }
 
     init(
@@ -213,51 +271,102 @@ final class DashboardViewModel {
 
     @discardableResult
     func refresh(account: GitHubAccount) async -> GitHubPullRequestFailure? {
-        let accountID = account.connectedAccountID
-        githubAccountID = account.id
-        guard !githubRefreshesInFlight.contains(accountID) else { return nil }
+        async let authoredFailure = refresh(account: account, section: .authored)
+        async let assignedFailure = refresh(account: account, section: .assigned)
+        let failures = await [authoredFailure, assignedFailure].compactMap { $0 }
+        return failures.first(where: { $0 == .authenticationRequired }) ?? failures.first
+    }
 
-        githubRefreshGenerations[accountID, default: 0] &+= 1
-        let refreshGeneration = githubRefreshGenerations[accountID]
-        githubRefreshesInFlight.insert(accountID)
+    @discardableResult
+    func refresh(
+        account: GitHubAccount,
+        section: GitHubPullRequestSection
+    ) async -> GitHubPullRequestFailure? {
+        let accountID = account.connectedAccountID
+        let refreshKey = RefreshKey(accountID: accountID, section: section)
+        githubAccountID = account.id
+        guard !githubRefreshesInFlight.contains(refreshKey) else { return nil }
+
+        githubRefreshGenerations[refreshKey, default: 0] &+= 1
+        let refreshGeneration = githubRefreshGenerations[refreshKey]
+        githubRefreshesInFlight.insert(refreshKey)
         defer {
-            if githubRefreshGenerations[accountID] == refreshGeneration {
-                githubRefreshesInFlight.remove(accountID)
+            if githubRefreshGenerations[refreshKey] == refreshGeneration {
+                githubRefreshesInFlight.remove(refreshKey)
             }
         }
-        let previousState = githubStates[accountID] ?? .loading
+        let previousState = githubState(for: account, section: section)
         let previousPullRequests = previousState.pullRequests
         let previousRefreshDate = previousState.refreshedAt
-        githubStates[accountID] = previousRefreshDate == nil && previousPullRequests.isEmpty
+        setGitHubState(
+            previousRefreshDate == nil && previousPullRequests.isEmpty
             ? .loading
-            : .refreshing(previousPullRequests, refreshedAt: previousRefreshDate)
+            : .refreshing(previousPullRequests, refreshedAt: previousRefreshDate),
+            for: accountID,
+            section: section
+        )
 
         do {
-            let collection = try await github.authoredPullRequests(for: account)
+            let collection = switch section {
+            case .authored:
+                try await github.authoredPullRequests(for: account)
+            case .assigned:
+                try await github.assignedPullRequests(for: account)
+            }
             let pullRequests = collection.pullRequests
                 .sorted { $0.updatedAt > $1.updatedAt }
-            guard githubRefreshGenerations[accountID] == refreshGeneration else { return nil }
-            githubTotalCounts[accountID] = collection.totalCount
-            githubStates[accountID] = .loaded(pullRequests, refreshedAt: now())
+            guard githubRefreshGenerations[refreshKey] == refreshGeneration else { return nil }
+            setGitHubTotalCount(collection.totalCount, for: accountID, section: section)
+            setGitHubState(.loaded(pullRequests, refreshedAt: now()), for: accountID, section: section)
             return nil
         } catch is CancellationError {
-            guard githubRefreshGenerations[accountID] == refreshGeneration else { return nil }
+            guard githubRefreshGenerations[refreshKey] == refreshGeneration else { return nil }
             if let previousRefreshDate {
-                githubStates[accountID] = .loaded(previousPullRequests, refreshedAt: previousRefreshDate)
+                setGitHubState(
+                    .loaded(previousPullRequests, refreshedAt: previousRefreshDate),
+                    for: accountID,
+                    section: section
+                )
             } else {
-                githubStates[accountID] = .loading
+                setGitHubState(.loading, for: accountID, section: section)
             }
             return nil
         } catch {
-            guard githubRefreshGenerations[accountID] == refreshGeneration else { return nil }
+            guard githubRefreshGenerations[refreshKey] == refreshGeneration else { return nil }
             let failure = Self.mapGitHubFailure(error)
-            githubStates[accountID] = .failed(
-                previousPullRequests,
-                refreshedAt: previousRefreshDate,
-                failure
+            setGitHubState(
+                .failed(previousPullRequests, refreshedAt: previousRefreshDate, failure),
+                for: accountID,
+                section: section
             )
-            AppLogger.integrations.error("GitHub pull request refresh failed")
+            AppLogger.integrations.error("GitHub pull request section refresh failed")
             return failure
+        }
+    }
+
+    private func setGitHubState(
+        _ state: GitHubPullRequestDashboardState,
+        for accountID: ConnectedAccountID,
+        section: GitHubPullRequestSection
+    ) {
+        switch section {
+        case .authored:
+            githubStates[accountID] = state
+        case .assigned:
+            githubAssignedStates[accountID] = state
+        }
+    }
+
+    private func setGitHubTotalCount(
+        _ count: Int,
+        for accountID: ConnectedAccountID,
+        section: GitHubPullRequestSection
+    ) {
+        switch section {
+        case .authored:
+            githubTotalCounts[accountID] = count
+        case .assigned:
+            githubAssignedTotalCounts[accountID] = count
         }
     }
 

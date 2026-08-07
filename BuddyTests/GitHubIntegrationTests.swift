@@ -72,6 +72,26 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(requests, [PullRequestRequest(login: "franz", token: "stored-token")])
     }
 
+    func testAssignedPullRequestsUsesTheRequestedAccountsScopedCredential() async throws {
+        let expectedCollection = GitHubPullRequestCollection(pullRequests: [], totalCount: 0)
+        let account = GitHubAccount(id: 7, login: "franz", name: nil, avatarURL: nil)
+        let credentials = MockCredentialStore(values: [
+            GitHubIntegration.credentialAccount(for: account.connectedAccountID): "scoped-token",
+        ])
+        let api = StubGitHubAPI(assignedPullRequestResults: [.success(expectedCollection)])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: credentials
+        )
+
+        let collection = try await integration.assignedPullRequests(for: account)
+
+        XCTAssertEqual(collection, expectedCollection)
+        let requests = await api.assignedPullRequestRequests()
+        XCTAssertEqual(requests, [PullRequestRequest(login: "franz", token: "scoped-token")])
+    }
+
     func testUnauthorizedPullRequestRefreshRemovesCredentialAndRequestsRecovery() async throws {
         let api = StubGitHubAPI(pullRequestResults: [.failure(.unauthorized)])
         let credentials = MockCredentialStore(initialValue: "revoked-token")
@@ -3307,8 +3327,10 @@ private actor StubGitHubAPI: GitHubAPIProviding {
     private var pollResults: [Result<GitHubTokenPollResult, GitHubAPIError>]
     private var userResults: [Result<GitHubAccount, GitHubAPIError>]
     private var pullRequestResults: [Result<GitHubPullRequestCollection, GitHubAPIError>]
+    private var assignedPullRequestResults: [Result<GitHubPullRequestCollection, GitHubAPIError>]
     private var capturedUserTokens: [String] = []
     private var capturedPullRequestRequests: [PullRequestRequest] = []
+    private var capturedAssignedPullRequestRequests: [PullRequestRequest] = []
     private var capturedDeviceRequestCount = 0
     private var capturedPollRequestCount = 0
 
@@ -3316,12 +3338,14 @@ private actor StubGitHubAPI: GitHubAPIProviding {
         deviceResults: [Result<GitHubDeviceAuthorization, GitHubAPIError>] = [],
         pollResults: [Result<GitHubTokenPollResult, GitHubAPIError>] = [],
         userResults: [Result<GitHubAccount, GitHubAPIError>] = [],
-        pullRequestResults: [Result<GitHubPullRequestCollection, GitHubAPIError>] = []
+        pullRequestResults: [Result<GitHubPullRequestCollection, GitHubAPIError>] = [],
+        assignedPullRequestResults: [Result<GitHubPullRequestCollection, GitHubAPIError>] = []
     ) {
         self.deviceResults = deviceResults
         self.pollResults = pollResults
         self.userResults = userResults
         self.pullRequestResults = pullRequestResults
+        self.assignedPullRequestResults = assignedPullRequestResults
     }
 
     func requestDeviceAuthorization(clientID: String) throws -> GitHubDeviceAuthorization {
@@ -3344,12 +3368,21 @@ private actor StubGitHubAPI: GitHubAPIProviding {
         return try pullRequestResults.removeFirst().get()
     }
 
+    func assignedPullRequests(login: String, token: String) throws -> GitHubPullRequestCollection {
+        capturedAssignedPullRequestRequests.append(PullRequestRequest(login: login, token: token))
+        return try assignedPullRequestResults.removeFirst().get()
+    }
+
     func userTokens() -> [String] {
         capturedUserTokens
     }
 
     func pullRequestRequests() -> [PullRequestRequest] {
         capturedPullRequestRequests
+    }
+
+    func assignedPullRequestRequests() -> [PullRequestRequest] {
+        capturedAssignedPullRequestRequests
     }
 
     func deviceRequestCount() -> Int {
