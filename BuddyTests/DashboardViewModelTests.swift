@@ -125,6 +125,30 @@ final class DashboardViewModelTests: XCTestCase {
         )
     }
 
+    func testPullRequestAccountHeaderKeepsLoadingAheadOfOrdinaryFailure() {
+        XCTAssertEqual(
+            DashboardGitHubPullRequestCopy.accountHeaderSummary(
+                authoredState: .failed([], refreshedAt: nil, .server),
+                authoredTotal: 0,
+                assignedState: .loading,
+                assignedTotal: 0
+            ),
+            "Loading pull requests"
+        )
+    }
+
+    func testPullRequestAccountHeaderKeepsAuthenticationFailureAheadOfLoading() {
+        XCTAssertEqual(
+            DashboardGitHubPullRequestCopy.accountHeaderSummary(
+                authoredState: .failed([], refreshedAt: nil, .authenticationRequired),
+                authoredTotal: 0,
+                assignedState: .loading,
+                assignedTotal: 0
+            ),
+            "Reconnect required · 0 authored · 0 assigned"
+        )
+    }
+
     func testAssignedEmptyStateDisclosesPublicRepositoryLimit() {
         let description = DashboardGitHubPullRequestCopy.emptyStateDescription(
             login: "octocat",

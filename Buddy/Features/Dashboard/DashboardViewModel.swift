@@ -56,16 +56,16 @@ enum DashboardGitHubPullRequestCopy {
             return "Reconnect required · \(result)"
         }
         if states.contains(where: {
-            if case .failed = $0 { return true }
-            return false
-        }) {
-            return "Refresh warning · \(result)"
-        }
-        if states.contains(where: {
             if case .loading = $0 { return true }
             return false
         }) {
             return "Loading pull requests"
+        }
+        if states.contains(where: {
+            if case .failed = $0 { return true }
+            return false
+        }) {
+            return "Refresh warning · \(result)"
         }
         if states.contains(where: {
             if case .refreshing = $0 { return true }
