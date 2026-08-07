@@ -498,9 +498,20 @@ final class GitHubViewModel {
     }
 
     func reportDashboardAuthenticationFailure(for id: ConnectedAccountID) {
+        reportDashboardAuthorizationFailure(for: id, error: .invalidToken)
+    }
+
+    func reportDashboardRepositoryAccessFailure(for id: ConnectedAccountID) {
+        reportDashboardAuthorizationFailure(for: id, error: .privateRepositoryAccessRequired)
+    }
+
+    private func reportDashboardAuthorizationFailure(
+        for id: ConnectedAccountID,
+        error: GitHubConnectionError
+    ) {
         guard let index = accounts.firstIndex(where: { $0.id == id }) else { return }
         accounts[index].state = .needsAttention
-        accounts[index].message = GitHubConnectionError.invalidToken.localizedDescription
+        accounts[index].message = error.localizedDescription
         accounts[index].recoveryAction = .reconnect
         stateScope = preferredRestingStateScope
         state = preferredRestingState

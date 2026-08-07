@@ -149,6 +149,18 @@ final class DashboardViewModelTests: XCTestCase {
         )
     }
 
+    func testPullRequestAccountHeaderTreatsRepositoryAccessAsReconnectRequired() {
+        XCTAssertEqual(
+            DashboardGitHubPullRequestCopy.accountHeaderSummary(
+                authoredState: .failed([], refreshedAt: nil, .repositoryAccessRequired),
+                authoredTotal: 0,
+                assignedState: .loaded([], refreshedAt: Date(timeIntervalSince1970: 100)),
+                assignedTotal: 0
+            ),
+            "Reconnect required · 0 authored · 0 assigned"
+        )
+    }
+
     func testAssignedEmptyStateCoversPublicAndPrivateRepositories() {
         let description = DashboardGitHubPullRequestCopy.emptyStateDescription(
             login: "octocat",
@@ -426,11 +438,12 @@ final class DashboardViewModelTests: XCTestCase {
 
         let failure = await viewModel.refresh(account: testAccount)
 
-        XCTAssertEqual(failure, .authenticationRequired)
+        XCTAssertEqual(failure, .repositoryAccessRequired)
         XCTAssertEqual(
             viewModel.githubState,
-            .failed([], refreshedAt: nil, .authenticationRequired)
+            .failed([], refreshedAt: nil, .repositoryAccessRequired)
         )
+        XCTAssertTrue(GitHubPullRequestFailure.repositoryAccessRequired.message.contains("approve repository access"))
     }
 
     func testGitHubDashboardPropagatesAuthenticationFailureToCanceledSiblingSection() async {

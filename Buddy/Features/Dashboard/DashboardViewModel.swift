@@ -50,7 +50,7 @@ enum DashboardGitHubPullRequestCopy {
             assignedTotal: assignedTotal
         )
         if states.contains(where: {
-            if case .failed(_, _, .authenticationRequired) = $0 { return true }
+            if case let .failed(_, _, failure) = $0 { return failure.requiresReconnect }
             return false
         }) {
             return "Reconnect required · \(result)"
@@ -83,6 +83,7 @@ enum DashboardGitHubPullRequestCopy {
 
 enum GitHubPullRequestFailure: Equatable, Sendable {
     case authenticationRequired
+    case repositoryAccessRequired
     case offline
     case rateLimited
     case incompleteResults
@@ -95,6 +96,8 @@ enum GitHubPullRequestFailure: Equatable, Sendable {
         switch self {
         case .authenticationRequired:
             "GitHub authorization expired. Reconnect the account in Settings."
+        case .repositoryAccessRequired:
+            "Buddy needs GitHub repository access to show private pull requests. Reconnect the account and approve repository access."
         case .offline:
             "Buddy is offline. Previously loaded pull requests remain available."
         case .rateLimited:
@@ -110,6 +113,10 @@ enum GitHubPullRequestFailure: Equatable, Sendable {
         case .unknown:
             "Pull requests couldn't be refreshed. Try again."
         }
+    }
+
+    var requiresReconnect: Bool {
+        self == .authenticationRequired || self == .repositoryAccessRequired
     }
 }
 
@@ -490,8 +497,10 @@ final class DashboardViewModel {
         }
 
         return switch error {
-        case .invalidToken, .privateRepositoryAccessRequired:
+        case .invalidToken:
             .authenticationRequired
+        case .privateRepositoryAccessRequired:
+            .repositoryAccessRequired
         case .networkUnavailable:
             .offline
         case .rateLimited:

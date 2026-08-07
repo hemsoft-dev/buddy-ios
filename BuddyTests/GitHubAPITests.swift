@@ -420,6 +420,28 @@ final class GitHubAPITests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "X-GitHub-Api-Version"), "2022-11-28")
     }
 
+    func testPullRequestSearchesRejectTokensWithoutPrivateRepositoryScope() async throws {
+        let emptyResponse = #"{"total_count":0,"incomplete_results":false,"items":[]}"#
+
+        for assigned in [false, true] {
+            let client = MockHTTPClient(responses: [
+                .successWithScopes(emptyResponse, statusCode: 200, scopes: "read:user"),
+            ])
+            let api = GitHubAPI(httpClient: client)
+
+            do {
+                if assigned {
+                    _ = try await api.assignedPullRequests(login: "octocat", token: "public-only-token")
+                } else {
+                    _ = try await api.authoredPullRequests(login: "octocat", token: "public-only-token")
+                }
+                XCTFail("Expected missing repository scope")
+            } catch let error as GitHubAPIError {
+                XCTAssertEqual(error, .insufficientOAuthScope)
+            }
+        }
+    }
+
     func testAuthoredPullRequestsSupportsEmptyResults() async throws {
         let httpClient = MockHTTPClient(responses: [.success(#"{"total_count":0,"incomplete_results":false,"items":[]}"#, statusCode: 200)])
 

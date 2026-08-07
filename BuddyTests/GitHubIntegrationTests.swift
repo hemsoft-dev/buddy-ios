@@ -1201,6 +1201,31 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertTrue(accounts.isEmpty)
     }
 
+    func testDashboardRepositoryAccessFailurePreservesReconnectGuidance() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(userResults: [.success(account)]),
+            credentials: MockCredentialStore(values: [credentialAccount: "stored-token"]),
+            accountStore: InMemoryConnectedAccountStore(records: [account.connectedAccountRecord])
+        )
+        let viewModel = await MainActor.run { GitHubViewModel(integration: integration) }
+        await viewModel.restore()
+
+        await MainActor.run {
+            viewModel.reportDashboardRepositoryAccessFailure(for: account.connectedAccountID)
+        }
+
+        let connection = await MainActor.run { viewModel.accounts.first }
+        XCTAssertEqual(connection?.state, .needsAttention)
+        XCTAssertEqual(connection?.recoveryAction, .reconnect)
+        XCTAssertEqual(
+            connection?.message,
+            GitHubConnectionError.privateRepositoryAccessRequired.localizedDescription
+        )
+    }
+
     func testDisconnectRetryRepeatsCredentialRemoval() async throws {
         let credentials = FailOnceRemovalCredentialStore(initialValue: "stored-token")
         let integration = GitHubIntegration(
