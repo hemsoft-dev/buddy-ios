@@ -541,6 +541,27 @@ final class DashboardViewModelTests: XCTestCase {
         )
     }
 
+    func testGitHubDashboardAccountTimestampUsesNewestSectionRefresh() async {
+        let authoredDate = Date(timeIntervalSince1970: 4_900)
+        let assignedDate = Date(timeIntervalSince1970: 5_000)
+        let clock = MutableTestClock(now: authoredDate)
+        let provider = SectionedPullRequestProvider(
+            authored: [testAccount.id: [.success(collection([]))]],
+            assigned: [testAccount.id: [.success(collection([]))]]
+        )
+        let viewModel = DashboardViewModel(
+            integrations: [],
+            github: provider,
+            now: { clock.now }
+        )
+
+        await viewModel.refresh(account: testAccount, section: .authored)
+        clock.now = assignedDate
+        await viewModel.refresh(account: testAccount, section: .assigned)
+
+        XCTAssertEqual(viewModel.githubRefreshedAt(for: testAccount), assignedDate)
+    }
+
     func testGitHubDashboardBlocksDuplicateInitialRefreshes() async {
         let pullRequest = makePullRequest(id: 1, updatedAt: Date(timeIntervalSince1970: 5_000))
         let provider = SuspendedPullRequestProvider()
@@ -565,6 +586,15 @@ final class DashboardViewModelTests: XCTestCase {
 }
 
 private let testAccount = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+
+@MainActor
+private final class MutableTestClock {
+    var now: Date
+
+    init(now: Date) {
+        self.now = now
+    }
+}
 
 private func makePullRequest(
     id: Int,

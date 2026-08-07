@@ -163,7 +163,7 @@ struct DashboardView: View {
                             .font(.caption)
                             .foregroundStyle(connection.state == .connected ? githubHeaderSummaryColor(for: account) : .orange)
 
-                        if let refreshedAt = viewModel.githubState(for: account).refreshedAt {
+                        if let refreshedAt = viewModel.githubRefreshedAt(for: account) {
                             Text("Updated \(refreshedAt, style: .relative) ago")
                                 .font(.caption2)
                                 .foregroundStyle(.tertiary)

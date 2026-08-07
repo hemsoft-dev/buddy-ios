@@ -282,6 +282,12 @@ final class DashboardViewModel {
         }
     }
 
+    func githubRefreshedAt(for account: GitHubAccount) -> Date? {
+        GitHubPullRequestSection.allCases
+            .compactMap { githubState(for: account, section: $0).refreshedAt }
+            .max()
+    }
+
     func isGitHubRefreshInFlight(for account: GitHubAccount) -> Bool {
         githubRefreshesInFlight.contains { $0.accountID == account.connectedAccountID }
     }
