@@ -514,8 +514,8 @@ actor GitHubWebOAuthService: GitHubOAuthAuthorizing {
         if let error = response.error {
             switch error {
             case "access_denied": throw GitHubOAuthError.accessDenied
-            case "incorrect_client_credentials", "bad_verification_code":
-                throw GitHubOAuthError.invalidConfiguration
+            case "incorrect_client_credentials": throw GitHubOAuthError.invalidConfiguration
+            case "bad_verification_code": throw GitHubOAuthError.authorizationFailed
             default: throw GitHubOAuthError.invalidTokenResponse
             }
         }

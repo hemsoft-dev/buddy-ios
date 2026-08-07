@@ -237,6 +237,47 @@ final class GitHubAPITests: XCTestCase {
         }
     }
 
+    func testTokenExchangeTreatsBadVerificationCodeAsRetryableAuthorizationFailure() async throws {
+        let httpClient = MockHTTPClient(responses: [
+            .success(#"{"error":"bad_verification_code"}"#, statusCode: 200),
+        ])
+        let service = GitHubWebOAuthService(
+            httpClient: httpClient,
+            callbackTimeout: .seconds(15),
+            randomBytes: { count in Data(repeating: UInt8(count), count: count) }
+        )
+        let authorization = try await service.beginAuthorization(
+            configuration: GitHubOAuthConfiguration(clientID: "client", clientSecret: "public-secret")
+        )
+        let authorizationComponents = try XCTUnwrap(
+            URLComponents(url: authorization.authorizationURL, resolvingAgainstBaseURL: false)
+        )
+        let query = Dictionary(
+            uniqueKeysWithValues: (authorizationComponents.queryItems ?? []).compactMap { item in
+                item.value.map { (item.name, $0) }
+            }
+        )
+        var callbackComponents = try XCTUnwrap(
+            URLComponents(string: try XCTUnwrap(query["redirect_uri"]))
+        )
+        callbackComponents.queryItems = [
+            URLQueryItem(name: "code", value: "expired-code"),
+            URLQueryItem(name: "state", value: try XCTUnwrap(query["state"])),
+        ]
+
+        let completion = Task { try await service.completeAuthorization(authorization) }
+        let (_, callbackResponse) = try await URLSession.shared.data(
+            from: try XCTUnwrap(callbackComponents.url)
+        )
+        XCTAssertEqual((callbackResponse as? HTTPURLResponse)?.statusCode, 200)
+        do {
+            _ = try await completion.value
+            XCTFail("Expected a rejected authorization code")
+        } catch let error as GitHubOAuthError {
+            XCTAssertEqual(error, .authorizationFailed)
+        }
+    }
+
     func testAuthenticatedUserUsesBearerTokenAndMapsUnauthorized() async throws {
         let validClient = MockHTTPClient(responses: [
             .success(#"{"id":42,"login":"octocat","name":"The Octocat","avatar_url":"https://avatars.githubusercontent.com/u/42"}"#, statusCode: 200),
