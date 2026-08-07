@@ -92,11 +92,15 @@ struct GitHubView: View {
 
     private var disconnectedContent: some View {
         ContentUnavailableView {
-            Label("Connect GitHub", systemImage: "chevron.left.forwardslash.chevron.right")
+            Label("Choose a GitHub account", systemImage: "chevron.left.forwardslash.chevron.right")
         } description: {
-            Text("Authorize Buddy to read your public GitHub identity. Your access token stays in this device's Keychain.")
+            Text(
+                "GitHub may ask you to sign in before showing its account picker. "
+                    + "It identifies HemSoft as Buddy iOS's publisher, not as an account receiving access. "
+                    + "Buddy requests only your public GitHub identity, and its token stays in this device's Keychain."
+            )
         } actions: {
-            Button("Connect GitHub") {
+            Button("Choose Account in GitHub") {
                 connectPresentedAccount()
             }
             .buttonStyle(.borderedProminent)
@@ -134,7 +138,11 @@ struct GitHubView: View {
             Text("Choose a GitHub account")
                 .font(.headline)
 
-            Text("Complete sign-in in the secure GitHub browser sheet. Buddy will finish connecting when GitHub returns to this device.")
+            Text(
+                "Sign in if needed, then choose an account in GitHub. "
+                    + "GitHub identifies Buddy iOS as the app and HemSoft as its publisher. "
+                    + "Buddy will finish connecting when GitHub returns to this device."
+            )
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
 
