@@ -1635,14 +1635,19 @@ final class GitHubIntegrationTests: XCTestCase {
             sleep: { _ in }
         )
 
-        do {
-            _ = try await integration.restoreAccounts()
-            XCTFail("Expected repository access requirement")
-        } catch let error as GitHubConnectionError {
-            XCTAssertEqual(error, .privateRepositoryAccessRequired)
-        }
+        let restored = try await integration.restoreAccounts()
+        XCTAssertEqual(restored, [
+            GitHubAccountConnection(
+                account: account,
+                state: .needsAttention,
+                message: GitHubConnectionError.privateRepositoryAccessRequired.localizedDescription,
+                recoveryAction: .reconnect
+            ),
+        ])
 
-        let authorization = try await integration.beginAccountAuthorization()
+        let authorization = try await integration.beginAccountAuthorization(
+            reconnecting: account.connectedAccountID
+        )
         let reconnected = try await integration.completeAccountAuthorization(authorization)
 
         XCTAssertEqual(reconnected, GitHubAccountConnection(account: account, state: .connected))
@@ -1674,7 +1679,9 @@ final class GitHubIntegrationTests: XCTestCase {
             credentials: credentials,
             accountStore: accountStore
         )
-        _ = try await integration.restoreAccounts()
+        let restored = try await integration.restoreAccounts()
+        XCTAssertEqual(restored.map(\.id), [account.connectedAccountID])
+        XCTAssertEqual(restored.map(\.state), [.connected])
 
         try await integration.disconnect(accountID: account.connectedAccountID)
 
@@ -1684,6 +1691,40 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertNil(legacyToken)
         XCTAssertNil(scopedToken)
         XCTAssertTrue(records.isEmpty)
+    }
+
+    func testLegacyScopeUpgradeRestoreRoutesDisconnectThroughDiscoveredAccount() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let credentials = MockCredentialStore(initialValue: "public-only-legacy-token")
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(userResults: [
+                .failure(.insufficientOAuthScope),
+                .success(account),
+            ]),
+            credentials: credentials,
+            accountStore: InMemoryConnectedAccountStore()
+        )
+        let viewModel = await MainActor.run { GitHubViewModel(integration: integration) }
+
+        await viewModel.restore()
+
+        let (accounts, stateScope) = await MainActor.run {
+            (viewModel.accounts, viewModel.stateScope)
+        }
+        XCTAssertEqual(accounts.map(\.id), [account.connectedAccountID])
+        XCTAssertEqual(accounts.map(\.state), [.needsAttention])
+        XCTAssertEqual(stateScope, .account(account.connectedAccountID))
+        let view = await MainActor.run {
+            GitHubView(viewModel: viewModel, accountID: account.connectedAccountID)
+        }
+
+        await view.disconnectPresentedAccount()
+
+        let legacyToken = await credentials.stringValue(for: "github.oauth-token")
+        let remainingAccounts = await MainActor.run { viewModel.accounts }
+        XCTAssertNil(legacyToken)
+        XCTAssertTrue(remainingAccounts.isEmpty)
     }
 
     func testScopeUpgradeReconnectPreservesLegacyCredentialForDifferentAccount() async throws {
@@ -1707,20 +1748,24 @@ final class GitHubIntegrationTests: XCTestCase {
             accountStore: accountStore,
             sleep: { _ in }
         )
-        do {
-            _ = try await integration.restoreAccounts()
-            XCTFail("Expected repository access requirement")
-        } catch let error as GitHubConnectionError {
-            XCTAssertEqual(error, .privateRepositoryAccessRequired)
-        }
+        let restored = try await integration.restoreAccounts()
+        XCTAssertEqual(restored.map(\.id), [legacyAccount.connectedAccountID])
+        XCTAssertEqual(restored.map(\.state), [.needsAttention])
 
-        let authorization = try await integration.beginAccountAuthorization()
-        _ = try await integration.completeAccountAuthorization(authorization)
+        let authorization = try await integration.beginAccountAuthorization(
+            reconnecting: legacyAccount.connectedAccountID
+        )
+        do {
+            _ = try await integration.completeAccountAuthorization(authorization)
+            XCTFail("Expected account mismatch")
+        } catch let error as GitHubConnectionError {
+            XCTAssertEqual(error, .accountMismatch)
+        }
 
         let legacyToken = await credentials.stringValue(for: "github.oauth-token")
         let selectedToken = await credentials.stringValue(for: selectedKey)
         XCTAssertEqual(legacyToken, "public-only-legacy-token")
-        XCTAssertEqual(selectedToken, "selected-account-token")
+        XCTAssertNil(selectedToken)
     }
 
     func testCanceledScopeUpgradeReconnectRestoresLegacyCredential() async throws {
@@ -1745,13 +1790,12 @@ final class GitHubIntegrationTests: XCTestCase {
             accountStore: accountStore,
             sleep: { _ in }
         )
-        do {
-            _ = try await integration.restoreAccounts()
-            XCTFail("Expected repository access requirement")
-        } catch let error as GitHubConnectionError {
-            XCTAssertEqual(error, .privateRepositoryAccessRequired)
-        }
-        let authorization = try await integration.beginAccountAuthorization()
+        let restored = try await integration.restoreAccounts()
+        XCTAssertEqual(restored.map(\.id), [account.connectedAccountID])
+        XCTAssertEqual(restored.map(\.state), [.needsAttention])
+        let authorization = try await integration.beginAccountAuthorization(
+            reconnecting: account.connectedAccountID
+        )
         let completion = Task {
             try await integration.completeAccountAuthorization(authorization)
         }

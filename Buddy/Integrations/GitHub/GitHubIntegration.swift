@@ -68,6 +68,7 @@ actor GitHubIntegration: IntegrationProviding {
     private struct LegacyMigrationResult: Sendable {
         let record: ConnectedAccountRecord
         let requiresScopedValidation: Bool
+        let requiresRepositoryScopeUpgrade: Bool
     }
 
     private static let credentialAccount = "github.oauth-token"
@@ -176,7 +177,17 @@ actor GitHubIntegration: IntegrationProviding {
         var connections: [GitHubAccountConnection] = []
         var connectionGenerations: [ConnectedAccountID: Int] = [:]
         if let migrated {
-            if migrated.requiresScopedValidation {
+            if migrated.requiresRepositoryScopeUpgrade {
+                let account = GitHubAccount(record: migrated.record)
+                let connection = GitHubAccountConnection(
+                    account: account,
+                    state: .needsAttention,
+                    message: GitHubConnectionError.privateRepositoryAccessRequired.localizedDescription,
+                    recoveryAction: .reconnect
+                )
+                connections.append(connection)
+                connectionGenerations[connection.id] = accountGenerations[connection.id, default: 0]
+            } else if migrated.requiresScopedValidation {
                 if let connection = await restoreRegisteredAccount(migrated.record) {
                     connections.append(connection)
                     connectionGenerations[connection.id] = accountGenerations[connection.id, default: 0]
@@ -721,8 +732,10 @@ actor GitHubIntegration: IntegrationProviding {
 
         let generationSnapshot = accountGenerations
         let account: GitHubAccount
+        let requiresRepositoryScopeUpgrade: Bool
         do {
             account = try await api.authenticatedUser(token: token)
+            requiresRepositoryScopeUpgrade = false
         } catch GitHubAPIError.unauthorized {
             do {
                 try await removeLegacyCredential(ifMatches: legacyData)
@@ -731,9 +744,9 @@ actor GitHubIntegration: IntegrationProviding {
             }
             return nil
         } catch GitHubAPIError.insufficientOAuthScope {
-            let account: GitHubAccount
+            let migrationAccount: GitHubAccount
             do {
-                account = try await api.authenticatedUserForCredentialMigration(token: token)
+                migrationAccount = try await api.authenticatedUserForCredentialMigration(token: token)
             } catch GitHubAPIError.unauthorized {
                 do {
                     try await removeLegacyCredential(ifMatches: legacyData)
@@ -746,15 +759,18 @@ actor GitHubIntegration: IntegrationProviding {
             }
             legacyCredentialState = .scopeUpgradeRequired(
                 legacyData,
-                account.connectedAccountID
+                migrationAccount.connectedAccountID
             )
-            throw GitHubConnectionError.privateRepositoryAccessRequired
+            account = migrationAccount
+            requiresRepositoryScopeUpgrade = true
         } catch {
             throw map(error)
         }
 
         let accountID = account.connectedAccountID
-        legacyCredentialState = .owned(legacyData, accountID)
+        if !requiresRepositoryScopeUpgrade {
+            legacyCredentialState = .owned(legacyData, accountID)
+        }
         let generation = generationSnapshot[accountID, default: 0]
         guard generation == accountGenerations[accountID, default: 0] else {
             if accountMutationIntents[accountID] == .disconnect {
@@ -792,7 +808,19 @@ actor GitHubIntegration: IntegrationProviding {
                 }
             }
             try? await removeLegacyCredential(ifMatches: legacyData)
-            return LegacyMigrationResult(record: record, requiresScopedValidation: true)
+            return LegacyMigrationResult(
+                record: record,
+                requiresScopedValidation: true,
+                requiresRepositoryScopeUpgrade: false
+            )
+        }
+
+        if requiresRepositoryScopeUpgrade {
+            return LegacyMigrationResult(
+                record: account.connectedAccountRecord,
+                requiresScopedValidation: false,
+                requiresRepositoryScopeUpgrade: true
+            )
         }
 
         do {
@@ -829,7 +857,8 @@ actor GitHubIntegration: IntegrationProviding {
         }
         return LegacyMigrationResult(
             record: account.connectedAccountRecord,
-            requiresScopedValidation: false
+            requiresScopedValidation: false,
+            requiresRepositoryScopeUpgrade: false
         )
     }
 
