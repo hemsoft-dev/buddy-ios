@@ -178,14 +178,19 @@ final class GitHubIntegrationTests: XCTestCase {
         let reconnectedAccount = try await integration.completeAuthorization(authorization)
         XCTAssertEqual(reconnectedAccount, account)
 
-        let restoredAccount = try await integration.restoreAccount()
-        XCTAssertEqual(restoredAccount, account)
+        let restoredAccounts = try await integration.restoreAccounts()
+        XCTAssertEqual(
+            restoredAccounts,
+            [GitHubAccountConnection(account: account, state: .connected)]
+        )
 
         await api.finishOldValidation()
         let oldAccount = try await oldRestoration.value
         XCTAssertNil(oldAccount)
 
-        let credentialValue = await credentials.stringValue()
+        let credentialValue = await credentials.stringValue(
+            for: GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        )
         XCTAssertEqual(credentialValue, "new-token")
         XCTAssertEqual(integration.summary.connectionState, .connected)
     }
@@ -284,41 +289,6 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(integration.summary.connectionState, .disconnected)
     }
 
-    func testPollingSleepIsCappedAtAuthorizationExpiration() async throws {
-        let authorization = GitHubDeviceAuthorization(
-            deviceCode: "device-code",
-            userCode: "ABCD-EFGH",
-            verificationURI: URL(string: "https://github.com/login/device")!,
-            expiresIn: 1,
-            interval: 30
-        )
-        let api = StubGitHubAPI(deviceResults: [.success(authorization)])
-        let recorder = SleepRecorder()
-        let integration = GitHubIntegration(
-            clientID: "client-id",
-            api: api,
-            credentials: MockCredentialStore(),
-            sleep: { duration in
-                try await recorder.recordAndSleep(duration)
-            }
-        )
-        let startedAuthorization = try await integration.beginAuthorization()
-
-        do {
-            _ = try await integration.completeAuthorization(startedAuthorization)
-            XCTFail("Expected expiration")
-        } catch let error as GitHubConnectionError {
-            XCTAssertEqual(error, .requestExpired)
-        }
-
-        let duration = await recorder.duration()
-        let pollCount = await api.pollRequestCount()
-        XCTAssertNotNil(duration)
-        XCTAssertGreaterThan(duration ?? .zero, .zero)
-        XCTAssertLessThanOrEqual(duration ?? .seconds(2), .seconds(1))
-        XCTAssertEqual(pollCount, 0)
-    }
-
     func testCancellationDuringCredentialPersistenceRemovesNewToken() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let api = StubGitHubAPI(
@@ -387,7 +357,7 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(integration.summary.connectionState, .needsAttention)
     }
 
-    func testSupersededCredentialPersistenceFailureDoesNotPublishNeedsAttention() async throws {
+    func testCanceledAuthorizationPersistenceFailureDoesNotPublishNeedsAttention() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let api = StubGitHubAPI(
             deviceResults: [.success(testAuthorization)],
@@ -411,14 +381,14 @@ final class GitHubIntegrationTests: XCTestCase {
         }
         XCTAssertTrue(persistenceStarted)
 
-        try await integration.disconnect()
+        await integration.cancelAccountAuthorization(authorization)
         await credentials.finishSet()
 
         do {
             _ = try await completion.value
             XCTFail("Expected cancellation")
         } catch is CancellationError {
-            // Expected: the disconnect superseded the failed persistence operation.
+            // Expected: explicit authorization cancellation superseded persistence.
         }
 
         XCTAssertEqual(integration.summary.connectionState, .disconnected)
@@ -922,7 +892,7 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(accounts, [GitHubAccountConnection(account: account, state: .connected)])
     }
 
-    func testDuplicateAddAdvancesResolvedAccountDashboardRevision() async throws {
+    func testDuplicateAddShowsExplicitMessageWithoutMutatingExistingAccount() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
         let api = StubGitHubAPI(
@@ -930,10 +900,11 @@ final class GitHubIntegrationTests: XCTestCase {
             pollResults: [.success(.authorized(token: "replacement-token"))],
             userResults: [.success(account), .success(account)]
         )
+        let credentials = MockCredentialStore(values: [credentialAccount: "stored-token"])
         let integration = GitHubIntegration(
             clientID: "client-id",
             api: api,
-            credentials: MockCredentialStore(values: [credentialAccount: "stored-token"]),
+            credentials: credentials,
             accountStore: InMemoryConnectedAccountStore(records: [account.connectedAccountRecord]),
             sleep: { _ in }
         )
@@ -959,8 +930,15 @@ final class GitHubIntegrationTests: XCTestCase {
             viewModel.dashboardRefreshRevision(for: account.connectedAccountID)
         }
         let accounts = await MainActor.run { viewModel.accounts }
-        XCTAssertEqual(revision, 1)
+        XCTAssertEqual(revision, 0)
         XCTAssertEqual(accounts, [GitHubAccountConnection(account: account, state: .connected)])
+        let state = await MainActor.run { viewModel.state }
+        XCTAssertEqual(
+            state,
+            .needsAttention(GitHubConnectionError.duplicateAccount.localizedDescription)
+        )
+        let storedToken = await credentials.stringValue(for: credentialAccount)
+        XCTAssertEqual(storedToken, "stored-token")
     }
 
     func testFailedReconnectPreservesPreviouslyHealthyAccount() async throws {
@@ -1286,7 +1264,7 @@ final class GitHubIntegrationTests: XCTestCase {
 
         let authorizingState = await MainActor.run { viewModel.state }
         XCTAssertEqual(authorizingState, .authorizing(testAuthorization))
-        XCTAssertEqual(openedURLs.values, [testAuthorization.verificationURI])
+        XCTAssertEqual(openedURLs.values, [testAuthorization.authorizationURL])
 
         await api.finishPoll()
         let connectionFinished = try await waitUntil {
@@ -1372,12 +1350,9 @@ final class GitHubIntegrationTests: XCTestCase {
         let first = GitHubAccount(id: 7, login: "franz", name: "Franz", avatarURL: nil)
         let second = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let firstAuthorization = testAuthorization
-        let secondAuthorization = GitHubDeviceAuthorization(
-            deviceCode: "second-device-code",
-            userCode: "IJKL-MNOP",
-            verificationURI: testAuthorization.verificationURI,
-            expiresIn: 900,
-            interval: 5
+        let secondAuthorization = GitHubBrowserAuthorization(
+            id: UUID(),
+            authorizationURL: testAuthorization.authorizationURL
         )
         let api = StubGitHubAPI(
             deviceResults: [.success(firstAuthorization), .success(secondAuthorization)],
@@ -2382,12 +2357,9 @@ final class GitHubIntegrationTests: XCTestCase {
         let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
         let credentials = MockCredentialStore()
         let accountStore = SuspendedSuccessfulUpsertConnectedAccountStore()
-        let secondAuthorization = GitHubDeviceAuthorization(
-            deviceCode: "second-device-code",
-            userCode: "IJKL-MNOP",
-            verificationURI: testAuthorization.verificationURI,
-            expiresIn: 900,
-            interval: 5
+        let secondAuthorization = GitHubBrowserAuthorization(
+            id: UUID(),
+            authorizationURL: testAuthorization.authorizationURL
         )
         let integration = GitHubIntegration(
             clientID: "client-id",
@@ -2435,12 +2407,9 @@ final class GitHubIntegrationTests: XCTestCase {
         let accountStore = FailFirstUpsertConnectedAccountStore(
             records: [original.connectedAccountRecord]
         )
-        let secondAuthorization = GitHubDeviceAuthorization(
-            deviceCode: "second-device-code",
-            userCode: "IJKL-MNOP",
-            verificationURI: testAuthorization.verificationURI,
-            expiresIn: 900,
-            interval: 5
+        let secondAuthorization = GitHubBrowserAuthorization(
+            id: UUID(),
+            authorizationURL: testAuthorization.authorizationURL
         )
         let integration = GitHubIntegration(
             clientID: "client-id",
@@ -2487,12 +2456,9 @@ final class GitHubIntegrationTests: XCTestCase {
         let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
         let credentials = MockCredentialStore()
         let accountStore = SuspendedFailingUpsertConnectedAccountStore()
-        let secondAuthorization = GitHubDeviceAuthorization(
-            deviceCode: "second-device-code",
-            userCode: "IJKL-MNOP",
-            verificationURI: testAuthorization.verificationURI,
-            expiresIn: 900,
-            interval: 5
+        let secondAuthorization = GitHubBrowserAuthorization(
+            id: UUID(),
+            authorizationURL: testAuthorization.authorizationURL
         )
         let integration = GitHubIntegration(
             clientID: "client-id",
@@ -3309,12 +3275,9 @@ private actor SleepRecorder {
     }
 }
 
-private let testAuthorization = GitHubDeviceAuthorization(
-    deviceCode: "device-code",
-    userCode: "ABCD-EFGH",
-    verificationURI: URL(string: "https://github.com/login/device")!,
-    expiresIn: 900,
-    interval: 5
+private let testAuthorization = GitHubBrowserAuthorization(
+    id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+    authorizationURL: URL(string: "https://github.com/login/oauth/authorize")!
 )
 
 private struct PullRequestRequest: Equatable, Sendable {
@@ -3322,8 +3285,14 @@ private struct PullRequestRequest: Equatable, Sendable {
     let token: String
 }
 
-private actor StubGitHubAPI: GitHubAPIProviding {
-    private var deviceResults: [Result<GitHubDeviceAuthorization, GitHubAPIError>]
+private enum GitHubTokenPollResult: Equatable, Sendable {
+    case pending
+    case slowDown(interval: Int?)
+    case authorized(token: String)
+}
+
+private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
+    private var deviceResults: [Result<GitHubBrowserAuthorization, GitHubAPIError>]
     private var pollResults: [Result<GitHubTokenPollResult, GitHubAPIError>]
     private var userResults: [Result<GitHubAccount, GitHubAPIError>]
     private var pullRequestResults: [Result<GitHubPullRequestCollection, GitHubAPIError>]
@@ -3335,7 +3304,7 @@ private actor StubGitHubAPI: GitHubAPIProviding {
     private var capturedPollRequestCount = 0
 
     init(
-        deviceResults: [Result<GitHubDeviceAuthorization, GitHubAPIError>] = [],
+        deviceResults: [Result<GitHubBrowserAuthorization, GitHubAPIError>] = [],
         pollResults: [Result<GitHubTokenPollResult, GitHubAPIError>] = [],
         userResults: [Result<GitHubAccount, GitHubAPIError>] = [],
         pullRequestResults: [Result<GitHubPullRequestCollection, GitHubAPIError>] = [],
@@ -3348,15 +3317,25 @@ private actor StubGitHubAPI: GitHubAPIProviding {
         self.assignedPullRequestResults = assignedPullRequestResults
     }
 
-    func requestDeviceAuthorization(clientID: String) throws -> GitHubDeviceAuthorization {
+    func beginAuthorization(configuration: GitHubOAuthConfiguration) throws -> GitHubBrowserAuthorization {
         capturedDeviceRequestCount += 1
         return try deviceResults.removeFirst().get()
     }
 
-    func pollForAccessToken(clientID: String, deviceCode: String) throws -> GitHubTokenPollResult {
-        capturedPollRequestCount += 1
-        return try pollResults.removeFirst().get()
+    func completeAuthorization(_ authorization: GitHubBrowserAuthorization) throws -> String {
+        while !pollResults.isEmpty {
+            capturedPollRequestCount += 1
+            switch try pollResults.removeFirst().get() {
+            case .pending, .slowDown:
+                continue
+            case let .authorized(token):
+                return token
+            }
+        }
+        throw GitHubAPIError.malformedResponse
     }
+
+    func cancelAuthorization(_ authorization: GitHubBrowserAuthorization) {}
 
     func authenticatedUser(token: String) throws -> GitHubAccount {
         capturedUserTokens.append(token)
@@ -3394,7 +3373,7 @@ private actor StubGitHubAPI: GitHubAPIProviding {
     }
 }
 
-private actor RefreshThenReconnectGitHubAPI: GitHubAPIProviding {
+private actor RefreshThenReconnectGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
     private let account: GitHubAccount
     private var refreshStartedWaiter: CheckedContinuation<Void, Never>?
     private var refreshCompletion: CheckedContinuation<Void, Never>?
@@ -3403,13 +3382,15 @@ private actor RefreshThenReconnectGitHubAPI: GitHubAPIProviding {
         self.account = account
     }
 
-    func requestDeviceAuthorization(clientID: String) -> GitHubDeviceAuthorization {
+    func beginAuthorization(configuration: GitHubOAuthConfiguration) -> GitHubBrowserAuthorization {
         testAuthorization
     }
 
-    func pollForAccessToken(clientID: String, deviceCode: String) -> GitHubTokenPollResult {
-        .authorized(token: "new-token")
+    func completeAuthorization(_ authorization: GitHubBrowserAuthorization) -> String {
+        "new-token"
     }
+
+    func cancelAuthorization(_ authorization: GitHubBrowserAuthorization) {}
 
     func authenticatedUser(token: String) -> GitHubAccount {
         account
@@ -3567,14 +3548,6 @@ private actor SuspendedUserGitHubAPI: GitHubAPIProviding {
         self.account = account
     }
 
-    func requestDeviceAuthorization(clientID: String) throws -> GitHubDeviceAuthorization {
-        throw GitHubAPIError.malformedResponse
-    }
-
-    func pollForAccessToken(clientID: String, deviceCode: String) throws -> GitHubTokenPollResult {
-        throw GitHubAPIError.malformedResponse
-    }
-
     func authenticatedUser(token: String) async -> GitHubAccount {
         userRequestWaiter?.resume()
         userRequestWaiter = nil
@@ -3599,7 +3572,7 @@ private actor SuspendedUserGitHubAPI: GitHubAPIProviding {
     }
 }
 
-private actor SuspendedAuthorizationUserGitHubAPI: GitHubAPIProviding {
+private actor SuspendedAuthorizationUserGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
     private let account: GitHubAccount
     private var userRequestWaiter: CheckedContinuation<Void, Never>?
     private var userRequestCompletion: CheckedContinuation<Void, Never>?
@@ -3608,13 +3581,15 @@ private actor SuspendedAuthorizationUserGitHubAPI: GitHubAPIProviding {
         self.account = account
     }
 
-    func requestDeviceAuthorization(clientID: String) -> GitHubDeviceAuthorization {
+    func beginAuthorization(configuration: GitHubOAuthConfiguration) -> GitHubBrowserAuthorization {
         testAuthorization
     }
 
-    func pollForAccessToken(clientID: String, deviceCode: String) -> GitHubTokenPollResult {
-        .authorized(token: "new-token")
+    func completeAuthorization(_ authorization: GitHubBrowserAuthorization) -> String {
+        "new-token"
     }
+
+    func cancelAuthorization(_ authorization: GitHubBrowserAuthorization) {}
 
     func authenticatedUser(token: String) async -> GitHubAccount {
         userRequestWaiter?.resume()
@@ -3638,7 +3613,7 @@ private actor SuspendedAuthorizationUserGitHubAPI: GitHubAPIProviding {
     }
 }
 
-private actor ReconnectionGitHubAPI: GitHubAPIProviding {
+private actor ReconnectionGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
     private let account: GitHubAccount
     private var oldValidationWaiter: CheckedContinuation<Void, Never>?
     private var oldValidationCompletion: CheckedContinuation<Void, Never>?
@@ -3647,13 +3622,15 @@ private actor ReconnectionGitHubAPI: GitHubAPIProviding {
         self.account = account
     }
 
-    func requestDeviceAuthorization(clientID: String) -> GitHubDeviceAuthorization {
+    func beginAuthorization(configuration: GitHubOAuthConfiguration) -> GitHubBrowserAuthorization {
         testAuthorization
     }
 
-    func pollForAccessToken(clientID: String, deviceCode: String) -> GitHubTokenPollResult {
-        .authorized(token: "new-token")
+    func completeAuthorization(_ authorization: GitHubBrowserAuthorization) -> String {
+        "new-token"
     }
+
+    func cancelAuthorization(_ authorization: GitHubBrowserAuthorization) {}
 
     func authenticatedUser(token: String) async -> GitHubAccount {
         guard token == "old-token" else { return account }
@@ -3682,14 +3659,6 @@ private actor ReconnectionGitHubAPI: GitHubAPIProviding {
 private actor SequencedSuspendedUserGitHubAPI: GitHubAPIProviding {
     private var requestCompletions: [CheckedContinuation<Result<GitHubAccount, GitHubAPIError>, Never>?] = []
     private var requestWaiters: [Int: CheckedContinuation<Void, Never>] = [:]
-
-    func requestDeviceAuthorization(clientID: String) throws -> GitHubDeviceAuthorization {
-        throw GitHubAPIError.malformedResponse
-    }
-
-    func pollForAccessToken(clientID: String, deviceCode: String) throws -> GitHubTokenPollResult {
-        throw GitHubAPIError.malformedResponse
-    }
 
     func authenticatedUser(token: String) async throws -> GitHubAccount {
         let requestIndex = requestCompletions.count
@@ -3786,11 +3755,11 @@ private actor SuspendedRemovalCredentialStore: CredentialStoring {
     }
 }
 
-private actor SuspendedAuthorizationAPI: GitHubAPIProviding {
+private actor SuspendedAuthorizationAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
     private var didStartAuthorization = false
     private var authorizationCompletion: CheckedContinuation<Void, Never>?
 
-    func requestDeviceAuthorization(clientID: String) async -> GitHubDeviceAuthorization {
+    func beginAuthorization(configuration: GitHubOAuthConfiguration) async -> GitHubBrowserAuthorization {
         didStartAuthorization = true
         await withCheckedContinuation { continuation in
             authorizationCompletion = continuation
@@ -3798,9 +3767,11 @@ private actor SuspendedAuthorizationAPI: GitHubAPIProviding {
         return testAuthorization
     }
 
-    func pollForAccessToken(clientID: String, deviceCode: String) -> GitHubTokenPollResult {
-        .pending
+    func completeAuthorization(_ authorization: GitHubBrowserAuthorization) throws -> String {
+        throw CancellationError()
     }
+
+    func cancelAuthorization(_ authorization: GitHubBrowserAuthorization) {}
 
     func authenticatedUser(token: String) -> GitHubAccount {
         GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
@@ -3816,7 +3787,7 @@ private actor SuspendedAuthorizationAPI: GitHubAPIProviding {
     }
 }
 
-private actor ValidationRetryDuringAuthorizationGitHubAPI: GitHubAPIProviding {
+private actor ValidationRetryDuringAuthorizationGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
     private let reconnectingAccount: GitHubAccount
     private var capturedUserTokens: [String] = []
     private var pollStartedWaiter: CheckedContinuation<Void, Never>?
@@ -3826,18 +3797,20 @@ private actor ValidationRetryDuringAuthorizationGitHubAPI: GitHubAPIProviding {
         self.reconnectingAccount = reconnectingAccount
     }
 
-    func requestDeviceAuthorization(clientID: String) -> GitHubDeviceAuthorization {
+    func beginAuthorization(configuration: GitHubOAuthConfiguration) -> GitHubBrowserAuthorization {
         testAuthorization
     }
 
-    func pollForAccessToken(clientID: String, deviceCode: String) async -> GitHubTokenPollResult {
+    func completeAuthorization(_ authorization: GitHubBrowserAuthorization) async -> String {
         pollStartedWaiter?.resume()
         pollStartedWaiter = nil
         await withCheckedContinuation { continuation in
             pollCompletion = continuation
         }
-        return .authorized(token: "new-token")
+        return "new-token"
     }
+
+    func cancelAuthorization(_ authorization: GitHubBrowserAuthorization) {}
 
     func authenticatedUser(token: String) throws -> GitHubAccount {
         capturedUserTokens.append(token)
@@ -3868,7 +3841,7 @@ private actor ValidationRetryDuringAuthorizationGitHubAPI: GitHubAPIProviding {
     }
 }
 
-private actor SuspendedPollingGitHubAPI: GitHubAPIProviding {
+private actor SuspendedPollingGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
     private let account: GitHubAccount
     private var didStartPoll = false
     private var pollCompletion: CheckedContinuation<Void, Never>?
@@ -3877,17 +3850,19 @@ private actor SuspendedPollingGitHubAPI: GitHubAPIProviding {
         self.account = account
     }
 
-    func requestDeviceAuthorization(clientID: String) -> GitHubDeviceAuthorization {
+    func beginAuthorization(configuration: GitHubOAuthConfiguration) -> GitHubBrowserAuthorization {
         testAuthorization
     }
 
-    func pollForAccessToken(clientID: String, deviceCode: String) async -> GitHubTokenPollResult {
+    func completeAuthorization(_ authorization: GitHubBrowserAuthorization) async -> String {
         didStartPoll = true
         await withCheckedContinuation { continuation in
             pollCompletion = continuation
         }
-        return .authorized(token: "new-token")
+        return "new-token"
     }
+
+    func cancelAuthorization(_ authorization: GitHubBrowserAuthorization) {}
 
     func authenticatedUser(token: String) -> GitHubAccount {
         account
@@ -3903,7 +3878,7 @@ private actor SuspendedPollingGitHubAPI: GitHubAPIProviding {
     }
 }
 
-private actor MultiAccountSuspendedPollingGitHubAPI: GitHubAPIProviding {
+private actor MultiAccountSuspendedPollingGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
     private let first: GitHubAccount
     private let second: GitHubAccount
     private var pollStartedWaiter: CheckedContinuation<Void, Never>?
@@ -3914,18 +3889,20 @@ private actor MultiAccountSuspendedPollingGitHubAPI: GitHubAPIProviding {
         self.second = second
     }
 
-    func requestDeviceAuthorization(clientID: String) -> GitHubDeviceAuthorization {
+    func beginAuthorization(configuration: GitHubOAuthConfiguration) -> GitHubBrowserAuthorization {
         testAuthorization
     }
 
-    func pollForAccessToken(clientID: String, deviceCode: String) async -> GitHubTokenPollResult {
+    func completeAuthorization(_ authorization: GitHubBrowserAuthorization) async -> String {
         pollStartedWaiter?.resume()
         pollStartedWaiter = nil
         await withCheckedContinuation { continuation in
             pollCompletion = continuation
         }
-        return .authorized(token: "new-first-token")
+        return "new-first-token"
     }
+
+    func cancelAuthorization(_ authorization: GitHubBrowserAuthorization) {}
 
     func authenticatedUser(token: String) throws -> GitHubAccount {
         switch token {
