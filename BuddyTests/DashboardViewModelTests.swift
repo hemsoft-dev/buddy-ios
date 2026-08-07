@@ -465,6 +465,24 @@ final class DashboardViewModelTests: XCTestCase {
         )
     }
 
+    func testGitHubDashboardPrioritizesRepositoryAccessAcrossSectionFailures() async {
+        let provider = SectionedPullRequestProvider(
+            authored: [testAccount.id: [.failure(.networkUnavailable)]],
+            assigned: [testAccount.id: [.failure(.privateRepositoryAccessRequired)]]
+        )
+        let viewModel = DashboardViewModel(integrations: [], github: provider)
+
+        let failure = await viewModel.refresh(account: testAccount)
+
+        XCTAssertEqual(failure, .repositoryAccessRequired)
+        for section in GitHubPullRequestSection.allCases {
+            XCTAssertEqual(
+                viewModel.githubState(for: testAccount, section: section),
+                .failed([], refreshedAt: nil, .repositoryAccessRequired)
+            )
+        }
+    }
+
     func testGitHubDashboardSurfacesIncompleteSearchAsRetryableFailure() async {
         let provider = StubPullRequestProvider(results: [.failure(.incompleteResults)])
         let viewModel = DashboardViewModel(integrations: [], github: provider)

@@ -355,20 +355,28 @@ final class DashboardViewModel {
         async let authoredFailure = refresh(account: account, section: .authored)
         async let assignedFailure = refresh(account: account, section: .assigned)
         let failures = await [authoredFailure, assignedFailure].compactMap { $0 }
+        let recoveryFailure: GitHubPullRequestFailure?
         if failures.contains(.authenticationRequired) {
+            recoveryFailure = .authenticationRequired
+        } else if failures.contains(.repositoryAccessRequired) {
+            recoveryFailure = .repositoryAccessRequired
+        } else {
+            recoveryFailure = nil
+        }
+        if let recoveryFailure {
             for section in GitHubPullRequestSection.allCases {
                 let state = githubState(for: account, section: section)
                 setGitHubState(
                     .failed(
                         state.pullRequests,
                         refreshedAt: state.refreshedAt,
-                        .authenticationRequired
+                        recoveryFailure
                     ),
                     for: account.connectedAccountID,
                     section: section
                 )
             }
-            return .authenticationRequired
+            return recoveryFailure
         }
         return failures.first
     }
