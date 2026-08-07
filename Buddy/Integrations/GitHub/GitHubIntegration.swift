@@ -342,10 +342,22 @@ actor GitHubIntegration: IntegrationProviding {
                 }
                 if Task.isCancelled || !accountAuthorizations.keys.contains(authorization.id) {
                     if accountGenerations[accountID, default: 0] == accountGeneration {
-                        _ = try? await credentials.removeData(
-                            for: credentialAccount,
-                            ifMatches: writtenToken
+                        let rolledBack = await rollbackAccountWrite(
+                            id: accountID,
+                            previousToken: previousToken,
+                            previousRecord: previousRecord,
+                            writtenToken: writtenToken,
+                            writtenRecord: account.connectedAccountRecord,
+                            generation: accountGeneration
                         )
+                        var tokenWasNeverChanged = false
+                        if !rolledBack {
+                            tokenWasNeverChanged = (try? await credentials.data(for: credentialAccount))
+                                == previousToken
+                        }
+                        guard rolledBack || tokenWasNeverChanged else {
+                            throw GitHubConnectionError.credentialStorage
+                        }
                     } else {
                         await discardSupersededAccountWrite(
                             id: accountID,

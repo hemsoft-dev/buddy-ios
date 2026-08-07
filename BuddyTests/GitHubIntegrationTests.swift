@@ -395,6 +395,48 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(integration.summary.detail, "Ready to connect")
     }
 
+    func testCanceledReconnectRestoresPreviousTokenWhenAccountWriteFails() async throws {
+        let original = GitHubAccount(id: 42, login: "original", name: nil, avatarURL: nil)
+        let refreshed = GitHubAccount(id: 42, login: "refreshed", name: nil, avatarURL: nil)
+        let credentialAccount = GitHubIntegration.credentialAccount(for: original.connectedAccountID)
+        let credentials = MockCredentialStore(values: [credentialAccount: "old-token"])
+        let accountStore = SuspendedFailingUpsertConnectedAccountStore(
+            records: [original.connectedAccountRecord]
+        )
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(
+                deviceResults: [.success(testAuthorization)],
+                pollResults: [.success(.authorized(token: "new-token"))],
+                userResults: [.success(refreshed)]
+            ),
+            credentials: credentials,
+            accountStore: accountStore,
+            sleep: { _ in }
+        )
+        let authorization = try await integration.beginAccountAuthorization(
+            reconnecting: original.connectedAccountID
+        )
+        let completion = Task {
+            try await integration.completeAccountAuthorization(authorization)
+        }
+        await accountStore.waitUntilUpsertBegins()
+
+        await integration.cancelAccountAuthorization(authorization)
+        await accountStore.finishUpsert()
+
+        do {
+            _ = try await completion.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let storedToken = await credentials.stringValue(for: credentialAccount)
+        let storedAccounts = await accountStore.accounts(for: .github)
+        XCTAssertEqual(storedToken, "old-token")
+        XCTAssertEqual(storedAccounts, [original.connectedAccountRecord])
+    }
+
     func testDisconnectPreventsStaleValidationFromRestoringConnectedState() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let api = SuspendedUserGitHubAPI(account: account)
@@ -3112,6 +3154,10 @@ private actor SuspendedFailingUpsertConnectedAccountStore: ConnectedAccountStori
     private var records: [ConnectedAccountRecord] = []
     private var upsertStartedWaiter: CheckedContinuation<Void, Never>?
     private var upsertCompletion: CheckedContinuation<Void, Never>?
+
+    init(records: [ConnectedAccountRecord] = []) {
+        self.records = records
+    }
 
     func accounts(for provider: IntegrationProvider) -> [ConnectedAccountRecord] {
         records.filter { $0.id.provider == provider }.sorted { $0.id < $1.id }
