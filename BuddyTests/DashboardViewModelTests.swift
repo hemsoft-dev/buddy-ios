@@ -149,15 +149,27 @@ final class DashboardViewModelTests: XCTestCase {
         )
     }
 
-    func testAssignedEmptyStateDisclosesPublicRepositoryLimit() {
+    func testPullRequestAccountHeaderTreatsRepositoryAccessAsReconnectRequired() {
+        XCTAssertEqual(
+            DashboardGitHubPullRequestCopy.accountHeaderSummary(
+                authoredState: .failed([], refreshedAt: nil, .repositoryAccessRequired),
+                authoredTotal: 0,
+                assignedState: .loaded([], refreshedAt: Date(timeIntervalSince1970: 100)),
+                assignedTotal: 0
+            ),
+            "Reconnect required · 0 authored · 0 assigned"
+        )
+    }
+
+    func testAssignedEmptyStateCoversPublicAndPrivateRepositories() {
         let description = DashboardGitHubPullRequestCopy.emptyStateDescription(
             login: "octocat",
             section: .assigned
         )
 
-        XCTAssertTrue(description.contains("No public open pull requests"))
+        XCTAssertTrue(description.contains("No open pull requests"))
         XCTAssertTrue(description.contains("@octocat"))
-        XCTAssertTrue(description.contains("limited to public repositories"))
+        XCTAssertFalse(description.contains("public repositories"))
     }
 
     func testPullRequestTreeExpansionSurvivesRefreshForExistingRepositories() {
@@ -420,6 +432,20 @@ final class DashboardViewModelTests: XCTestCase {
         )
     }
 
+    func testGitHubDashboardMapsMissingPrivateRepositoryScopeToReconnect() async {
+        let provider = StubPullRequestProvider(results: [.failure(.privateRepositoryAccessRequired)])
+        let viewModel = DashboardViewModel(integrations: [], github: provider)
+
+        let failure = await viewModel.refresh(account: testAccount)
+
+        XCTAssertEqual(failure, .repositoryAccessRequired)
+        XCTAssertEqual(
+            viewModel.githubState,
+            .failed([], refreshedAt: nil, .repositoryAccessRequired)
+        )
+        XCTAssertTrue(GitHubPullRequestFailure.repositoryAccessRequired.message.contains("approve repository access"))
+    }
+
     func testGitHubDashboardPropagatesAuthenticationFailureToCanceledSiblingSection() async {
         let viewModel = DashboardViewModel(
             integrations: [],
@@ -437,6 +463,24 @@ final class DashboardViewModelTests: XCTestCase {
             viewModel.githubState(for: testAccount, section: .assigned),
             .failed([], refreshedAt: nil, .authenticationRequired)
         )
+    }
+
+    func testGitHubDashboardPrioritizesRepositoryAccessAcrossSectionFailures() async {
+        let provider = SectionedPullRequestProvider(
+            authored: [testAccount.id: [.failure(.networkUnavailable)]],
+            assigned: [testAccount.id: [.failure(.privateRepositoryAccessRequired)]]
+        )
+        let viewModel = DashboardViewModel(integrations: [], github: provider)
+
+        let failure = await viewModel.refresh(account: testAccount)
+
+        XCTAssertEqual(failure, .repositoryAccessRequired)
+        for section in GitHubPullRequestSection.allCases {
+            XCTAssertEqual(
+                viewModel.githubState(for: testAccount, section: section),
+                .failed([], refreshedAt: nil, .repositoryAccessRequired)
+            )
+        }
     }
 
     func testGitHubDashboardSurfacesIncompleteSearchAsRetryableFailure() async {

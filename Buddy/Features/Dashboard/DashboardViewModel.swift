@@ -20,9 +20,9 @@ enum DashboardGitHubPullRequestCopy {
     ) -> String {
         switch section {
         case .authored:
-            "@\(login) has no public authored pull requests open right now. Buddy's current GitHub authorization is limited to public repositories."
+            "@\(login) has no authored pull requests open right now."
         case .assigned:
-            "No public open pull requests currently request a review from @\(login). Buddy's current GitHub authorization is limited to public repositories."
+            "No open pull requests currently request a review from @\(login)."
         }
     }
 
@@ -50,7 +50,7 @@ enum DashboardGitHubPullRequestCopy {
             assignedTotal: assignedTotal
         )
         if states.contains(where: {
-            if case .failed(_, _, .authenticationRequired) = $0 { return true }
+            if case let .failed(_, _, failure) = $0 { return failure.requiresReconnect }
             return false
         }) {
             return "Reconnect required · \(result)"
@@ -83,6 +83,7 @@ enum DashboardGitHubPullRequestCopy {
 
 enum GitHubPullRequestFailure: Equatable, Sendable {
     case authenticationRequired
+    case repositoryAccessRequired
     case offline
     case rateLimited
     case incompleteResults
@@ -95,6 +96,8 @@ enum GitHubPullRequestFailure: Equatable, Sendable {
         switch self {
         case .authenticationRequired:
             "GitHub authorization expired. Reconnect the account in Settings."
+        case .repositoryAccessRequired:
+            "Buddy needs GitHub repository access to show private pull requests. Reconnect the account and approve repository access."
         case .offline:
             "Buddy is offline. Previously loaded pull requests remain available."
         case .rateLimited:
@@ -110,6 +113,10 @@ enum GitHubPullRequestFailure: Equatable, Sendable {
         case .unknown:
             "Pull requests couldn't be refreshed. Try again."
         }
+    }
+
+    var requiresReconnect: Bool {
+        self == .authenticationRequired || self == .repositoryAccessRequired
     }
 }
 
@@ -348,20 +355,28 @@ final class DashboardViewModel {
         async let authoredFailure = refresh(account: account, section: .authored)
         async let assignedFailure = refresh(account: account, section: .assigned)
         let failures = await [authoredFailure, assignedFailure].compactMap { $0 }
+        let recoveryFailure: GitHubPullRequestFailure?
         if failures.contains(.authenticationRequired) {
+            recoveryFailure = .authenticationRequired
+        } else if failures.contains(.repositoryAccessRequired) {
+            recoveryFailure = .repositoryAccessRequired
+        } else {
+            recoveryFailure = nil
+        }
+        if let recoveryFailure {
             for section in GitHubPullRequestSection.allCases {
                 let state = githubState(for: account, section: section)
                 setGitHubState(
                     .failed(
                         state.pullRequests,
                         refreshedAt: state.refreshedAt,
-                        .authenticationRequired
+                        recoveryFailure
                     ),
                     for: account.connectedAccountID,
                     section: section
                 )
             }
-            return .authenticationRequired
+            return recoveryFailure
         }
         return failures.first
     }
@@ -492,6 +507,8 @@ final class DashboardViewModel {
         return switch error {
         case .invalidToken:
             .authenticationRequired
+        case .privateRepositoryAccessRequired:
+            .repositoryAccessRequired
         case .networkUnavailable:
             .offline
         case .rateLimited:

@@ -97,7 +97,9 @@ struct GitHubView: View {
             Text(
                 "GitHub may ask you to sign in before showing its account picker. "
                     + "It identifies HemSoft as Buddy iOS's publisher, not as an account receiving access. "
-                    + "Buddy requests only your public GitHub identity, and its token stays in this device's Keychain."
+                    + "Buddy requests repository access to show public and private pull requests. "
+                    + "GitHub's OAuth permission includes write access, but Buddy only makes read-only API requests. "
+                    + "The token stays in this device's Keychain."
             )
         } actions: {
             Button("Choose Account in GitHub") {
@@ -139,8 +141,9 @@ struct GitHubView: View {
                 .font(.headline)
 
             Text(
-                "Sign in if needed, then choose an account in GitHub. "
+                "Sign in if needed, choose an account, then approve repository access. "
                     + "GitHub identifies Buddy iOS as the app and HemSoft as its publisher. "
+                    + "Buddy uses the permission only to read public and private pull-request data. "
                     + "Buddy will finish connecting when GitHub returns to this device."
             )
                 .multilineTextAlignment(.center)
@@ -315,7 +318,10 @@ final class GitHubViewModel {
             return
         } catch {
             guard generation == operationGeneration else { return }
-            retryAction = (error as? GitHubConnectionError) == .invalidToken ? .connect : .restore
+            let connectionError = error as? GitHubConnectionError
+            retryAction = connectionError == .invalidToken || connectionError == .privateRepositoryAccessRequired
+                ? .connect
+                : .restore
             stateScope = .global
             state = .needsAttention(error.localizedDescription)
         }
@@ -492,9 +498,20 @@ final class GitHubViewModel {
     }
 
     func reportDashboardAuthenticationFailure(for id: ConnectedAccountID) {
+        reportDashboardAuthorizationFailure(for: id, error: .invalidToken)
+    }
+
+    func reportDashboardRepositoryAccessFailure(for id: ConnectedAccountID) {
+        reportDashboardAuthorizationFailure(for: id, error: .privateRepositoryAccessRequired)
+    }
+
+    private func reportDashboardAuthorizationFailure(
+        for id: ConnectedAccountID,
+        error: GitHubConnectionError
+    ) {
         guard let index = accounts.firstIndex(where: { $0.id == id }) else { return }
         accounts[index].state = .needsAttention
-        accounts[index].message = GitHubConnectionError.invalidToken.localizedDescription
+        accounts[index].message = error.localizedDescription
         accounts[index].recoveryAction = .reconnect
         stateScope = preferredRestingStateScope
         state = preferredRestingState

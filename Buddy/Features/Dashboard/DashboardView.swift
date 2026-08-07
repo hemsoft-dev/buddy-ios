@@ -333,8 +333,8 @@ struct DashboardView: View {
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
 
-                Button(failure == .authenticationRequired ? "Reconnect in Settings" : "Try Again") {
-                    if failure == .authenticationRequired {
+                Button(failure.requiresReconnect ? "Reconnect in Settings" : "Try Again") {
+                    if failure.requiresReconnect {
                         openAccounts()
                     } else {
                         Task { await refreshPullRequests(for: account, section: section) }
@@ -524,10 +524,10 @@ struct DashboardView: View {
             countDescription
         case .refreshing:
             "Refreshing · \(countDescription)"
-        case .failed(_, _, .authenticationRequired):
-            "Reconnect required · \(countDescription)"
-        case .failed:
-            "Refresh warning · \(countDescription)"
+        case let .failed(_, _, failure):
+            failure.requiresReconnect
+                ? "Reconnect required · \(countDescription)"
+                : "Refresh warning · \(countDescription)"
         }
     }
 
@@ -570,9 +570,7 @@ struct DashboardView: View {
 
     private func refreshPullRequests(for account: GitHubAccount) async {
         let failure = await viewModel.refresh(account: account)
-        if failure == .authenticationRequired {
-            githubViewModel.reportDashboardAuthenticationFailure(for: account.connectedAccountID)
-        }
+        reportAuthorizationFailure(failure, for: account)
     }
 
     private func refreshPullRequests(
@@ -580,8 +578,20 @@ struct DashboardView: View {
         section: GitHubPullRequestSection
     ) async {
         let failure = await viewModel.refresh(account: account, section: section)
-        if failure == .authenticationRequired {
+        reportAuthorizationFailure(failure, for: account)
+    }
+
+    private func reportAuthorizationFailure(
+        _ failure: GitHubPullRequestFailure?,
+        for account: GitHubAccount
+    ) {
+        switch failure {
+        case .authenticationRequired:
             githubViewModel.reportDashboardAuthenticationFailure(for: account.connectedAccountID)
+        case .repositoryAccessRequired:
+            githubViewModel.reportDashboardRepositoryAccessFailure(for: account.connectedAccountID)
+        default:
+            break
         }
     }
 
