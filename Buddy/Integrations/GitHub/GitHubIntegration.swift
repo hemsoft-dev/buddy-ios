@@ -1153,11 +1153,7 @@ actor GitHubIntegration: IntegrationProviding {
     func cancelAuthorization() async throws {
         authorizationGeneration &+= 1
         let generation = authorizationGeneration
-        if let activeAuthorization {
-            accountAuthorizations.removeValue(forKey: activeAuthorization.id)
-            await authorizer.cancelAuthorization(activeAuthorization)
-        }
-        activeAuthorization = nil
+        await cancelAllAccountAuthorizations()
 
         do {
             try await performCredentialCleanup()
@@ -1175,12 +1171,7 @@ actor GitHubIntegration: IntegrationProviding {
     func disconnect() async throws {
         authorizationGeneration &+= 1
         let generation = authorizationGeneration
-        let authorizationToCancel = activeAuthorization
-        activeAuthorization = nil
-        if let authorizationToCancel {
-            accountAuthorizations.removeValue(forKey: authorizationToCancel.id)
-            await authorizer.cancelAuthorization(authorizationToCancel)
-        }
+        await cancelAllAccountAuthorizations()
 
         do {
             try await performCredentialCleanup()
@@ -1192,6 +1183,15 @@ actor GitHubIntegration: IntegrationProviding {
             authorizationGeneration &+= 1
             updateSummary(detail: "Unable to remove authorization", state: .needsAttention)
             throw GitHubConnectionError.credentialStorage
+        }
+    }
+
+    private func cancelAllAccountAuthorizations() async {
+        let authorizations = accountAuthorizations.values.map(\.authorization)
+        accountAuthorizations.removeAll()
+        activeAuthorization = nil
+        for authorization in authorizations {
+            await authorizer.cancelAuthorization(authorization)
         }
     }
 

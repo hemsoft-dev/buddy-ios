@@ -1464,6 +1464,38 @@ final class GitHubIntegrationTests: XCTestCase {
         }
     }
 
+    func testGlobalDisconnectCancelsEveryAccountAuthorization() async throws {
+        let firstAuthorization = testAuthorization
+        let secondAuthorization = GitHubBrowserAuthorization(
+            id: UUID(),
+            authorizationURL: testAuthorization.authorizationURL
+        )
+        let api = StubGitHubAPI(deviceResults: [
+            .success(firstAuthorization),
+            .success(secondAuthorization),
+        ])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: MockCredentialStore()
+        )
+        let first = try await integration.beginAccountAuthorization()
+        let second = try await integration.beginAccountAuthorization()
+
+        try await integration.disconnect()
+
+        let canceledIDs = Set(await api.canceledAuthorizations().map(\.id))
+        XCTAssertEqual(canceledIDs, Set([first.id, second.id]))
+        for authorization in [first, second] {
+            do {
+                _ = try await integration.completeAccountAuthorization(authorization)
+                XCTFail("Expected disconnected account authorization to be invalidated")
+            } catch is CancellationError {
+                // Expected.
+            }
+        }
+    }
+
     func testMultipleAuthorizationsPersistDistinctProviderQualifiedCredentials() async throws {
         let first = GitHubAccount(id: 7, login: "franz", name: "Franz", avatarURL: nil)
         let second = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
