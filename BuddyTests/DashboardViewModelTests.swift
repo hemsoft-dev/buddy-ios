@@ -106,6 +106,25 @@ final class DashboardViewModelTests: XCTestCase {
         )
     }
 
+    func testPullRequestAccountHeaderRemainsLoadingUntilBothSectionsResolve() {
+        XCTAssertEqual(
+            DashboardGitHubPullRequestCopy.accountHeaderSummary(
+                authoredState: .loaded(
+                    [makePullRequest(
+                        id: 1,
+                        repository: "HemSoft/Buddy",
+                        updatedAt: Date(timeIntervalSince1970: 100)
+                    )],
+                    refreshedAt: Date(timeIntervalSince1970: 100)
+                ),
+                authoredTotal: 1,
+                assignedState: .loading,
+                assignedTotal: 0
+            ),
+            "Loading pull requests"
+        )
+    }
+
     func testAssignedEmptyStateDisclosesPublicRepositoryLimit() {
         let description = DashboardGitHubPullRequestCopy.emptyStateDescription(
             login: "octocat",

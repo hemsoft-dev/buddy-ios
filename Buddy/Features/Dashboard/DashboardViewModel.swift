@@ -36,6 +36,46 @@ enum DashboardGitHubPullRequestCopy {
             "\(countSummary(visible: assignedVisible, total: assignedTotal)) assigned"
     }
 
+    static func accountHeaderSummary(
+        authoredState: GitHubPullRequestDashboardState,
+        authoredTotal: Int,
+        assignedState: GitHubPullRequestDashboardState,
+        assignedTotal: Int
+    ) -> String {
+        let states = [authoredState, assignedState]
+        let result = accountSummary(
+            authoredVisible: authoredState.pullRequests.count,
+            authoredTotal: authoredTotal,
+            assignedVisible: assignedState.pullRequests.count,
+            assignedTotal: assignedTotal
+        )
+        if states.contains(where: {
+            if case .failed(_, _, .authenticationRequired) = $0 { return true }
+            return false
+        }) {
+            return "Reconnect required · \(result)"
+        }
+        if states.contains(where: {
+            if case .failed = $0 { return true }
+            return false
+        }) {
+            return "Refresh warning · \(result)"
+        }
+        if states.contains(where: {
+            if case .loading = $0 { return true }
+            return false
+        }) {
+            return "Loading pull requests"
+        }
+        if states.contains(where: {
+            if case .refreshing = $0 { return true }
+            return false
+        }) {
+            return "Refreshing · \(result)"
+        }
+        return result
+    }
+
     private static func countSummary(visible: Int, total: Int) -> String {
         total > visible ? "\(visible) of \(total)" : "\(visible)"
     }

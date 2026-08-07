@@ -548,38 +548,12 @@ struct DashboardView: View {
     private func githubHeaderSummary(for account: GitHubAccount) -> String {
         let authoredState = viewModel.githubState(for: account, section: .authored)
         let assignedState = viewModel.githubState(for: account, section: .assigned)
-        let result = DashboardGitHubPullRequestCopy.accountSummary(
-            authoredVisible: authoredState.pullRequests.count,
+        return DashboardGitHubPullRequestCopy.accountHeaderSummary(
+            authoredState: authoredState,
             authoredTotal: viewModel.githubTotalCount(for: account, section: .authored),
-            assignedVisible: assignedState.pullRequests.count,
+            assignedState: assignedState,
             assignedTotal: viewModel.githubTotalCount(for: account, section: .assigned)
         )
-        let states = [authoredState, assignedState]
-        if states.contains(where: {
-            if case .failed(_, _, .authenticationRequired) = $0 { return true }
-            return false
-        }) {
-            return "Reconnect required · \(result)"
-        }
-        if states.contains(where: {
-            if case .failed = $0 { return true }
-            return false
-        }) {
-            return "Refresh warning · \(result)"
-        }
-        if states.contains(where: {
-            if case .refreshing = $0 { return true }
-            return false
-        }) {
-            return "Refreshing · \(result)"
-        }
-        if states.allSatisfy({
-            if case .loading = $0 { return true }
-            return false
-        }) {
-            return "Loading pull requests"
-        }
-        return result
     }
 
     private func githubHeaderSummaryColor(for account: GitHubAccount) -> Color {
