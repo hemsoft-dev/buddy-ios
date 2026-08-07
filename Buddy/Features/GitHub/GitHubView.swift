@@ -125,7 +125,7 @@ struct GitHubView: View {
         }
     }
 
-    private func authorizingContent(_: GitHubBrowserAuthorization) -> some View {
+    private func authorizingContent(_ authorization: GitHubBrowserAuthorization) -> some View {
         VStack(spacing: BuddyTheme.Spacing.medium) {
             Image(systemName: "person.badge.key.fill")
                 .font(.largeTitle)
@@ -137,6 +137,11 @@ struct GitHubView: View {
             Text("Complete sign-in in the secure GitHub browser sheet. Buddy will finish connecting when GitHub returns to this device.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
+
+            Button("Open GitHub Again") {
+                presentAuthorizationURL(authorization.authorizationURL)
+            }
+            .buttonStyle(.borderedProminent)
 
             Button("Cancel", role: .cancel) {
                 viewModel.cancelAccountAuthorization()
@@ -211,10 +216,11 @@ struct GitHubView: View {
         presentedAuthorizationURL = PresentedGitHubAuthorizationURL(url: url)
     }
 
-    private func authorizationSheetDismissed() {
-        if case .authorizing = viewModel.state {
-            viewModel.cancelAccountAuthorization()
-        }
+    func authorizationSheetDismissed() {
+        // Dismissing Safari is not a reliable cancellation signal: GitHub may
+        // already have delivered the callback while exchange and persistence
+        // are still finishing. Keep the bounded authorization alive; the user
+        // can reopen Safari or use the explicit Cancel action instead.
     }
 
 }

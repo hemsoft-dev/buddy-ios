@@ -676,6 +676,43 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertTrue(connectionFinished)
     }
 
+    func testDismissingAuthorizationSheetPreservesInFlightAccountAuthorization() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let api = SuspendedPollingGitHubAPI(account: account)
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: MockCredentialStore(),
+            sleep: { _ in }
+        )
+        let viewModel = await MainActor.run { GitHubViewModel(integration: integration) }
+
+        await MainActor.run {
+            viewModel.addAccount(presentAuthorizationURL: { _ in })
+        }
+        let pollingStarted = try await waitUntil {
+            await api.pollDidStart()
+        }
+        XCTAssertTrue(pollingStarted)
+
+        let stateAfterDismissal = await MainActor.run {
+            let view = GitHubView(viewModel: viewModel)
+            view.authorizationSheetDismissed()
+            return viewModel.state
+        }
+        XCTAssertEqual(stateAfterDismissal, .authorizing(testAuthorization))
+
+        await api.finishPoll()
+        let connectionFinished = try await waitUntil {
+            await MainActor.run {
+                viewModel.accounts == [
+                    GitHubAccountConnection(account: account, state: .connected),
+                ]
+            }
+        }
+        XCTAssertTrue(connectionFinished)
+    }
+
     func testAddedAccountRouteShowsItsReconnectAuthorization() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let api = SuspendedPollingGitHubAPI(account: account)
