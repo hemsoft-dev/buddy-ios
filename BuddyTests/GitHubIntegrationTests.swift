@@ -1346,6 +1346,45 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(integration.summary.connectionState, .needsAttention)
     }
 
+    func testMissingOAuthSecretReportsCompleteConfigurationRequirement() async {
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            clientSecret: nil,
+            api: GitHubAPI(),
+            credentials: MockCredentialStore()
+        )
+        let viewModel = await MainActor.run { GitHubViewModel(integration: integration) }
+
+        await viewModel.restore()
+
+        let state = await MainActor.run { viewModel.state }
+        XCTAssertEqual(
+            state,
+            .configurationRequired(GitHubConnectionError.missingOAuthConfiguration.localizedDescription)
+        )
+    }
+
+    func testGlobalDisconnectCancelsActiveBrowserAuthorization() async throws {
+        let api = StubGitHubAPI(deviceResults: [.success(testAuthorization)])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: MockCredentialStore()
+        )
+        let authorization = try await integration.beginAuthorization()
+
+        try await integration.disconnect()
+
+        let canceledAuthorizations = await api.canceledAuthorizations()
+        XCTAssertEqual(canceledAuthorizations, [authorization])
+        do {
+            _ = try await integration.completeAuthorization(authorization)
+            XCTFail("Expected disconnected authorization to be invalidated")
+        } catch is CancellationError {
+            // Expected.
+        }
+    }
+
     func testMultipleAuthorizationsPersistDistinctProviderQualifiedCredentials() async throws {
         let first = GitHubAccount(id: 7, login: "franz", name: "Franz", avatarURL: nil)
         let second = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
@@ -3302,6 +3341,7 @@ private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
     private var capturedAssignedPullRequestRequests: [PullRequestRequest] = []
     private var capturedDeviceRequestCount = 0
     private var capturedPollRequestCount = 0
+    private var capturedCanceledAuthorizations: [GitHubBrowserAuthorization] = []
 
     init(
         deviceResults: [Result<GitHubBrowserAuthorization, GitHubAPIError>] = [],
@@ -3335,7 +3375,9 @@ private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
         throw GitHubAPIError.malformedResponse
     }
 
-    func cancelAuthorization(_ authorization: GitHubBrowserAuthorization) {}
+    func cancelAuthorization(_ authorization: GitHubBrowserAuthorization) {
+        capturedCanceledAuthorizations.append(authorization)
+    }
 
     func authenticatedUser(token: String) throws -> GitHubAccount {
         capturedUserTokens.append(token)
@@ -3370,6 +3412,10 @@ private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
 
     func pollRequestCount() -> Int {
         capturedPollRequestCount
+    }
+
+    func canceledAuthorizations() -> [GitHubBrowserAuthorization] {
+        capturedCanceledAuthorizations
     }
 }
 

@@ -77,7 +77,7 @@ struct GitHubView: View {
             return .loading
         }
         if !viewModel.integrationIsAuthorizationConfigured {
-            return .configurationRequired(GitHubConnectionError.missingClientID.localizedDescription)
+            return .configurationRequired(viewModel.authorizationConfigurationError.localizedDescription)
         }
         return .disconnected
     }
@@ -261,6 +261,10 @@ final class GitHubViewModel {
 
     var integrationIsAuthorizationConfigured: Bool {
         integration.isAuthorizationConfigured
+    }
+
+    var authorizationConfigurationError: GitHubConnectionError {
+        integration.authorizationConfigurationError ?? .missingOAuthConfiguration
     }
 
     func restore() async {
@@ -674,7 +678,7 @@ final class GitHubViewModel {
         if integration.isAuthorizationConfigured {
             return .disconnected
         }
-        return .configurationRequired(GitHubConnectionError.missingClientID.localizedDescription)
+        return .configurationRequired(authorizationConfigurationError.localizedDescription)
     }
 }
 

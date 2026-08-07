@@ -91,6 +91,10 @@ final class GitHubAPITests: XCTestCase {
             parser.parse(Data("GET /callback?state=expected HTTP/1.1\r\n\r\n".utf8)),
             .failure(.missingAuthorizationCode)
         )
+        XCTAssertEqual(
+            parser.parse(Data("GET /callback?error=access_denied&state=expected HTTP/1.1\r\n\r\n".utf8)),
+            .failure(.accessDenied)
+        )
         XCTAssertEqual(parser.parse(Data(repeating: 65, count: 129)), .failure(.callbackTooLarge))
     }
 
@@ -127,6 +131,11 @@ final class GitHubAPITests: XCTestCase {
         let callbackURL = try XCTUnwrap(callbackComponents.url)
 
         let completion = Task { try await service.completeAuthorization(authorization) }
+        var unrelatedComponents = callbackComponents
+        unrelatedComponents.path = "/unrelated"
+        let unrelatedURL = try XCTUnwrap(unrelatedComponents.url)
+        let (_, unrelatedResponse) = try await URLSession.shared.data(from: unrelatedURL)
+        XCTAssertEqual((unrelatedResponse as? HTTPURLResponse)?.statusCode, 400)
         let (_, callbackResponse) = try await URLSession.shared.data(from: callbackURL)
         XCTAssertEqual((callbackResponse as? HTTPURLResponse)?.statusCode, 200)
         let token = try await completion.value
@@ -179,6 +188,41 @@ final class GitHubAPITests: XCTestCase {
             XCTFail("Expected cancellation")
         } catch is CancellationError {
             // Expected.
+        }
+    }
+
+    func testBrowserAuthorizationReportsAccessDeniedCallback() async throws {
+        let service = GitHubWebOAuthService(
+            callbackTimeout: .seconds(2),
+            randomBytes: { count in Data(repeating: UInt8(count), count: count) }
+        )
+        let authorization = try await service.beginAuthorization(
+            configuration: GitHubOAuthConfiguration(clientID: "client", clientSecret: "public-secret")
+        )
+        let authorizationComponents = try XCTUnwrap(
+            URLComponents(url: authorization.authorizationURL, resolvingAgainstBaseURL: false)
+        )
+        let query = Dictionary(
+            uniqueKeysWithValues: (authorizationComponents.queryItems ?? []).compactMap { item in
+                item.value.map { (item.name, $0) }
+            }
+        )
+        var callbackComponents = try XCTUnwrap(URLComponents(string: try XCTUnwrap(query["redirect_uri"])))
+        callbackComponents.queryItems = [
+            URLQueryItem(name: "error", value: "access_denied"),
+            URLQueryItem(name: "state", value: try XCTUnwrap(query["state"])),
+        ]
+
+        let completion = Task { try await service.completeAuthorization(authorization) }
+        let (_, callbackResponse) = try await URLSession.shared.data(
+            from: try XCTUnwrap(callbackComponents.url)
+        )
+        XCTAssertEqual((callbackResponse as? HTTPURLResponse)?.statusCode, 400)
+        do {
+            _ = try await completion.value
+            XCTFail("Expected access denied")
+        } catch let error as GitHubOAuthError {
+            XCTAssertEqual(error, .accessDenied)
         }
     }
 

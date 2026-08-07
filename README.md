@@ -73,10 +73,12 @@ To test with a different GitHub OAuth app:
 
 1. Register a dedicated Buddy GitHub OAuth app. Its callback URL must allow the
    loopback-literal redirect `http://127.0.0.1:<ephemeral-port>/callback`.
-2. Pass its client ID and public/non-confidential exchange credential through
-   build settings, for example `xcodebuild ... BUDDY_GITHUB_CLIENT_ID=...`
-   `BUDDY_GITHUB_CLIENT_SECRET=...`, or define both in the gitignored
-   `Config/Local.xcconfig`.
+2. Pass both its client ID and public/non-confidential exchange credential as
+   higher-precedence command-line build settings, for example
+   `xcodebuild ... BUDDY_GITHUB_CLIENT_ID=... BUDDY_GITHUB_CLIENT_SECRET=...`.
+   `Config/Local.xcconfig` may provide the exchange credential only when it
+   belongs to the source-controlled client ID, because `Shared.xcconfig`
+   intentionally restores that client ID after including local settings.
 3. Do not commit a real credential, authorization code, PKCE verifier, or token.
 
 The source-controlled client-ID assignment intentionally follows the optional

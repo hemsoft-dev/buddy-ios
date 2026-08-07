@@ -77,6 +77,7 @@ actor GitHubIntegration: IntegrationProviding {
 
     nonisolated var summary: IntegrationSummary { summaryStorage.value }
     nonisolated let isAuthorizationConfigured: Bool
+    nonisolated let authorizationConfigurationError: GitHubConnectionError?
 
     private let clientID: String?
     private let clientSecret: String?
@@ -116,7 +117,14 @@ actor GitHubIntegration: IntegrationProviding {
         let resolvedAPI = api ?? GitHubAPI()
         let injectedAuthorizer = authorizer ?? (resolvedAPI as? any GitHubOAuthAuthorizing)
         self.clientSecret = clientSecret ?? (injectedAuthorizer == nil ? nil : "test-client-secret")
-        isAuthorizationConfigured = clientID != nil && self.clientSecret != nil
+        if clientID == nil {
+            authorizationConfigurationError = .missingClientID
+        } else if self.clientSecret == nil {
+            authorizationConfigurationError = .missingOAuthConfiguration
+        } else {
+            authorizationConfigurationError = nil
+        }
+        isAuthorizationConfigured = authorizationConfigurationError == nil
         self.api = resolvedAPI
         self.authorizer = injectedAuthorizer ?? GitHubWebOAuthService()
         self.credentials = credentials
@@ -1155,7 +1163,12 @@ actor GitHubIntegration: IntegrationProviding {
     func disconnect() async throws {
         authorizationGeneration &+= 1
         let generation = authorizationGeneration
+        let authorizationToCancel = activeAuthorization
         activeAuthorization = nil
+        if let authorizationToCancel {
+            accountAuthorizations.removeValue(forKey: authorizationToCancel.id)
+            await authorizer.cancelAuthorization(authorizationToCancel)
+        }
 
         do {
             try await performCredentialCleanup()

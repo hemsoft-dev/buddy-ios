@@ -643,6 +643,11 @@ struct GitHubOAuthCallbackRequestParser: Sendable {
         guard components.queryItems?.first(where: { $0.name == "state" })?.value == expectedState else {
             return .failure(.stateMismatch)
         }
+        if let error = components.queryItems?.first(where: { $0.name == "error" })?.value {
+            return error == "access_denied"
+                ? .failure(.accessDenied)
+                : .failure(.malformedCallback)
+        }
         guard components.queryItems?.first(where: { $0.name == "code" })?.value?.isEmpty == false else {
             return .failure(.missingAuthorizationCode)
         }
@@ -843,8 +848,14 @@ final class GitHubOAuthCallbackServer: @unchecked Sendable {
         let response = "\(status)\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: \(Data(body.utf8).count)\r\nConnection: close\r\n\r\n\(body)"
         connection.send(content: Data(response.utf8), completion: .contentProcessed { _ in connection.cancel() })
         switch result {
-        case let .success(url): finishCallback(.success(url))
-        case let .failure(error): finishCallback(.failure(error))
+        case let .success(url):
+            finishCallback(.success(url))
+        case .failure(.accessDenied):
+            finishCallback(.failure(GitHubOAuthError.accessDenied))
+        case .failure:
+            // A malformed or unrelated request must not consume the one valid
+            // OAuth callback. Respond to that connection and keep listening.
+            break
         }
     }
 }
