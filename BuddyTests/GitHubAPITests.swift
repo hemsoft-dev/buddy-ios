@@ -359,6 +359,22 @@ final class GitHubAPITests: XCTestCase {
         }
     }
 
+    func testCredentialMigrationCanIdentifyPublicOnlyTokenOwner() async throws {
+        let client = MockHTTPClient(responses: [
+            .successWithScopes(
+                #"{"id":42,"login":"octocat"}"#,
+                statusCode: 200,
+                scopes: "read:user"
+            ),
+        ])
+
+        let account = try await GitHubAPI(httpClient: client)
+            .authenticatedUserForCredentialMigration(token: "public-only-token")
+
+        XCTAssertEqual(account.id, 42)
+        XCTAssertEqual(account.login, "octocat")
+    }
+
     func testAuthoredPullRequestsUsesVersionedEncodedBoundedSearchAndSortsResults() async throws {
         let httpClient = MockHTTPClient(responses: [
             .success(

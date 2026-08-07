@@ -72,11 +72,16 @@ struct GitHubPullRequestCollection: Equatable, Sendable {
 
 protocol GitHubAPIProviding: Sendable {
     func authenticatedUser(token: String) async throws -> GitHubAccount
+    func authenticatedUserForCredentialMigration(token: String) async throws -> GitHubAccount
     func authoredPullRequests(login: String, token: String) async throws -> GitHubPullRequestCollection
     func assignedPullRequests(login: String, token: String) async throws -> GitHubPullRequestCollection
 }
 
 extension GitHubAPIProviding {
+    func authenticatedUserForCredentialMigration(token: String) async throws -> GitHubAccount {
+        try await authenticatedUser(token: token)
+    }
+
     func authoredPullRequests(login _: String, token _: String) async throws -> GitHubPullRequestCollection {
         throw GitHubAPIError.malformedResponse
     }
@@ -94,6 +99,19 @@ struct GitHubAPI: GitHubAPIProviding {
     }
 
     func authenticatedUser(token: String) async throws -> GitHubAccount {
+        try await authenticatedUser(token: token, requiresRepositoryScope: true)
+    }
+
+    /// Identifies a legacy token owner so an upgrade never deletes another account's credential.
+    /// The caller still treats a token without `repo` as disconnected and requires reauthorization.
+    func authenticatedUserForCredentialMigration(token: String) async throws -> GitHubAccount {
+        try await authenticatedUser(token: token, requiresRepositoryScope: false)
+    }
+
+    private func authenticatedUser(
+        token: String,
+        requiresRepositoryScope: Bool
+    ) async throws -> GitHubAccount {
         guard let url = URL(string: "https://api.github.com/user") else {
             throw GitHubAPIError.malformedResponse
         }
@@ -104,7 +122,10 @@ struct GitHubAPI: GitHubAPIProviding {
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
 
-        let data = try await perform(request)
+        let data = try await perform(
+            request,
+            requiresRepositoryScope: requiresRepositoryScope
+        )
         let response: UserResponse
         do {
             response = try JSONDecoder().decode(UserResponse.self, from: data)
@@ -221,10 +242,15 @@ struct GitHubAPI: GitHubAPIProviding {
         )
     }
 
-    private func perform(_ request: URLRequest) async throws -> Data {
+    private func perform(
+        _ request: URLRequest,
+        requiresRepositoryScope: Bool = true
+    ) async throws -> Data {
         do {
             let (data, response) = try await httpClient.data(for: request)
-            guard Self.oauthScopes(from: response).contains(GitHubOAuthConfiguration.repositoryScope) else {
+            guard !requiresRepositoryScope ||
+                    Self.oauthScopes(from: response).contains(GitHubOAuthConfiguration.repositoryScope)
+            else {
                 throw GitHubAPIError.insufficientOAuthScope
             }
             return data

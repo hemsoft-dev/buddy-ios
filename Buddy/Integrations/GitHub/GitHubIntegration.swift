@@ -61,7 +61,7 @@ actor GitHubIntegration: IntegrationProviding {
 
     private enum LegacyCredentialState: Sendable {
         case unknown(Data)
-        case scopeUpgradeRequired(Data)
+        case scopeUpgradeRequired(Data, ConnectedAccountID)
         case owned(Data, ConnectedAccountID)
     }
 
@@ -315,6 +315,7 @@ actor GitHubIntegration: IntegrationProviding {
             }
 
             let writtenToken = Data(token.utf8)
+            var removedLegacyData: Data?
             do {
                 try await credentials.set(writtenToken, for: credentialAccount)
                 guard !Task.isCancelled,
@@ -340,7 +341,9 @@ actor GitHubIntegration: IntegrationProviding {
                     throw CancellationError()
                 }
                 try await accountStore.upsert(account.connectedAccountRecord)
-                try await removeLegacyCredentialReplacedByScopeUpgrade()
+                removedLegacyData = try await removeLegacyCredentialReplacedByScopeUpgrade(
+                    for: accountID
+                )
             } catch {
                 if error is CancellationError { throw error }
                 if let connectionError = error as? GitHubConnectionError,
@@ -409,7 +412,13 @@ actor GitHubIntegration: IntegrationProviding {
                         writtenRecord: account.connectedAccountRecord,
                         generation: accountGeneration
                     )
-                    guard rolledBack else { throw GitHubConnectionError.credentialStorage }
+                    let restoredLegacy = await restoreLegacyCredentialAfterAuthorizationRollback(
+                        removedLegacyData,
+                        ownerID: accountID
+                    )
+                    guard rolledBack, restoredLegacy else {
+                        throw GitHubConnectionError.credentialStorage
+                    }
                 } else {
                     await discardSupersededAccountWrite(
                         id: accountID,
@@ -417,8 +426,17 @@ actor GitHubIntegration: IntegrationProviding {
                         writtenToken: writtenToken,
                         writtenRecord: account.connectedAccountRecord
                     )
+                    guard await restoreLegacyCredentialAfterAuthorizationRollback(
+                        removedLegacyData,
+                        ownerID: accountID
+                    ) else {
+                        throw GitHubConnectionError.credentialStorage
+                    }
                 }
                 throw CancellationError()
+            }
+            if removedLegacyData != nil {
+                legacyCredentialState = nil
             }
             accountAuthorizations.removeValue(forKey: authorization.id)
             return GitHubAccountConnection(account: account, state: .connected)
@@ -611,6 +629,9 @@ actor GitHubIntegration: IntegrationProviding {
         switch legacyCredentialState {
         case let .unknown(pendingData) where pendingData == legacyData:
             return
+        case let .scopeUpgradeRequired(pendingData, ownerID)
+            where pendingData == legacyData && ownerID != accountID:
+            return
         case let .owned(pendingData, ownerID)
             where pendingData == legacyData && ownerID != accountID:
             return
@@ -625,13 +646,47 @@ actor GitHubIntegration: IntegrationProviding {
         }
     }
 
-    private func removeLegacyCredentialReplacedByScopeUpgrade() async throws {
-        guard case let .scopeUpgradeRequired(pendingData) = legacyCredentialState,
+    private func removeLegacyCredentialReplacedByScopeUpgrade(
+        for accountID: ConnectedAccountID
+    ) async throws -> Data? {
+        guard case let .scopeUpgradeRequired(pendingData, ownerID) = legacyCredentialState,
+              ownerID == accountID,
               try await credentials.data(for: Self.credentialAccount) == pendingData
         else {
-            return
+            return nil
         }
-        try await removeLegacyCredential(ifMatches: pendingData)
+        if try await credentials.removeData(
+            for: Self.credentialAccount,
+            ifMatches: pendingData
+        ) {
+            return pendingData
+        }
+        return nil
+    }
+
+    private func restoreLegacyCredentialAfterAuthorizationRollback(
+        _ legacyData: Data?,
+        ownerID: ConnectedAccountID
+    ) async -> Bool {
+        guard let legacyData else { return true }
+        guard accountMutationIntents[ownerID] != .disconnect else {
+            legacyCredentialState = nil
+            return true
+        }
+        do {
+            let currentData = try await credentials.data(for: Self.credentialAccount)
+            if currentData == nil {
+                try await credentials.set(legacyData, for: Self.credentialAccount)
+                legacyCredentialState = .scopeUpgradeRequired(legacyData, ownerID)
+            } else if currentData == legacyData {
+                legacyCredentialState = .scopeUpgradeRequired(legacyData, ownerID)
+            } else if let currentData {
+                legacyCredentialState = .unknown(currentData)
+            }
+            return true
+        } catch {
+            return false
+        }
     }
 
     private func removeLegacyCredential(ifMatches legacyData: Data) async throws {
@@ -676,7 +731,23 @@ actor GitHubIntegration: IntegrationProviding {
             }
             return nil
         } catch GitHubAPIError.insufficientOAuthScope {
-            legacyCredentialState = .scopeUpgradeRequired(legacyData)
+            let account: GitHubAccount
+            do {
+                account = try await api.authenticatedUserForCredentialMigration(token: token)
+            } catch GitHubAPIError.unauthorized {
+                do {
+                    try await removeLegacyCredential(ifMatches: legacyData)
+                } catch {
+                    throw GitHubConnectionError.credentialStorage
+                }
+                return nil
+            } catch {
+                throw map(error)
+            }
+            legacyCredentialState = .scopeUpgradeRequired(
+                legacyData,
+                account.connectedAccountID
+            )
             throw GitHubConnectionError.privateRepositoryAccessRequired
         } catch {
             throw map(error)

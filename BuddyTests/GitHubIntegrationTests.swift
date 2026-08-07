@@ -1624,6 +1624,7 @@ final class GitHubIntegrationTests: XCTestCase {
             userResults: [
                 .failure(.insufficientOAuthScope),
                 .success(account),
+                .success(account),
             ]
         )
         let integration = GitHubIntegration(
@@ -1668,6 +1669,7 @@ final class GitHubIntegrationTests: XCTestCase {
             api: StubGitHubAPI(userResults: [
                 .failure(.insufficientOAuthScope),
                 .success(account),
+                .success(account),
             ]),
             credentials: credentials,
             accountStore: accountStore
@@ -1680,6 +1682,94 @@ final class GitHubIntegrationTests: XCTestCase {
         let scopedToken = await credentials.stringValue(for: scopedKey)
         let records = await accountStore.accounts(for: .github)
         XCTAssertNil(legacyToken)
+        XCTAssertNil(scopedToken)
+        XCTAssertTrue(records.isEmpty)
+    }
+
+    func testScopeUpgradeReconnectPreservesLegacyCredentialForDifferentAccount() async throws {
+        let legacyAccount = GitHubAccount(id: 7, login: "legacy", name: nil, avatarURL: nil)
+        let selectedAccount = GitHubAccount(id: 42, login: "selected", name: nil, avatarURL: nil)
+        let selectedKey = GitHubIntegration.credentialAccount(for: selectedAccount.connectedAccountID)
+        let credentials = MockCredentialStore(initialValue: "public-only-legacy-token")
+        let accountStore = InMemoryConnectedAccountStore()
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(
+                deviceResults: [.success(testAuthorization)],
+                pollResults: [.success(.authorized(token: "selected-account-token"))],
+                userResults: [
+                    .failure(.insufficientOAuthScope),
+                    .success(legacyAccount),
+                    .success(selectedAccount),
+                ]
+            ),
+            credentials: credentials,
+            accountStore: accountStore,
+            sleep: { _ in }
+        )
+        do {
+            _ = try await integration.restoreAccounts()
+            XCTFail("Expected repository access requirement")
+        } catch let error as GitHubConnectionError {
+            XCTAssertEqual(error, .privateRepositoryAccessRequired)
+        }
+
+        let authorization = try await integration.beginAccountAuthorization()
+        _ = try await integration.completeAccountAuthorization(authorization)
+
+        let legacyToken = await credentials.stringValue(for: "github.oauth-token")
+        let selectedToken = await credentials.stringValue(for: selectedKey)
+        XCTAssertEqual(legacyToken, "public-only-legacy-token")
+        XCTAssertEqual(selectedToken, "selected-account-token")
+    }
+
+    func testCanceledScopeUpgradeReconnectRestoresLegacyCredential() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let scopedKey = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let credentials = SuspendedPostRemovalCredentialStore(values: [
+            "github.oauth-token": "public-only-legacy-token",
+        ])
+        let accountStore = InMemoryConnectedAccountStore()
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(
+                deviceResults: [.success(testAuthorization)],
+                pollResults: [.success(.authorized(token: "private-repository-token"))],
+                userResults: [
+                    .failure(.insufficientOAuthScope),
+                    .success(account),
+                    .success(account),
+                ]
+            ),
+            credentials: credentials,
+            accountStore: accountStore,
+            sleep: { _ in }
+        )
+        do {
+            _ = try await integration.restoreAccounts()
+            XCTFail("Expected repository access requirement")
+        } catch let error as GitHubConnectionError {
+            XCTAssertEqual(error, .privateRepositoryAccessRequired)
+        }
+        let authorization = try await integration.beginAccountAuthorization()
+        let completion = Task {
+            try await integration.completeAccountAuthorization(authorization)
+        }
+        await credentials.waitUntilFirstRemovalCompletes()
+
+        completion.cancel()
+        await credentials.finishFirstRemoval()
+
+        do {
+            _ = try await completion.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let legacyToken = await credentials.stringValue(for: "github.oauth-token")
+        let scopedToken = await credentials.stringValue(for: scopedKey)
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertEqual(legacyToken, "public-only-legacy-token")
         XCTAssertNil(scopedToken)
         XCTAssertTrue(records.isEmpty)
     }
