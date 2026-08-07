@@ -1496,6 +1496,34 @@ final class GitHubIntegrationTests: XCTestCase {
         }
     }
 
+    func testGlobalDisconnectCancelsAccountAuthorizationStillStarting() async throws {
+        let api = SuspendedAuthorizationAPI()
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: MockCredentialStore()
+        )
+        let authorization = Task {
+            try await integration.beginAccountAuthorization()
+        }
+        let authorizationStarted = try await waitUntil {
+            await api.authorizationDidStart()
+        }
+        XCTAssertTrue(authorizationStarted)
+
+        try await integration.disconnect()
+        await api.finishAuthorization()
+
+        do {
+            _ = try await authorization.value
+            XCTFail("Expected disconnect to invalidate the starting authorization")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let canceledAuthorizations = await api.canceledAuthorizations()
+        XCTAssertEqual(canceledAuthorizations, [testAuthorization])
+    }
+
     func testMultipleAuthorizationsPersistDistinctProviderQualifiedCredentials() async throws {
         let first = GitHubAccount(id: 7, login: "franz", name: "Franz", avatarURL: nil)
         let second = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
@@ -3919,6 +3947,7 @@ private actor SuspendedRemovalCredentialStore: CredentialStoring {
 private actor SuspendedAuthorizationAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
     private var didStartAuthorization = false
     private var authorizationCompletion: CheckedContinuation<Void, Never>?
+    private var canceled: [GitHubBrowserAuthorization] = []
 
     func beginAuthorization(configuration: GitHubOAuthConfiguration) async -> GitHubBrowserAuthorization {
         didStartAuthorization = true
@@ -3932,7 +3961,9 @@ private actor SuspendedAuthorizationAPI: GitHubAPIProviding, GitHubOAuthAuthoriz
         throw CancellationError()
     }
 
-    func cancelAuthorization(_ authorization: GitHubBrowserAuthorization) {}
+    func cancelAuthorization(_ authorization: GitHubBrowserAuthorization) {
+        canceled.append(authorization)
+    }
 
     func authenticatedUser(token: String) -> GitHubAccount {
         GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
@@ -3945,6 +3976,10 @@ private actor SuspendedAuthorizationAPI: GitHubAPIProviding, GitHubOAuthAuthoriz
     func finishAuthorization() {
         authorizationCompletion?.resume()
         authorizationCompletion = nil
+    }
+
+    func canceledAuthorizations() -> [GitHubBrowserAuthorization] {
+        canceled
     }
 }
 

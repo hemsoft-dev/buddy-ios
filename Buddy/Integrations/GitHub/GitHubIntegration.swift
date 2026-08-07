@@ -214,6 +214,7 @@ actor GitHubIntegration: IntegrationProviding {
         reconnecting id: ConnectedAccountID? = nil
     ) async throws -> GitHubBrowserAuthorization {
         let configuration = try oauthConfiguration()
+        let authorizationGenerationSnapshot = authorizationGeneration
         let generationSnapshot = accountGenerations
         let targetGeneration = id.map { id in
             accountGenerations[id, default: 0] &+= 1
@@ -222,6 +223,10 @@ actor GitHubIntegration: IntegrationProviding {
         }
         do {
             let authorization = try await authorizer.beginAuthorization(configuration: configuration)
+            if Task.isCancelled || authorizationGeneration != authorizationGenerationSnapshot {
+                await authorizer.cancelAuthorization(authorization)
+                throw CancellationError()
+            }
             if let id,
                accountGenerations[id, default: 0] != targetGeneration {
                 await authorizer.cancelAuthorization(authorization)
