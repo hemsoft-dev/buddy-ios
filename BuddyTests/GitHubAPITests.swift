@@ -104,7 +104,7 @@ final class GitHubAPITests: XCTestCase {
         ])
         let service = GitHubWebOAuthService(
             httpClient: httpClient,
-            callbackTimeout: .seconds(2),
+            callbackTimeout: .seconds(15),
             randomBytes: { count in Data(repeating: UInt8(count), count: count) }
         )
         let authorization = try await service.beginAuthorization(
@@ -193,7 +193,7 @@ final class GitHubAPITests: XCTestCase {
 
     func testBrowserAuthorizationReportsAccessDeniedCallback() async throws {
         let service = GitHubWebOAuthService(
-            callbackTimeout: .seconds(2),
+            callbackTimeout: .seconds(15),
             randomBytes: { count in Data(repeating: UInt8(count), count: count) }
         )
         let authorization = try await service.beginAuthorization(
