@@ -1763,6 +1763,32 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(healthyToken, "healthy-token")
     }
 
+    func testPublicOnlyAccountRequiresReconnectAndPreservesStoredCredential() async throws {
+        let account = GitHubAccount(id: 7, login: "public-only", name: nil, avatarURL: nil)
+        let credentialAccount = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        let credentials = MockCredentialStore(values: [credentialAccount: "public-only-token"])
+        let accountStore = InMemoryConnectedAccountStore(records: [account.connectedAccountRecord])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: StubGitHubAPI(userResults: [.failure(.insufficientOAuthScope)]),
+            credentials: credentials,
+            accountStore: accountStore
+        )
+
+        let restored = try await integration.restoreAccounts()
+
+        XCTAssertEqual(restored, [
+            GitHubAccountConnection(
+                account: account,
+                state: .needsAttention,
+                message: GitHubConnectionError.privateRepositoryAccessRequired.localizedDescription,
+                recoveryAction: .reconnect
+            ),
+        ])
+        let storedToken = await credentials.stringValue(for: credentialAccount)
+        XCTAssertEqual(storedToken, "public-only-token")
+    }
+
     func testDisconnectDuringRestoreCannotResurrectAccount() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let scopedKey = GitHubIntegration.credentialAccount(for: account.connectedAccountID)

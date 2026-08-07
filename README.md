@@ -57,9 +57,12 @@ provider supports it.
 Buddy uses GitHub's browser authorization-code flow with a loopback callback,
 cryptographically random state, and PKCE `S256`. The authorization request uses
 `prompt=select_account`, so initial connect, Add account, and reconnect all show
-GitHub's account chooser. Buddy requests no OAuth scopes: the current features
-need only public identity and public pull-request data. Tokens are stored only in
-iOS Keychain.
+GitHub's account chooser. Buddy requests GitHub's `repo` OAuth scope so authored
+and review-requested pull requests from private repositories appear alongside
+public repositories. GitHub's OAuth App model grants broad read/write repository
+access with this scope; Buddy uses it only for read-only identity and pull-request
+API requests. Tokens are stored only in iOS Keychain. Existing accounts must be
+reconnected once after this change so GitHub can grant the required scope.
 
 GitHub currently requires `client_secret` during authorization-code exchange,
 including when PKCE is supplied. A credential distributed in an iOS bundle is

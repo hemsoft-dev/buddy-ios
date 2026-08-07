@@ -9,6 +9,8 @@ struct GitHubBrowserAuthorization: Equatable, Identifiable, Sendable {
 }
 
 struct GitHubOAuthConfiguration: Equatable, Sendable {
+    static let repositoryScope = "repo"
+
     let clientID: String
     let clientSecret: String
 }
@@ -97,6 +99,7 @@ struct GitHubAPI: GitHubAPIProviding {
         }
 
         var request = URLRequest(url: url)
+        request.httpMethod = "GET"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
@@ -164,6 +167,7 @@ struct GitHubAPI: GitHubAPIProviding {
         }
 
         var request = URLRequest(url: url)
+        request.httpMethod = "GET"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
@@ -219,7 +223,10 @@ struct GitHubAPI: GitHubAPIProviding {
 
     private func perform(_ request: URLRequest) async throws -> Data {
         do {
-            let (data, _) = try await httpClient.data(for: request)
+            let (data, response) = try await httpClient.data(for: request)
+            guard Self.oauthScopes(from: response).contains(GitHubOAuthConfiguration.repositoryScope) else {
+                throw GitHubAPIError.insufficientOAuthScope
+            }
             return data
         } catch HTTPClientError.unacceptableStatus(401) {
             throw GitHubAPIError.unauthorized
@@ -231,6 +238,15 @@ struct GitHubAPI: GitHubAPIProviding {
         } catch HTTPClientError.invalidResponse {
             throw GitHubAPIError.malformedResponse
         }
+    }
+
+    private static func oauthScopes(from response: HTTPURLResponse) -> Set<String> {
+        Set(
+            (response.value(forHTTPHeaderField: "X-OAuth-Scopes") ?? "")
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        )
     }
 
     private func isValidLogin(_ login: String) -> Bool {
@@ -283,6 +299,7 @@ enum GitHubAPIError: Error, Equatable, Sendable {
     case incorrectClientCredentials
     case rateLimited
     case incompleteResults
+    case insufficientOAuthScope
     case server(Int)
 }
 
@@ -543,6 +560,7 @@ actor GitHubWebOAuthService: GitHubOAuthAuthorizing {
             URLQueryItem(name: "state", value: state),
             URLQueryItem(name: "code_challenge", value: codeChallenge),
             URLQueryItem(name: "code_challenge_method", value: "S256"),
+            URLQueryItem(name: "scope", value: GitHubOAuthConfiguration.repositoryScope),
             URLQueryItem(name: "prompt", value: "select_account"),
         ]
         return components.url!

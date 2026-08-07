@@ -149,15 +149,15 @@ final class DashboardViewModelTests: XCTestCase {
         )
     }
 
-    func testAssignedEmptyStateDisclosesPublicRepositoryLimit() {
+    func testAssignedEmptyStateCoversPublicAndPrivateRepositories() {
         let description = DashboardGitHubPullRequestCopy.emptyStateDescription(
             login: "octocat",
             section: .assigned
         )
 
-        XCTAssertTrue(description.contains("No public open pull requests"))
+        XCTAssertTrue(description.contains("No open pull requests"))
         XCTAssertTrue(description.contains("@octocat"))
-        XCTAssertTrue(description.contains("limited to public repositories"))
+        XCTAssertFalse(description.contains("public repositories"))
     }
 
     func testPullRequestTreeExpansionSurvivesRefreshForExistingRepositories() {
@@ -409,6 +409,19 @@ final class DashboardViewModelTests: XCTestCase {
 
     func testGitHubDashboardMapsUnauthorizedRefreshToRecoveryState() async {
         let provider = StubPullRequestProvider(results: [.failure(.invalidToken)])
+        let viewModel = DashboardViewModel(integrations: [], github: provider)
+
+        let failure = await viewModel.refresh(account: testAccount)
+
+        XCTAssertEqual(failure, .authenticationRequired)
+        XCTAssertEqual(
+            viewModel.githubState,
+            .failed([], refreshedAt: nil, .authenticationRequired)
+        )
+    }
+
+    func testGitHubDashboardMapsMissingPrivateRepositoryScopeToReconnect() async {
+        let provider = StubPullRequestProvider(results: [.failure(.privateRepositoryAccessRequired)])
         let viewModel = DashboardViewModel(integrations: [], github: provider)
 
         let failure = await viewModel.refresh(account: testAccount)

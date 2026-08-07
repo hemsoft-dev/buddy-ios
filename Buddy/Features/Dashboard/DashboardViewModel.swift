@@ -20,9 +20,9 @@ enum DashboardGitHubPullRequestCopy {
     ) -> String {
         switch section {
         case .authored:
-            "@\(login) has no public authored pull requests open right now. Buddy's current GitHub authorization is limited to public repositories."
+            "@\(login) has no authored pull requests open right now."
         case .assigned:
-            "No public open pull requests currently request a review from @\(login). Buddy's current GitHub authorization is limited to public repositories."
+            "No open pull requests currently request a review from @\(login)."
         }
     }
 
@@ -490,7 +490,7 @@ final class DashboardViewModel {
         }
 
         return switch error {
-        case .invalidToken:
+        case .invalidToken, .privateRepositoryAccessRequired:
             .authenticationRequired
         case .networkUnavailable:
             .offline

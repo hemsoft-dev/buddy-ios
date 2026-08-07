@@ -22,8 +22,8 @@ final class GitHubAPITests: XCTestCase {
         XCTAssertEqual(query["state"]!, "random-state")
         XCTAssertEqual(query["code_challenge"]!, "challenge")
         XCTAssertEqual(query["code_challenge_method"]!, "S256")
+        XCTAssertEqual(query["scope"]!, "repo")
         XCTAssertEqual(query["prompt"]!, "select_account")
-        XCTAssertFalse(query.keys.contains("scope"))
     }
 
     func testPKCEUsesIndependentSecureMaterialAndReportsRandomnessFailure() async throws {
@@ -316,7 +316,11 @@ final class GitHubAPITests: XCTestCase {
 
     func testAuthenticatedUserUsesBearerTokenAndMapsUnauthorized() async throws {
         let validClient = MockHTTPClient(responses: [
-            .success(#"{"id":42,"login":"octocat","name":"The Octocat","avatar_url":"https://avatars.githubusercontent.com/u/42"}"#, statusCode: 200),
+            .successWithScopes(
+                #"{"id":42,"login":"octocat","name":"The Octocat","avatar_url":"https://avatars.githubusercontent.com/u/42"}"#,
+                statusCode: 200,
+                scopes: "user, repo"
+            ),
         ])
         let api = GitHubAPI(httpClient: validClient)
 
@@ -326,6 +330,7 @@ final class GitHubAPITests: XCTestCase {
         XCTAssertEqual(account.login, "octocat")
         let capturedRequest = await validClient.lastRequest()
         let request = try XCTUnwrap(capturedRequest)
+        XCTAssertEqual(request.httpMethod, "GET")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer sensitive-token")
 
         let unauthorizedClient = MockHTTPClient(responses: [.success("{}", statusCode: 401)])
@@ -334,6 +339,23 @@ final class GitHubAPITests: XCTestCase {
             XCTFail("Expected unauthorized")
         } catch let error as GitHubAPIError {
             XCTAssertEqual(error, .unauthorized)
+        }
+    }
+
+    func testAuthenticatedUserRejectsTokensWithoutPrivateRepositoryScope() async throws {
+        let client = MockHTTPClient(responses: [
+            .successWithScopes(
+                #"{"id":42,"login":"octocat"}"#,
+                statusCode: 200,
+                scopes: "read:user"
+            ),
+        ])
+
+        do {
+            _ = try await GitHubAPI(httpClient: client).authenticatedUser(token: "public-only-token")
+            XCTFail("Expected missing repository scope")
+        } catch let error as GitHubAPIError {
+            XCTAssertEqual(error, .insufficientOAuthScope)
         }
     }
 
@@ -362,6 +384,7 @@ final class GitHubAPITests: XCTestCase {
         XCTAssertEqual(components.scheme, "https")
         XCTAssertEqual(components.host, "api.github.com")
         XCTAssertEqual(components.path, "/search/issues")
+        XCTAssertEqual(request.httpMethod, "GET")
         XCTAssertEqual(query["q"]!, "is:pr is:open author:franz-test")
         XCTAssertEqual(query["sort"]!, "updated")
         XCTAssertEqual(query["order"]!, "desc")
@@ -495,6 +518,7 @@ private enum ErrorExpectation: Equatable {
 private actor MockHTTPClient: HTTPClient {
     enum Response: Sendable {
         case success(String, statusCode: Int)
+        case successWithScopes(String, statusCode: Int, scopes: String)
         case networkFailure
         case rateLimited
     }
@@ -516,7 +540,18 @@ private actor MockHTTPClient: HTTPClient {
                 url: request.url!,
                 statusCode: statusCode,
                 httpVersion: nil,
-                headerFields: nil
+                headerFields: ["X-OAuth-Scopes": "repo"]
+            )!
+            guard 200..<300 ~= statusCode else {
+                throw HTTPClientError.unacceptableStatus(statusCode)
+            }
+            return (Data(body.utf8), httpResponse)
+        case let .successWithScopes(body, statusCode, scopes):
+            let httpResponse = HTTPURLResponse(
+                url: request.url!,
+                statusCode: statusCode,
+                httpVersion: nil,
+                headerFields: ["X-OAuth-Scopes": scopes]
             )!
             guard 200..<300 ~= statusCode else {
                 throw HTTPClientError.unacceptableStatus(statusCode)

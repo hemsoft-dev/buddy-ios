@@ -864,6 +864,14 @@ actor GitHubIntegration: IntegrationProviding {
                 message: GitHubConnectionError.invalidToken.localizedDescription,
                 recoveryAction: .reconnect
             )
+        } catch GitHubAPIError.insufficientOAuthScope {
+            guard generation == accountGenerations[record.id, default: 0] else { return nil }
+            return GitHubAccountConnection(
+                account: account,
+                state: .needsAttention,
+                message: GitHubConnectionError.privateRepositoryAccessRequired.localizedDescription,
+                recoveryAction: .reconnect
+            )
         } catch {
             guard generation == accountGenerations[record.id, default: 0] else { return nil }
             return GitHubAccountConnection(
@@ -1016,6 +1024,14 @@ actor GitHubIntegration: IntegrationProviding {
             accountGenerations[accountID, default: 0] &+= 1
             updateSummary(detail: "Authorization expired", state: .needsAttention)
             throw GitHubConnectionError.invalidToken
+        } catch GitHubAPIError.insufficientOAuthScope {
+            guard generation == authorizationGeneration,
+                  accountGeneration == accountGenerations[accountID, default: 0]
+            else {
+                throw CancellationError()
+            }
+            updateSummary(detail: "Private repository access required", state: .needsAttention)
+            throw GitHubConnectionError.privateRepositoryAccessRequired
         } catch {
             if Task.isCancelled {
                 throw CancellationError()
@@ -1274,6 +1290,8 @@ actor GitHubIntegration: IntegrationProviding {
                 return .rateLimited
             case .incompleteResults:
                 return .incompleteResults
+            case .insufficientOAuthScope:
+                return .privateRepositoryAccessRequired
             case let .server(statusCode):
                 return .server(statusCode)
             }
@@ -1324,6 +1342,7 @@ enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
     case malformedResponse
     case rateLimited
     case incompleteResults
+    case privateRepositoryAccessRequired
     case server(Int)
     case credentialStorage
     case accountStorage
@@ -1356,6 +1375,8 @@ enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
             "GitHub's request limit was reached. Wait a little while, then refresh again."
         case .incompleteResults:
             "GitHub returned partial search results. Refresh to try again."
+        case .privateRepositoryAccessRequired:
+            "Buddy needs GitHub repository access to show private pull requests. Reconnect this account and approve repository access."
         case let .server(statusCode):
             "GitHub returned an error (\(statusCode)). Try again later."
         case .credentialStorage:
@@ -1383,6 +1404,7 @@ enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
         case .malformedResponse: "Unexpected response from GitHub"
         case .rateLimited: "GitHub request limit reached"
         case .incompleteResults: "GitHub returned partial results"
+        case .privateRepositoryAccessRequired: "Private repository access required"
         case .server: "GitHub is unavailable"
         case .credentialStorage: "Keychain update failed"
         case .accountStorage: "Account list unavailable"
