@@ -94,6 +94,29 @@ final class DashboardViewModelTests: XCTestCase {
         XCTAssertEqual(groups[1].pullRequests.map(\.id), [1])
     }
 
+    func testPullRequestAccountSummaryPreservesBoundedSearchTotals() {
+        XCTAssertEqual(
+            DashboardGitHubPullRequestCopy.accountSummary(
+                authoredVisible: 50,
+                authoredTotal: 72,
+                assignedVisible: 2,
+                assignedTotal: 2
+            ),
+            "50 of 72 authored · 2 assigned"
+        )
+    }
+
+    func testAssignedEmptyStateDisclosesPublicRepositoryLimit() {
+        let description = DashboardGitHubPullRequestCopy.emptyStateDescription(
+            login: "octocat",
+            section: .assigned
+        )
+
+        XCTAssertTrue(description.contains("No public open pull requests"))
+        XCTAssertTrue(description.contains("@octocat"))
+        XCTAssertTrue(description.contains("limited to public repositories"))
+    }
+
     func testPullRequestTreeExpansionSurvivesRefreshForExistingRepositories() {
         var expansion = DashboardGitHubPullRequestTreeExpansionState()
         expansion.reconcile(accountID: testAccount.id, repositories: ["HemSoft/Buddy", "HemSoft/Other"])
@@ -356,6 +379,25 @@ final class DashboardViewModelTests: XCTestCase {
         XCTAssertEqual(failure, .authenticationRequired)
         XCTAssertEqual(
             viewModel.githubState,
+            .failed([], refreshedAt: nil, .authenticationRequired)
+        )
+    }
+
+    func testGitHubDashboardPropagatesAuthenticationFailureToCanceledSiblingSection() async {
+        let viewModel = DashboardViewModel(
+            integrations: [],
+            github: RevokedCredentialRaceProvider()
+        )
+
+        let failure = await viewModel.refresh(account: testAccount)
+
+        XCTAssertEqual(failure, .authenticationRequired)
+        XCTAssertEqual(
+            viewModel.githubState(for: testAccount, section: .authored),
+            .failed([], refreshedAt: nil, .authenticationRequired)
+        )
+        XCTAssertEqual(
+            viewModel.githubState(for: testAccount, section: .assigned),
             .failed([], refreshedAt: nil, .authenticationRequired)
         )
     }
@@ -629,6 +671,16 @@ private actor SectionedPullRequestProvider: GitHubPullRequestProviding {
         let result = results.removeFirst()
         assigned[account.id] = results
         return try result.get()
+    }
+}
+
+private actor RevokedCredentialRaceProvider: GitHubPullRequestProviding {
+    func authoredPullRequests(for _: GitHubAccount) throws -> GitHubPullRequestCollection {
+        throw GitHubConnectionError.invalidToken
+    }
+
+    func assignedPullRequests(for _: GitHubAccount) throws -> GitHubPullRequestCollection {
+        throw CancellationError()
     }
 }
 

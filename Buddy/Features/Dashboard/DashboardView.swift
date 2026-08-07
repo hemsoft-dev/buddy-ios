@@ -363,7 +363,10 @@ struct DashboardView: View {
                 )
                     .font(.headline)
                     .foregroundStyle(.green)
-                Text(emptyStateDescription(for: account, section: section))
+                Text(DashboardGitHubPullRequestCopy.emptyStateDescription(
+                    login: account.login,
+                    section: section
+                ))
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
@@ -506,18 +509,6 @@ struct DashboardView: View {
         }
     }
 
-    private func emptyStateDescription(
-        for account: GitHubAccount,
-        section: GitHubPullRequestSection
-    ) -> String {
-        switch section {
-        case .authored:
-            "@\(account.login) has no public authored pull requests open right now. Buddy's current GitHub authorization is limited to public repositories."
-        case .assigned:
-            "No open pull requests currently request a review from @\(account.login)."
-        }
-    }
-
     private func githubPullRequestSectionSummary(
         for account: GitHubAccount,
         section: GitHubPullRequestSection
@@ -557,7 +548,12 @@ struct DashboardView: View {
     private func githubHeaderSummary(for account: GitHubAccount) -> String {
         let authoredState = viewModel.githubState(for: account, section: .authored)
         let assignedState = viewModel.githubState(for: account, section: .assigned)
-        let result = "\(authoredState.pullRequests.count) authored · \(assignedState.pullRequests.count) assigned"
+        let result = DashboardGitHubPullRequestCopy.accountSummary(
+            authoredVisible: authoredState.pullRequests.count,
+            authoredTotal: viewModel.githubTotalCount(for: account, section: .authored),
+            assignedVisible: assignedState.pullRequests.count,
+            assignedTotal: viewModel.githubTotalCount(for: account, section: .assigned)
+        )
         let states = [authoredState, assignedState]
         if states.contains(where: {
             if case .failed(_, _, .authenticationRequired) = $0 { return true }

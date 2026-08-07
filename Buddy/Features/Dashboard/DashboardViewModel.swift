@@ -8,9 +8,37 @@ protocol GitHubPullRequestProviding: Sendable {
 
 extension GitHubIntegration: GitHubPullRequestProviding {}
 
-enum GitHubPullRequestSection: Hashable, Sendable {
+enum GitHubPullRequestSection: CaseIterable, Hashable, Sendable {
     case authored
     case assigned
+}
+
+enum DashboardGitHubPullRequestCopy {
+    static func emptyStateDescription(
+        login: String,
+        section: GitHubPullRequestSection
+    ) -> String {
+        switch section {
+        case .authored:
+            "@\(login) has no public authored pull requests open right now. Buddy's current GitHub authorization is limited to public repositories."
+        case .assigned:
+            "No public open pull requests currently request a review from @\(login). Buddy's current GitHub authorization is limited to public repositories."
+        }
+    }
+
+    static func accountSummary(
+        authoredVisible: Int,
+        authoredTotal: Int,
+        assignedVisible: Int,
+        assignedTotal: Int
+    ) -> String {
+        "\(countSummary(visible: authoredVisible, total: authoredTotal)) authored · " +
+            "\(countSummary(visible: assignedVisible, total: assignedTotal)) assigned"
+    }
+
+    private static func countSummary(visible: Int, total: Int) -> String {
+        total > visible ? "\(visible) of \(total)" : "\(visible)"
+    }
 }
 
 enum GitHubPullRequestFailure: Equatable, Sendable {
@@ -274,7 +302,22 @@ final class DashboardViewModel {
         async let authoredFailure = refresh(account: account, section: .authored)
         async let assignedFailure = refresh(account: account, section: .assigned)
         let failures = await [authoredFailure, assignedFailure].compactMap { $0 }
-        return failures.first(where: { $0 == .authenticationRequired }) ?? failures.first
+        if failures.contains(.authenticationRequired) {
+            for section in GitHubPullRequestSection.allCases {
+                let state = githubState(for: account, section: section)
+                setGitHubState(
+                    .failed(
+                        state.pullRequests,
+                        refreshedAt: state.refreshedAt,
+                        .authenticationRequired
+                    ),
+                    for: account.connectedAccountID,
+                    section: section
+                )
+            }
+            return .authenticationRequired
+        }
+        return failures.first
     }
 
     @discardableResult
