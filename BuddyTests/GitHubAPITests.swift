@@ -557,6 +557,119 @@ final class GitHubAPITests: XCTestCase {
         }
     }
 
+    func testPullRequestDetailsUsesOneAccountScopedGraphQLRequestAndReducesReviewers() async throws {
+        let response = #"""
+        {
+          "data": {
+            "repository": {
+              "pullRequest": {
+                "databaseId": 300,
+                "number": 30,
+                "title": "Private detail",
+                "state": "OPEN",
+                "isDraft": false,
+                "updatedAt": "2026-08-08T18:00:00Z",
+                "url": "https://github.com/Relias/private-repo/pull/30",
+                "body": "## Summary\n\n[Read more](https://example.com)",
+                "changedFiles": 8,
+                "additions": 162,
+                "deletions": 52,
+                "author": {"login":"octocat","name":"The Octocat","avatarUrl":"https://avatars.githubusercontent.com/u/1"},
+                "closingIssuesReferences": {"nodes":[{"number":29,"title":"Detail issue","url":"https://github.com/Relias/private-repo/issues/29"}]},
+                "reviewRequests": {"nodes":[
+                  {"requestedReviewer":{"__typename":"User","login":"bob","name":"Bob","avatarUrl":null}},
+                  {"requestedReviewer":{"__typename":"Team","name":"Core Team","slug":"core","avatarUrl":null,"organization":{"login":"Relias"}}}
+                ]},
+                "reviews": {"nodes":[
+                  {"state":"COMMENTED","submittedAt":"2026-08-08T12:00:00Z","author":{"login":"alice","name":"Alice","avatarUrl":null}},
+                  {"state":"APPROVED","submittedAt":"2026-08-08T13:00:00Z","author":{"login":"alice","name":"Alice","avatarUrl":null}},
+                  {"state":"CHANGES_REQUESTED","submittedAt":"2026-08-08T14:00:00Z","author":{"login":"bob","name":"Bob","avatarUrl":null}}
+                ]}
+              }
+            }
+          }
+        }
+        """#
+        let client = MockHTTPClient(responses: [.success(response, statusCode: 200)])
+
+        let details = try await GitHubAPI(httpClient: client).pullRequestDetails(
+            repository: "Relias/private-repo",
+            number: 30,
+            token: "private-account-token"
+        )
+
+        XCTAssertEqual(details.repository, "Relias/private-repo")
+        XCTAssertEqual(details.number, 30)
+        XCTAssertEqual(details.changedFiles, 8)
+        XCTAssertEqual(details.changedLines, 214)
+        XCTAssertEqual(details.author?.login, "octocat")
+        XCTAssertEqual(details.linkedIssues.map(\.number), [29])
+        XCTAssertEqual(details.reviewers.map(\.reviewer.login), ["alice", "bob", "Relias/core"])
+        XCTAssertEqual(details.reviewers.map(\.status), [.approved, .requested, .requested])
+
+        let capturedRequest = await client.lastRequest()
+        let request = try XCTUnwrap(capturedRequest)
+        XCTAssertEqual(request.url?.absoluteString, "https://api.github.com/graphql")
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer private-account-token")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-GitHub-Api-Version"), "2022-11-28")
+        let body = try XCTUnwrap(request.httpBody)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let variables = try XCTUnwrap(object["variables"] as? [String: Any])
+        XCTAssertEqual(variables["owner"] as? String, "Relias")
+        XCTAssertEqual(variables["name"] as? String, "private-repo")
+        XCTAssertEqual(variables["number"] as? Int, 30)
+        let query = try XCTUnwrap(object["query"] as? String)
+        XCTAssertTrue(query.contains("closingIssuesReferences(first: 50)"))
+        XCTAssertTrue(query.contains("reviewRequests(first: 50)"))
+        XCTAssertTrue(query.contains("reviews(last: 100)"))
+    }
+
+    func testPullRequestDetailsSupportsPartialAndEmptyMetadata() async throws {
+        let response = #"""
+        {"data":{"repository":{"pullRequest":{
+          "databaseId":31,"number":31,"title":"Sparse detail","state":"CLOSED","isDraft":false,
+          "updatedAt":"2026-08-08T18:00:00Z","url":"https://github.com/HemSoft/buddy-ios/pull/31",
+          "body":"","changedFiles":0,"additions":0,"deletions":0,"author":null,
+          "closingIssuesReferences":{"nodes":[null]},"reviewRequests":{"nodes":[]},"reviews":{"nodes":[null]}
+        }}}}
+        """#
+
+        let details = try await GitHubAPI(httpClient: MockHTTPClient(responses: [.success(response, statusCode: 200)]))
+            .pullRequestDetails(repository: "HemSoft/buddy-ios", number: 31, token: "token")
+
+        XCTAssertEqual(details.state, .closed)
+        XCTAssertNil(details.author)
+        XCTAssertTrue(details.body.isEmpty)
+        XCTAssertTrue(details.linkedIssues.isEmpty)
+        XCTAssertTrue(details.reviewers.isEmpty)
+    }
+
+    func testPullRequestDetailsRejectsGraphQLErrorsMissingNodesAndMalformedIdentity() async throws {
+        let responses = [
+            #"{"errors":[{"message":"denied"}],"data":{"repository":null}}"#,
+            #"{"data":{"repository":{"pullRequest":null}}}"#,
+        ]
+
+        for response in responses {
+            do {
+                _ = try await GitHubAPI(httpClient: MockHTTPClient(responses: [.success(response, statusCode: 200)]))
+                    .pullRequestDetails(repository: "HemSoft/buddy-ios", number: 30, token: "token")
+                XCTFail("Expected malformed GraphQL response")
+            } catch let error as GitHubAPIError {
+                XCTAssertEqual(error, .malformedResponse)
+            }
+        }
+
+        do {
+            _ = try await GitHubAPI(httpClient: MockHTTPClient(responses: []))
+                .pullRequestDetails(repository: "not-a-repository", number: 30, token: "token")
+            XCTFail("Expected malformed repository identity")
+        } catch let error as GitHubAPIError {
+            XCTAssertEqual(error, .malformedResponse)
+        }
+    }
+
     func testNetworkFailureRemainsRecoverable() async throws {
         let httpClient = MockHTTPClient(responses: [.networkFailure])
 

@@ -664,6 +664,99 @@ final class DashboardViewModelTests: XCTestCase {
         XCTAssertFalse(viewModel.isGitHubRefreshInFlight)
         XCTAssertEqual(viewModel.githubState.pullRequests, [pullRequest])
     }
+
+    func testPullRequestDetailsStayLazyCachedAndAccountIsolated() async {
+        let pullRequest = makePullRequest(id: 30, updatedAt: .now)
+        let firstDetails = makeDetails(id: 30, title: "First account")
+        let provider = SequencedDetailProvider(results: [
+            testAccount.id: [.success(firstDetails)],
+            84: [.failure(.networkUnavailable)],
+        ])
+        let store = GitHubPullRequestDetailStore(provider: provider)
+        let secondAccount = GitHubAccount(id: 84, login: "hubot", name: nil, avatarURL: nil)
+
+        XCTAssertEqual(store.state(for: pullRequest, account: testAccount), .idle)
+        var requestCount = await provider.requestCount()
+        XCTAssertEqual(requestCount, 0)
+
+        await store.load(pullRequest, account: testAccount)
+        await store.load(pullRequest, account: testAccount)
+        XCTAssertEqual(store.state(for: pullRequest, account: testAccount), .loaded(firstDetails))
+        requestCount = await provider.requestCount()
+        XCTAssertEqual(requestCount, 1)
+
+        await store.load(pullRequest, account: secondAccount)
+        XCTAssertEqual(
+            store.state(for: pullRequest, account: secondAccount),
+            .failed(nil, .offline)
+        )
+        XCTAssertEqual(store.state(for: pullRequest, account: testAccount), .loaded(firstDetails))
+        requestCount = await provider.requestCount()
+        XCTAssertEqual(requestCount, 2)
+    }
+
+    func testPullRequestDetailRefreshKeepsCachedContentUntilReplacementArrives() async {
+        let pullRequest = makePullRequest(id: 30, updatedAt: .now)
+        let previous = makeDetails(id: 30, title: "Previous")
+        let replacement = makeDetails(id: 30, title: "Replacement")
+        let provider = BlockingRefreshDetailProvider(first: previous, replacement: replacement)
+        let store = GitHubPullRequestDetailStore(provider: provider)
+        await store.load(pullRequest, account: testAccount)
+
+        let refresh = Task { await store.refresh(pullRequest, account: testAccount) }
+        await provider.waitUntilRefreshRequested()
+
+        XCTAssertEqual(store.state(for: pullRequest, account: testAccount), .refreshing(previous))
+        await provider.finishRefresh()
+        await refresh.value
+        XCTAssertEqual(store.state(for: pullRequest, account: testAccount), .loaded(replacement))
+    }
+
+    func testPullRequestDetailRetryReplacesFailure() async {
+        let pullRequest = makePullRequest(id: 30, updatedAt: .now)
+        let details = makeDetails(id: 30, title: "Recovered")
+        let provider = SequencedDetailProvider(results: [
+            testAccount.id: [.failure(.server(503)), .success(details)],
+        ])
+        let store = GitHubPullRequestDetailStore(provider: provider)
+
+        await store.load(pullRequest, account: testAccount)
+        XCTAssertEqual(store.state(for: pullRequest, account: testAccount), .failed(nil, .server))
+
+        await store.retry(pullRequest, account: testAccount)
+        XCTAssertEqual(store.state(for: pullRequest, account: testAccount), .loaded(details))
+    }
+
+    func testPullRequestDetailCancellationClearsUncachedLoadingState() async {
+        let pullRequest = makePullRequest(id: 30, updatedAt: .now)
+        let provider = BlockingRefreshDetailProvider(first: nil, replacement: makeDetails(id: 30))
+        let store = GitHubPullRequestDetailStore(provider: provider)
+        let load = Task { await store.load(pullRequest, account: testAccount) }
+        await provider.waitUntilRefreshRequested()
+
+        XCTAssertEqual(store.state(for: pullRequest, account: testAccount), .loading)
+        store.cancel(pullRequest, account: testAccount)
+        await load.value
+
+        XCTAssertEqual(store.state(for: pullRequest, account: testAccount), .idle)
+        let wasCancelled = await provider.wasCancelled()
+        XCTAssertTrue(wasCancelled)
+    }
+
+    func testNativeDetailNavigationAndDiffAccessibilityCopyAreExplicit() {
+        let pullRequest = makePullRequest(id: 30, updatedAt: .now)
+        let key = GitHubPullRequestDetailKey(account: testAccount, pullRequest: pullRequest)
+        let details = makeDetails(id: 30, changedFiles: 8, additions: 162, deletions: 52)
+
+        XCTAssertEqual(key.accountID, testAccount.connectedAccountID)
+        XCTAssertEqual(key.repository, pullRequest.repository)
+        XCTAssertEqual(key.number, 30)
+        XCTAssertEqual(GitHubPullRequestDetailCopy.navigationHint, "Opens pull request details in Buddy")
+        XCTAssertEqual(
+            GitHubPullRequestDetailCopy.diffAccessibilityLabel(details),
+            "Diff summary, 8 changed files, 214 changed lines, 162 additions, 52 deletions"
+        )
+    }
 }
 
 private let testAccount = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
@@ -701,6 +794,95 @@ private func collection(
         pullRequests: pullRequests,
         totalCount: totalCount ?? pullRequests.count
     )
+}
+
+private func makeDetails(
+    id: Int,
+    title: String = "Pull request detail",
+    changedFiles: Int = 1,
+    additions: Int = 2,
+    deletions: Int = 1
+) -> GitHubPullRequestDetails {
+    GitHubPullRequestDetails(
+        id: id,
+        repository: "HemSoft/Buddy",
+        number: id,
+        title: title,
+        state: .open,
+        isDraft: false,
+        updatedAt: Date(timeIntervalSince1970: 1_000),
+        url: URL(string: "https://github.com/HemSoft/Buddy/pull/\(id)")!,
+        body: "Description",
+        changedFiles: changedFiles,
+        additions: additions,
+        deletions: deletions,
+        author: nil,
+        linkedIssues: [],
+        reviewers: []
+    )
+}
+
+private actor SequencedDetailProvider: GitHubPullRequestDetailProviding {
+    private var results: [Int: [Result<GitHubPullRequestDetails, GitHubConnectionError>]]
+    private var capturedRequestCount = 0
+
+    init(results: [Int: [Result<GitHubPullRequestDetails, GitHubConnectionError>]]) {
+        self.results = results
+    }
+
+    func pullRequestDetails(
+        for _: GitHubPullRequest,
+        account: GitHubAccount
+    ) throws -> GitHubPullRequestDetails {
+        capturedRequestCount += 1
+        guard var accountResults = results[account.id], !accountResults.isEmpty else {
+            throw GitHubConnectionError.malformedResponse
+        }
+        let result = accountResults.removeFirst()
+        results[account.id] = accountResults
+        return try result.get()
+    }
+
+    func requestCount() -> Int { capturedRequestCount }
+}
+
+private actor BlockingRefreshDetailProvider: GitHubPullRequestDetailProviding {
+    private let first: GitHubPullRequestDetails?
+    private let replacement: GitHubPullRequestDetails
+    private var capturedRequestCount = 0
+    private var shouldFinish = false
+    private var capturedCancellation = false
+
+    init(first: GitHubPullRequestDetails?, replacement: GitHubPullRequestDetails) {
+        self.first = first
+        self.replacement = replacement
+    }
+
+    func pullRequestDetails(
+        for _: GitHubPullRequest,
+        account _: GitHubAccount
+    ) async throws -> GitHubPullRequestDetails {
+        capturedRequestCount += 1
+        if capturedRequestCount == 1, let first { return first }
+        do {
+            while !shouldFinish {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            return replacement
+        } catch is CancellationError {
+            capturedCancellation = true
+            throw CancellationError()
+        }
+    }
+
+    func waitUntilRefreshRequested() async {
+        let expectedCount = first == nil ? 1 : 2
+        while capturedRequestCount < expectedCount { await Task.yield() }
+    }
+
+    func finishRefresh() { shouldFinish = true }
+
+    func wasCancelled() -> Bool { capturedCancellation }
 }
 
 private actor StubPullRequestProvider: GitHubPullRequestProviding {

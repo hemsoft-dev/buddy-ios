@@ -75,11 +75,92 @@ struct GitHubPullRequestCollection: Equatable, Sendable {
     let totalCount: Int
 }
 
+struct GitHubIssueReference: Identifiable, Equatable, Sendable {
+    var id: Int { number }
+
+    let number: Int
+    let title: String
+    let url: URL
+}
+
+struct GitHubUserSummary: Identifiable, Equatable, Sendable {
+    let id: String
+    let login: String
+    let name: String?
+    let avatarURL: URL?
+    let isTeam: Bool
+}
+
+enum GitHubReviewerStatus: String, Equatable, Sendable {
+    case requested
+    case approved
+    case changesRequested
+    case commented
+
+    var label: String {
+        switch self {
+        case .requested: "Requested"
+        case .approved: "Approved"
+        case .changesRequested: "Changes requested"
+        case .commented: "Commented"
+        }
+    }
+
+    fileprivate init?(graphQLReviewState: String) {
+        switch graphQLReviewState {
+        case "APPROVED": self = .approved
+        case "CHANGES_REQUESTED": self = .changesRequested
+        case "COMMENTED": self = .commented
+        default: return nil
+        }
+    }
+}
+
+struct GitHubReviewerSummary: Identifiable, Equatable, Sendable {
+    var id: String { reviewer.id }
+
+    let reviewer: GitHubUserSummary
+    let status: GitHubReviewerStatus
+}
+
+enum GitHubPullRequestState: String, Equatable, Sendable {
+    case open
+    case closed
+    case merged
+
+    var label: String { rawValue.capitalized }
+}
+
+struct GitHubPullRequestDetails: Equatable, Sendable {
+    let id: Int
+    let repository: String
+    let number: Int
+    let title: String
+    let state: GitHubPullRequestState
+    let isDraft: Bool
+    let updatedAt: Date
+    let url: URL
+    let body: String
+    let changedFiles: Int
+    let additions: Int
+    let deletions: Int
+    let author: GitHubUserSummary?
+    let linkedIssues: [GitHubIssueReference]
+    let reviewers: [GitHubReviewerSummary]
+
+    var changedLines: Int { additions + deletions }
+}
+
 protocol GitHubAPIProviding: Sendable {
     func authenticatedUser(token: String) async throws -> GitHubAccount
     func authenticatedUserForCredentialMigration(token: String) async throws -> GitHubAccount
     func authoredPullRequests(login: String, token: String) async throws -> GitHubPullRequestCollection
     func assignedPullRequests(login: String, token: String) async throws -> GitHubPullRequestCollection
+    func pullRequestDetails(
+        repository: String,
+        number: Int,
+        token: String
+    ) async throws -> GitHubPullRequestDetails
 }
 
 extension GitHubAPIProviding {
@@ -92,6 +173,14 @@ extension GitHubAPIProviding {
     }
 
     func assignedPullRequests(login _: String, token _: String) async throws -> GitHubPullRequestCollection {
+        throw GitHubAPIError.malformedResponse
+    }
+
+    func pullRequestDetails(
+        repository _: String,
+        number _: Int,
+        token _: String
+    ) async throws -> GitHubPullRequestDetails {
         throw GitHubAPIError.malformedResponse
     }
 }
@@ -168,6 +257,209 @@ struct GitHubAPI: GitHubAPIProviding {
             token: token,
             qualifier: "review-requested"
         )
+    }
+
+    /// Fetches a single pull request's read-only metadata without expanding dashboard summaries.
+    /// The GraphQL shape collects reviewer and linked-issue metadata in one bounded request.
+    func pullRequestDetails(
+        repository: String,
+        number: Int,
+        token: String
+    ) async throws -> GitHubPullRequestDetails {
+        let repositoryParts = repository.split(separator: "/", omittingEmptySubsequences: false)
+        guard repositoryParts.count == 2,
+              repositoryParts.allSatisfy({ !$0.isEmpty }),
+              number > 0,
+              let url = URL(string: "https://api.github.com/graphql")
+        else {
+            throw GitHubAPIError.malformedResponse
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "query": Self.pullRequestDetailsQuery,
+            "variables": [
+                "owner": String(repositoryParts[0]),
+                "name": String(repositoryParts[1]),
+                "number": number,
+            ],
+        ])
+        guard request.httpBody != nil else { throw GitHubAPIError.malformedResponse }
+
+        let data = try await perform(request)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let response: PullRequestDetailsGraphQLResponse
+        do {
+            response = try decoder.decode(PullRequestDetailsGraphQLResponse.self, from: data)
+        } catch {
+            throw GitHubAPIError.malformedResponse
+        }
+        guard response.errors?.isEmpty != false,
+              let node = response.data?.repository?.pullRequest,
+              node.id > 0,
+              node.number == number,
+              !node.title.isEmpty,
+              node.changedFiles >= 0,
+              node.additions >= 0,
+              node.deletions >= 0,
+              let state = GitHubPullRequestState(rawValue: node.state.lowercased()),
+              let canonicalURL = canonicalGitHubURL(from: node.url)
+        else {
+            throw GitHubAPIError.malformedResponse
+        }
+
+        let author = try node.author.map(Self.userSummary)
+        var linkedIssues: [GitHubIssueReference] = []
+        for issue in node.closingIssuesReferences.nodes.compactMap({ $0 }) {
+            guard issue.number > 0,
+                  !issue.title.isEmpty,
+                  let issueURL = canonicalGitHubURL(from: issue.url)
+            else {
+                throw GitHubAPIError.malformedResponse
+            }
+            linkedIssues.append(
+                GitHubIssueReference(number: issue.number, title: issue.title, url: issueURL)
+            )
+        }
+        linkedIssues.sort { $0.number < $1.number }
+
+        return GitHubPullRequestDetails(
+            id: node.id,
+            repository: repository,
+            number: node.number,
+            title: node.title,
+            state: state,
+            isDraft: node.isDraft,
+            updatedAt: node.updatedAt,
+            url: canonicalURL,
+            body: node.body,
+            changedFiles: node.changedFiles,
+            additions: node.additions,
+            deletions: node.deletions,
+            author: author,
+            linkedIssues: linkedIssues,
+            reviewers: try Self.reviewerSummaries(from: node)
+        )
+    }
+
+    private static let pullRequestDetailsQuery = """
+    query BuddyPullRequestDetails($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          databaseId
+          number
+          title
+          state
+          isDraft
+          updatedAt
+          url
+          body
+          changedFiles
+          additions
+          deletions
+          author {
+            login
+            avatarUrl
+            ... on User { name }
+          }
+          closingIssuesReferences(first: 50) {
+            nodes { number title url }
+          }
+          reviewRequests(first: 50) {
+            nodes {
+              requestedReviewer {
+                __typename
+                ... on User { login name avatarUrl }
+                ... on Team { name slug avatarUrl organization { login } }
+              }
+            }
+          }
+          reviews(last: 100) {
+            nodes {
+              state
+              submittedAt
+              author {
+                login
+                avatarUrl
+                ... on User { name }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+
+    private static func userSummary(_ actor: PullRequestDetailsActor) throws -> GitHubUserSummary {
+        guard !actor.login.isEmpty else { throw GitHubAPIError.malformedResponse }
+        return GitHubUserSummary(
+            id: "user:\(actor.login.lowercased())",
+            login: actor.login,
+            name: actor.name,
+            avatarURL: actor.avatarURL.flatMap(URL.init(string:)),
+            isTeam: false
+        )
+    }
+
+    private static func reviewerSummaries(
+        from pullRequest: PullRequestDetailsNode
+    ) throws -> [GitHubReviewerSummary] {
+        var reviewers: [String: GitHubReviewerSummary] = [:]
+
+        for review in pullRequest.reviews.nodes.compactMap({ $0 })
+            .sorted(by: { ($0.submittedAt ?? .distantPast) < ($1.submittedAt ?? .distantPast) }) {
+            guard let author = review.author,
+                  let status = GitHubReviewerStatus(graphQLReviewState: review.state)
+            else { continue }
+            let reviewer = try userSummary(author)
+            reviewers[reviewer.id] = GitHubReviewerSummary(reviewer: reviewer, status: status)
+        }
+
+        for request in pullRequest.reviewRequests.nodes.compactMap({ $0 }) {
+            guard let requestedReviewer = request.requestedReviewer else { continue }
+            let reviewer: GitHubUserSummary
+            switch requestedReviewer.typeName {
+            case "User":
+                guard let login = requestedReviewer.login, !login.isEmpty else {
+                    throw GitHubAPIError.malformedResponse
+                }
+                reviewer = GitHubUserSummary(
+                    id: "user:\(login.lowercased())",
+                    login: login,
+                    name: requestedReviewer.name,
+                    avatarURL: requestedReviewer.avatarURL.flatMap(URL.init(string:)),
+                    isTeam: false
+                )
+            case "Team":
+                guard let slug = requestedReviewer.slug,
+                      !slug.isEmpty,
+                      let organization = requestedReviewer.organization?.login,
+                      !organization.isEmpty
+                else {
+                    throw GitHubAPIError.malformedResponse
+                }
+                reviewer = GitHubUserSummary(
+                    id: "team:\(organization.lowercased())/\(slug.lowercased())",
+                    login: "\(organization)/\(slug)",
+                    name: requestedReviewer.name,
+                    avatarURL: requestedReviewer.avatarURL.flatMap(URL.init(string:)),
+                    isTeam: true
+                )
+            default:
+                continue
+            }
+            reviewers[reviewer.id] = GitHubReviewerSummary(reviewer: reviewer, status: .requested)
+        }
+
+        return reviewers.values.sorted {
+            $0.reviewer.login.localizedCaseInsensitiveCompare($1.reviewer.login) == .orderedAscending
+        }
     }
 
     private func pullRequests(
@@ -378,6 +670,121 @@ private struct PullRequestSearchItem: Decodable {
         case htmlURL = "html_url"
         case repositoryURL = "repository_url"
     }
+}
+
+private struct PullRequestDetailsGraphQLResponse: Decodable {
+    let data: PullRequestDetailsGraphQLData?
+    let errors: [PullRequestDetailsGraphQLError]?
+}
+
+private struct PullRequestDetailsGraphQLError: Decodable {
+    let message: String
+}
+
+private struct PullRequestDetailsGraphQLData: Decodable {
+    let repository: PullRequestDetailsRepository?
+}
+
+private struct PullRequestDetailsRepository: Decodable {
+    let pullRequest: PullRequestDetailsNode?
+}
+
+private struct PullRequestDetailsNode: Decodable {
+    let id: Int
+    let number: Int
+    let title: String
+    let state: String
+    let isDraft: Bool
+    let updatedAt: Date
+    let url: String
+    let body: String
+    let changedFiles: Int
+    let additions: Int
+    let deletions: Int
+    let author: PullRequestDetailsActor?
+    let closingIssuesReferences: PullRequestDetailsIssueConnection
+    let reviewRequests: PullRequestDetailsReviewRequestConnection
+    let reviews: PullRequestDetailsReviewConnection
+
+    enum CodingKeys: String, CodingKey {
+        case id = "databaseId"
+        case number
+        case title
+        case state
+        case isDraft
+        case updatedAt
+        case url
+        case body
+        case changedFiles
+        case additions
+        case deletions
+        case author
+        case closingIssuesReferences
+        case reviewRequests
+        case reviews
+    }
+}
+
+private struct PullRequestDetailsActor: Decodable {
+    let login: String
+    let name: String?
+    let avatarURL: String?
+
+    enum CodingKeys: String, CodingKey {
+        case login
+        case name
+        case avatarURL = "avatarUrl"
+    }
+}
+
+private struct PullRequestDetailsIssueConnection: Decodable {
+    let nodes: [PullRequestDetailsIssueNode?]
+}
+
+private struct PullRequestDetailsIssueNode: Decodable {
+    let number: Int
+    let title: String
+    let url: String
+}
+
+private struct PullRequestDetailsReviewRequestConnection: Decodable {
+    let nodes: [PullRequestDetailsReviewRequestNode?]
+}
+
+private struct PullRequestDetailsReviewRequestNode: Decodable {
+    let requestedReviewer: PullRequestDetailsRequestedReviewer?
+}
+
+private struct PullRequestDetailsRequestedReviewer: Decodable {
+    let typeName: String
+    let login: String?
+    let name: String?
+    let slug: String?
+    let avatarURL: String?
+    let organization: PullRequestDetailsOrganization?
+
+    enum CodingKeys: String, CodingKey {
+        case typeName = "__typename"
+        case login
+        case name
+        case slug
+        case avatarURL = "avatarUrl"
+        case organization
+    }
+}
+
+private struct PullRequestDetailsOrganization: Decodable {
+    let login: String
+}
+
+private struct PullRequestDetailsReviewConnection: Decodable {
+    let nodes: [PullRequestDetailsReviewNode?]
+}
+
+private struct PullRequestDetailsReviewNode: Decodable {
+    let state: String
+    let submittedAt: Date?
+    let author: PullRequestDetailsActor?
 }
 
 enum GitHubOAuthError: Error, Equatable, LocalizedError, Sendable {
