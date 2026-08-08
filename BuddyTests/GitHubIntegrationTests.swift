@@ -713,15 +713,44 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertTrue(connectionFinished)
     }
 
-    func testAuthorizationSheetOnlyRemainsPresentedWhileAuthorizationIsActive() {
-        XCTAssertTrue(GitHubViewState.authorizing(testAuthorization).keepsAuthorizationSheetPresented)
-        XCTAssertFalse(GitHubViewState.disconnected.keepsAuthorizationSheetPresented)
-        XCTAssertFalse(
-            GitHubViewState.connected(
-                GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
-            ).keepsAuthorizationSheetPresented
+    func testAuthorizationSheetTracksActiveAuthorizationInsteadOfUnrelatedGlobalState() async throws {
+        let first = GitHubAccount(id: 7, login: "first", name: nil, avatarURL: nil)
+        let second = GitHubAccount(id: 42, login: "second", name: nil, avatarURL: nil)
+        let firstKey = GitHubIntegration.credentialAccount(for: first.connectedAccountID)
+        let secondKey = GitHubIntegration.credentialAccount(for: second.connectedAccountID)
+        let api = MultiAccountSuspendedPollingGitHubAPI(first: first, second: second)
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: MockCredentialStore(values: [
+                firstKey: "first-token",
+                secondKey: "second-token",
+            ]),
+            accountStore: InMemoryConnectedAccountStore(records: [
+                first.connectedAccountRecord,
+                second.connectedAccountRecord,
+            ]),
+            sleep: { _ in }
         )
-        XCTAssertFalse(GitHubViewState.needsAttention("Authorization failed").keepsAuthorizationSheetPresented)
+        let viewModel = await MainActor.run { GitHubViewModel(integration: integration) }
+        await viewModel.restore()
+
+        await MainActor.run {
+            viewModel.reconnect(first.connectedAccountID, presentAuthorizationURL: { _ in })
+        }
+        await api.waitUntilPollBegins()
+
+        await MainActor.run {
+            XCTAssertTrue(viewModel.keepsAuthorizationSheetPresented)
+            viewModel.reportDashboardAuthenticationFailure(for: second.connectedAccountID)
+            XCTAssertTrue(viewModel.keepsAuthorizationSheetPresented)
+        }
+
+        await api.finishPoll()
+        let authorizationFinished = try await waitUntil {
+            await MainActor.run { !viewModel.keepsAuthorizationSheetPresented }
+        }
+        XCTAssertTrue(authorizationFinished)
     }
 
     func testAddedAccountRouteShowsItsReconnectAuthorization() async throws {

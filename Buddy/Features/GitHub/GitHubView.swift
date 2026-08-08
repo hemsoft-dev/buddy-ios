@@ -41,8 +41,8 @@ struct GitHubView: View {
             GitHubSafariView(url: item.url)
                 .ignoresSafeArea()
         }
-        .onChange(of: viewModel.state) { _, state in
-            guard !state.keepsAuthorizationSheetPresented else { return }
+        .onChange(of: viewModel.keepsAuthorizationSheetPresented) { _, keepsPresented in
+            guard !keepsPresented else { return }
             presentedAuthorizationURL = nil
         }
         .confirmationDialog(
@@ -297,6 +297,10 @@ final class GitHubViewModel {
 
     var authorizationConfigurationError: GitHubConnectionError {
         integration.authorizationConfigurationError ?? .missingOAuthConfiguration
+    }
+
+    var keepsAuthorizationSheetPresented: Bool {
+        activeAccountAuthorization != nil
     }
 
     func restore() async {
@@ -741,11 +745,6 @@ enum GitHubViewState: Equatable {
     case authorizing(GitHubBrowserAuthorization)
     case connected(GitHubAccount)
     case needsAttention(String)
-
-    var keepsAuthorizationSheetPresented: Bool {
-        if case .authorizing = self { return true }
-        return false
-    }
 }
 
 #Preview {

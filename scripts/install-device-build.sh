@@ -27,6 +27,7 @@ if ! DEVELOPER_DIR="$developer_dir" xcodebuild build \
   -destination "platform=iOS,id=$device_id" \
   -derivedDataPath "$derived_data" \
   > "$build_log" 2>&1; then
+  cat "$build_log" >&2
   echo "Buddy device build failed." >&2
   exit 1
 fi
