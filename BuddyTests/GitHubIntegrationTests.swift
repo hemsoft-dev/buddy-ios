@@ -713,6 +713,17 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertTrue(connectionFinished)
     }
 
+    func testAuthorizationSheetOnlyRemainsPresentedWhileAuthorizationIsActive() {
+        XCTAssertTrue(GitHubViewState.authorizing(testAuthorization).keepsAuthorizationSheetPresented)
+        XCTAssertFalse(GitHubViewState.disconnected.keepsAuthorizationSheetPresented)
+        XCTAssertFalse(
+            GitHubViewState.connected(
+                GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+            ).keepsAuthorizationSheetPresented
+        )
+        XCTAssertFalse(GitHubViewState.needsAttention("Authorization failed").keepsAuthorizationSheetPresented)
+    }
+
     func testAddedAccountRouteShowsItsReconnectAuthorization() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let api = SuspendedPollingGitHubAPI(account: account)
@@ -1693,7 +1704,7 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertTrue(records.isEmpty)
     }
 
-    func testDisconnectRevokesGitHubGrantBeforeRemovingScopedCredential() async throws {
+    func testDisconnectRemovesOnlyBuddysScopedCredential() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let scopedKey = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
         let credentials = MockCredentialStore(values: [scopedKey: "private-repository-token"])
@@ -1709,19 +1720,8 @@ final class GitHubIntegrationTests: XCTestCase {
 
         try await integration.disconnect(accountID: account.connectedAccountID)
 
-        let revokedAuthorizations = await api.revokedAuthorizations()
         let storedToken = await credentials.stringValue(for: scopedKey)
         let records = await accountStore.accounts(for: .github)
-        XCTAssertEqual(
-            revokedAuthorizations,
-            [RevokedAuthorization(
-                token: "private-repository-token",
-                configuration: GitHubOAuthConfiguration(
-                    clientID: "buddy-client",
-                    clientSecret: "private-secret"
-                )
-            )]
-        )
         XCTAssertNil(storedToken)
         XCTAssertTrue(records.isEmpty)
     }
@@ -3755,11 +3755,6 @@ private struct PullRequestRequest: Equatable, Sendable {
     let token: String
 }
 
-private struct RevokedAuthorization: Equatable, Sendable {
-    let token: String
-    let configuration: GitHubOAuthConfiguration
-}
-
 private enum GitHubTokenPollResult: Equatable, Sendable {
     case pending
     case slowDown(interval: Int?)
@@ -3778,7 +3773,6 @@ private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
     private var capturedDeviceRequestCount = 0
     private var capturedPollRequestCount = 0
     private var capturedCanceledAuthorizations: [GitHubBrowserAuthorization] = []
-    private var capturedRevokedAuthorizations: [RevokedAuthorization] = []
 
     init(
         deviceResults: [Result<GitHubBrowserAuthorization, GitHubAPIError>] = [],
@@ -3816,19 +3810,9 @@ private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
         capturedCanceledAuthorizations.append(authorization)
     }
 
-    func revokeAuthorization(token: String, configuration: GitHubOAuthConfiguration) {
-        capturedRevokedAuthorizations.append(
-            RevokedAuthorization(token: token, configuration: configuration)
-        )
-    }
-
     func authenticatedUser(token: String) throws -> GitHubAccount {
         capturedUserTokens.append(token)
         return try userResults.removeFirst().get()
-    }
-
-    func revokedAuthorizations() -> [RevokedAuthorization] {
-        capturedRevokedAuthorizations
     }
 
     func authoredPullRequests(login: String, token: String) throws -> GitHubPullRequestCollection {

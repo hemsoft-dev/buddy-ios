@@ -496,11 +496,6 @@ actor GitHubIntegration: IntegrationProviding {
                 throw CancellationError()
             }
 
-            try await revokeAuthorizationIfPresent(tokenData)
-            guard generation == accountGenerations[accountID, default: 0] else {
-                throw CancellationError()
-            }
-
             // Remove metadata before the scoped token. If a reconnect supersedes this
             // operation, rollback only fills values that its newer write did not replace.
             try await accountStore.remove(accountID)
@@ -1323,8 +1318,6 @@ actor GitHubIntegration: IntegrationProviding {
         await cancelAllAccountAuthorizations()
 
         do {
-            let tokenData = try await credentials.data(for: Self.credentialAccount)
-            try await revokeAuthorizationIfPresent(tokenData)
             try await performCredentialCleanup()
             guard generation == authorizationGeneration else { return }
             authorizationGeneration &+= 1
@@ -1373,32 +1366,6 @@ actor GitHubIntegration: IntegrationProviding {
                 activeCredentialCleanup = nil
             }
             throw error
-        }
-    }
-
-    private func revokeAuthorizationIfPresent(_ tokenData: Data?) async throws {
-        guard let tokenData else { return }
-        guard let token = String(data: tokenData, encoding: .utf8), !token.isEmpty else {
-            // A malformed local item cannot represent a usable GitHub grant.
-            // Continue with local cleanup so Disconnect remains recoverable.
-            return
-        }
-        guard let clientID, let clientSecret else {
-            // Local cleanup must remain possible for a build whose OAuth configuration
-            // was removed after the credential was originally stored.
-            return
-        }
-
-        do {
-            try await authorizer.revokeAuthorization(
-                token: token,
-                configuration: GitHubOAuthConfiguration(
-                    clientID: clientID,
-                    clientSecret: clientSecret
-                )
-            )
-        } catch {
-            throw map(error)
         }
     }
 
@@ -1474,8 +1441,6 @@ actor GitHubIntegration: IntegrationProviding {
                 return .malformedResponse
             case let .tokenExchangeFailed(statusCode):
                 return .server(statusCode)
-            case let .authorizationRevocationFailed(statusCode):
-                return statusCode == 0 ? .malformedResponse : .server(statusCode)
             }
         }
 
@@ -1510,11 +1475,11 @@ enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
     var errorDescription: String? {
         switch self {
         case .missingClientID:
-            "Buddy was built without a GitHub client ID. Set BUDDY_GITHUB_CLIENT_ID in the build configuration and rebuild the app."
+            "Buddy was built without its bundled GitHub CLI-compatible client ID. Rebuild the app from a complete configuration."
         case .missingOAuthConfiguration:
-            "Buddy was built without complete GitHub browser OAuth configuration. Provision a dedicated Buddy OAuth app and set BUDDY_GITHUB_CLIENT_ID and BUDDY_GITHUB_CLIENT_SECRET."
+            "Buddy was built without complete GitHub CLI-compatible browser configuration. Rebuild the app from a complete configuration."
         case .invalidConfiguration:
-            "GitHub rejected Buddy's OAuth configuration. Check the dedicated Buddy OAuth app settings and try again."
+            "GitHub rejected the bundled GitHub CLI-compatible OAuth configuration. Rebuild Buddy or try again later."
         case .secureRandomUnavailable:
             "Buddy couldn't create a secure GitHub sign-in request. Try again."
         case .callbackUnavailable:

@@ -1,8 +1,5 @@
 // Copy this file to Local.xcconfig for private local build values.
-// Keep client secrets, access tokens, and other private values out of source control.
-// The shipped GitHub client ID is intentionally set in Shared.xcconfig after this file.
-
-// GitHub currently requires this OAuth app exchange credential even with PKCE.
-// For a backend-free native build it must be treated as public/non-confidential.
-// Provision a dedicated Buddy OAuth app; never reuse another app's credential.
-// BUDDY_GITHUB_CLIENT_SECRET = dedicated-buddy-oauth-app-exchange-credential
+// Keep access tokens and other private values out of source control.
+// Buddy's public GitHub CLI-compatible OAuth identifiers are intentionally set in
+// Shared.xcconfig after this file. Use command-line build settings for deliberate
+// OAuth client overrides during isolated testing.
