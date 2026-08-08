@@ -89,9 +89,9 @@ Buddy starts a listener bound only to `127.0.0.1` before presenting
 `SFSafariViewController`, uses the listener's exact redirect URI during exchange,
 and stops it on success, failure, timeout, or cancellation. The callback validates
 the path, state, and non-empty code and rejects malformed or oversized requests.
-Disconnect removes only Buddy's local token. It must not revoke the shared
-GitHub CLI grant because that could invalidate unrelated GitHub CLI or CodexBar
-sessions for the same account.
+Disconnect revokes only Buddy's exact access token, then removes its local
+Keychain item. It does not revoke the shared GitHub CLI application grant, so
+unrelated GitHub CLI and CodexBar sessions remain valid.
 
 ## Verification
 

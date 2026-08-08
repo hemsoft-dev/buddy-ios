@@ -1733,7 +1733,7 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertTrue(records.isEmpty)
     }
 
-    func testDisconnectRemovesOnlyBuddysScopedCredential() async throws {
+    func testDisconnectRevokesOnlyBuddysTokenBeforeRemovingScopedCredential() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let scopedKey = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
         let credentials = MockCredentialStore(values: [scopedKey: "private-repository-token"])
@@ -1749,8 +1749,19 @@ final class GitHubIntegrationTests: XCTestCase {
 
         try await integration.disconnect(accountID: account.connectedAccountID)
 
+        let revokedAuthorizations = await api.revokedAuthorizations()
         let storedToken = await credentials.stringValue(for: scopedKey)
         let records = await accountStore.accounts(for: .github)
+        XCTAssertEqual(
+            revokedAuthorizations,
+            [RevokedAuthorization(
+                token: "private-repository-token",
+                configuration: GitHubOAuthConfiguration(
+                    clientID: "buddy-client",
+                    clientSecret: "private-secret"
+                )
+            )]
+        )
         XCTAssertNil(storedToken)
         XCTAssertTrue(records.isEmpty)
     }
@@ -3784,13 +3795,18 @@ private struct PullRequestRequest: Equatable, Sendable {
     let token: String
 }
 
+private struct RevokedAuthorization: Equatable, Sendable {
+    let token: String
+    let configuration: GitHubOAuthConfiguration
+}
+
 private enum GitHubTokenPollResult: Equatable, Sendable {
     case pending
     case slowDown(interval: Int?)
     case authorized(token: String)
 }
 
-private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
+private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing, GitHubOAuthTokenRevoking {
     private var deviceResults: [Result<GitHubBrowserAuthorization, GitHubAPIError>]
     private var pollResults: [Result<GitHubTokenPollResult, GitHubAPIError>]
     private var userResults: [Result<GitHubAccount, GitHubAPIError>]
@@ -3802,6 +3818,7 @@ private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
     private var capturedDeviceRequestCount = 0
     private var capturedPollRequestCount = 0
     private var capturedCanceledAuthorizations: [GitHubBrowserAuthorization] = []
+    private var capturedRevokedAuthorizations: [RevokedAuthorization] = []
 
     init(
         deviceResults: [Result<GitHubBrowserAuthorization, GitHubAPIError>] = [],
@@ -3837,6 +3854,12 @@ private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
 
     func cancelAuthorization(_ authorization: GitHubBrowserAuthorization) {
         capturedCanceledAuthorizations.append(authorization)
+    }
+
+    func revokeAuthorization(token: String, configuration: GitHubOAuthConfiguration) {
+        capturedRevokedAuthorizations.append(
+            RevokedAuthorization(token: token, configuration: configuration)
+        )
     }
 
     func authenticatedUser(token: String) throws -> GitHubAccount {
@@ -3876,6 +3899,10 @@ private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
 
     func canceledAuthorizations() -> [GitHubBrowserAuthorization] {
         capturedCanceledAuthorizations
+    }
+
+    func revokedAuthorizations() -> [RevokedAuthorization] {
+        capturedRevokedAuthorizations
     }
 }
 

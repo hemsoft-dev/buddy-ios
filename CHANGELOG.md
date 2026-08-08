@@ -6,7 +6,7 @@ Notable changes included in Buddy device deployments are recorded here.
 
 - Match CodexBar's GitHub CLI-compatible browser authorization so private organization accounts do not depend on a newly registered HemSoft OAuth app.
 - Dismiss the in-app GitHub browser only after authorization succeeds or fails.
-- Disconnect locally without revoking shared GitHub CLI-compatible sessions used by other apps.
+- Disconnect by revoking only Buddy's token, without revoking shared GitHub CLI-compatible sessions used by other apps.
 
 ## 0.1.0 (3) - 2026-08-07
 

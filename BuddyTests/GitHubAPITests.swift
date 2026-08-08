@@ -314,6 +314,31 @@ final class GitHubAPITests: XCTestCase {
         }
     }
 
+    func testAuthorizationRevocationDeletesOnlyTheSuppliedApplicationToken() async throws {
+        let httpClient = MockHTTPClient(responses: [.success("", statusCode: 204)])
+        let service = GitHubWebOAuthService(httpClient: httpClient)
+        let configuration = GitHubOAuthConfiguration(
+            clientID: "shared-client",
+            clientSecret: "public-secret"
+        )
+
+        try await service.revokeAuthorization(token: "buddy-token", configuration: configuration)
+
+        let capturedRequest = await httpClient.lastRequest()
+        let request = try XCTUnwrap(capturedRequest)
+        XCTAssertEqual(request.url?.absoluteString, "https://api.github.com/applications/shared-client/token")
+        XCTAssertEqual(request.httpMethod, "DELETE")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "application/vnd.github+json")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-GitHub-Api-Version"), "2022-11-28")
+        XCTAssertEqual(
+            request.value(forHTTPHeaderField: "Authorization"),
+            "Basic " + Data("shared-client:public-secret".utf8).base64EncodedString()
+        )
+        let body = try XCTUnwrap(request.httpBody)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String])
+        XCTAssertEqual(object, ["access_token": "buddy-token"])
+    }
+
     func testAuthenticatedUserUsesBearerTokenAndMapsUnauthorized() async throws {
         let validClient = MockHTTPClient(responses: [
             .successWithScopes(

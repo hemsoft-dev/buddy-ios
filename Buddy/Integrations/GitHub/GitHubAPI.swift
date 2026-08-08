@@ -22,6 +22,10 @@ protocol GitHubOAuthAuthorizing: Sendable {
     func cancelAuthorization(_ authorization: GitHubBrowserAuthorization) async
 }
 
+protocol GitHubOAuthTokenRevoking: Sendable {
+    func revokeAuthorization(token: String, configuration: GitHubOAuthConfiguration) async throws
+}
+
 struct GitHubAccount: Hashable, Sendable {
     let id: Int
     let login: String
@@ -390,6 +394,7 @@ enum GitHubOAuthError: Error, Equatable, LocalizedError, Sendable {
     case invalidConfiguration
     case tokenExchangeFailed(Int)
     case invalidTokenResponse
+    case authorizationRevocationFailed(Int)
 
     var errorDescription: String? {
         switch self {
@@ -419,13 +424,15 @@ enum GitHubOAuthError: Error, Equatable, LocalizedError, Sendable {
             "GitHub token exchange failed (HTTP \(statusCode))."
         case .invalidTokenResponse:
             "GitHub token exchange returned an invalid response."
+        case let .authorizationRevocationFailed(statusCode):
+            "GitHub token revocation failed (HTTP \(statusCode))."
         }
     }
 }
 
 typealias GitHubOAuthRandomByteGenerator = @Sendable (Int) throws -> Data
 
-actor GitHubWebOAuthService: GitHubOAuthAuthorizing {
+actor GitHubWebOAuthService: GitHubOAuthAuthorizing, GitHubOAuthTokenRevoking {
     struct PKCEPair: Equatable, Sendable {
         let verifier: String
         let challenge: String
@@ -433,6 +440,7 @@ actor GitHubWebOAuthService: GitHubOAuthAuthorizing {
 
     static let authorizationEndpoint = URL(string: "https://github.com/login/oauth/authorize")!
     static let tokenEndpoint = URL(string: "https://github.com/login/oauth/access_token")!
+    static let applicationEndpoint = URL(string: "https://api.github.com/applications")!
     static let callbackPath = "/callback"
 
     private struct Session: Sendable {
@@ -571,6 +579,55 @@ actor GitHubWebOAuthService: GitHubOAuthAuthorizing {
 
     func cancelAuthorization(_ authorization: GitHubBrowserAuthorization) {
         sessions.removeValue(forKey: authorization.id)?.callbackServer.cancel()
+    }
+
+    func revokeAuthorization(
+        token: String,
+        configuration: GitHubOAuthConfiguration
+    ) async throws {
+        let request = try Self.revocationRequest(token: token, configuration: configuration)
+        do {
+            _ = try await httpClient.data(for: request)
+        } catch HTTPClientError.unacceptableStatus(404) {
+            // An already-revoked token satisfies disconnect.
+        } catch HTTPClientError.unacceptableStatus(let statusCode) {
+            throw GitHubOAuthError.authorizationRevocationFailed(statusCode)
+        } catch HTTPClientError.rateLimited {
+            throw GitHubOAuthError.authorizationRevocationFailed(429)
+        } catch HTTPClientError.invalidResponse {
+            throw GitHubOAuthError.authorizationRevocationFailed(0)
+        }
+    }
+
+    static func revocationRequest(
+        token: String,
+        configuration: GitHubOAuthConfiguration
+    ) throws -> URLRequest {
+        let clientID = configuration.clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let clientSecret = configuration.clientSecret.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clientID.isEmpty, !clientSecret.isEmpty, !token.isEmpty else {
+            throw GitHubOAuthError.missingConfiguration
+        }
+
+        var request = URLRequest(url: applicationEndpoint
+            .appendingPathComponent(clientID)
+            .appendingPathComponent("token"))
+        request.httpMethod = "DELETE"
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+        let basicCredential = Data("\(clientID):\(clientSecret)".utf8).base64EncodedString()
+        request.setValue("Basic \(basicCredential)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(RevocationRequestBody(accessToken: token))
+        return request
+    }
+
+    private struct RevocationRequestBody: Encodable {
+        let accessToken: String
+
+        enum CodingKeys: String, CodingKey {
+            case accessToken = "access_token"
+        }
     }
 
     static func authorizationURL(
