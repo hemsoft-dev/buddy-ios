@@ -362,18 +362,18 @@ struct GitHubAPI: GitHubAPIProviding {
                 query: Self.pullRequestLatestReviewsQuery
             ))
         }
-        var latestOpinionatedReviews = node.latestOpinionatedReviews.nodes
-        if node.latestOpinionatedReviews.pageInfo.hasNextPage {
-            guard let cursor = node.latestOpinionatedReviews.pageInfo.endCursor, !cursor.isEmpty else {
+        var reviewHistory = node.reviewHistory.nodes
+        if node.reviewHistory.pageInfo.hasNextPage {
+            guard let cursor = node.reviewHistory.pageInfo.endCursor, !cursor.isEmpty else {
                 throw GitHubAPIError.malformedResponse
             }
-            latestOpinionatedReviews.append(contentsOf: try await remainingConnectionNodes(
+            reviewHistory.append(contentsOf: try await remainingConnectionNodes(
                 owner: String(repositoryParts[0]),
                 name: String(repositoryParts[1]),
                 number: number,
                 after: cursor,
                 token: token,
-                query: Self.pullRequestLatestOpinionatedReviewsQuery
+                query: Self.pullRequestReviewsQuery
             ))
         }
         var reviewRequests = node.reviewRequests.nodes
@@ -407,8 +407,8 @@ struct GitHubAPI: GitHubAPIProviding {
             author: author,
             linkedIssues: linkedIssues,
             reviewers: try Self.reviewerSummaries(
-                reviews: latestReviews,
-                opinionatedReviews: latestOpinionatedReviews,
+                latestReviews: latestReviews,
+                reviewHistory: reviewHistory,
                 reviewRequests: reviewRequests
             )
         )
@@ -460,7 +460,7 @@ struct GitHubAPI: GitHubAPIProviding {
               }
             }
           }
-          latestOpinionatedReviews(first: 100) {
+          reviewHistory: reviews(first: 100) {
             pageInfo { hasNextPage endCursor }
             nodes {
               state
@@ -548,8 +548,8 @@ struct GitHubAPI: GitHubAPIProviding {
     }
     """
 
-    private static let pullRequestLatestOpinionatedReviewsQuery = """
-    query BuddyPullRequestLatestOpinionatedReviews(
+    private static let pullRequestReviewsQuery = """
+    query BuddyPullRequestReviews(
       $owner: String!,
       $name: String!,
       $number: Int!,
@@ -558,7 +558,7 @@ struct GitHubAPI: GitHubAPIProviding {
       repository(owner: $owner, name: $name) {
         pullRequest(number: $number) {
           number
-          page: latestOpinionatedReviews(first: 100, after: $after) {
+          page: reviews(first: 100, after: $after) {
             pageInfo { hasNextPage endCursor }
             nodes {
               state
@@ -652,8 +652,8 @@ struct GitHubAPI: GitHubAPIProviding {
     }
 
     private static func reviewerSummaries(
-        reviews latestReviews: [PullRequestDetailsReviewNode?],
-        opinionatedReviews: [PullRequestDetailsReviewNode?],
+        latestReviews: [PullRequestDetailsReviewNode?],
+        reviewHistory: [PullRequestDetailsReviewNode?],
         reviewRequests: [PullRequestDetailsReviewRequestNode?]
     ) throws -> [GitHubReviewerSummary] {
         var reviewers: [String: GitHubReviewerSummary] = [:]
@@ -671,13 +671,24 @@ struct GitHubAPI: GitHubAPIProviding {
             reviewers[reviewer.id] = GitHubReviewerSummary(reviewer: reviewer, status: status)
         }
 
-        for review in opinionatedReviews.compactMap({ $0 }) {
+        var latestDecisions: [String: (reviewer: GitHubUserSummary, status: GitHubReviewerStatus, submittedAt: Date)] = [:]
+        for review in reviewHistory.compactMap({ $0 }) {
             guard let author = review.author,
                   let status = GitHubReviewerStatus(graphQLReviewState: review.state),
-                  status != .commented
+                  status != .commented,
+                  let submittedAt = review.submittedAt
             else { continue }
             let reviewer = try userSummary(author)
-            reviewers[reviewer.id] = GitHubReviewerSummary(reviewer: reviewer, status: status)
+            if let current = latestDecisions[reviewer.id], current.submittedAt > submittedAt {
+                continue
+            }
+            latestDecisions[reviewer.id] = (reviewer, status, submittedAt)
+        }
+        for decision in latestDecisions.values {
+            reviewers[decision.reviewer.id] = GitHubReviewerSummary(
+                reviewer: decision.reviewer,
+                status: decision.status
+            )
         }
 
         for request in reviewRequests.compactMap({ $0 }) {
@@ -982,7 +993,7 @@ private struct PullRequestDetailsNode: Decodable {
     let closingIssuesReferences: PullRequestDetailsIssueConnection
     let reviewRequests: PullRequestDetailsReviewRequestConnection
     let latestReviews: PullRequestDetailsReviewConnection
-    let latestOpinionatedReviews: PullRequestDetailsReviewConnection
+    let reviewHistory: PullRequestDetailsReviewConnection
 
     enum CodingKeys: String, CodingKey {
         case id = "databaseId"
@@ -1000,7 +1011,7 @@ private struct PullRequestDetailsNode: Decodable {
         case closingIssuesReferences
         case reviewRequests
         case latestReviews
-        case latestOpinionatedReviews
+        case reviewHistory
     }
 }
 

@@ -588,7 +588,7 @@ final class GitHubAPITests: XCTestCase {
                   {"state":"CHANGES_REQUESTED","submittedAt":"2026-08-08T14:00:00Z","author":{"login":"bob","name":"Bob","avatarUrl":null}},
                   {"state":"DISMISSED","submittedAt":"2026-08-08T16:00:00Z","author":{"login":"dana","name":"Dana","avatarUrl":null}}
                 ]},
-                "latestOpinionatedReviews": {"pageInfo":{"hasNextPage":false,"endCursor":"opinionated-end"},"nodes":[
+                "reviewHistory": {"pageInfo":{"hasNextPage":false,"endCursor":"history-end"},"nodes":[
                   {"state":"APPROVED","submittedAt":"2026-08-08T13:00:00Z","author":{"login":"alice","name":"Alice","avatarUrl":null}},
                   {"state":"CHANGES_REQUESTED","submittedAt":"2026-08-08T14:00:00Z","author":{"login":"bob","name":"Bob","avatarUrl":null}},
                   {"state":"APPROVED","submittedAt":"2026-08-08T15:00:00Z","author":{"login":"dana","name":"Dana","avatarUrl":null}},
@@ -633,16 +633,16 @@ final class GitHubAPITests: XCTestCase {
         XCTAssertTrue(query.contains("closingIssuesReferences(first: 100)"))
         XCTAssertTrue(query.contains("reviewRequests(first: 100)"))
         XCTAssertTrue(query.contains("latestReviews(first: 100)"))
-        XCTAssertTrue(query.contains("latestOpinionatedReviews(first: 100)"))
+        XCTAssertTrue(query.contains("reviewHistory: reviews(first: 100)"))
         let requests = await client.requests()
         XCTAssertEqual(requests.count, 1)
     }
 
-    func testPullRequestDetailsPaginatesLatestReviewerDecisionsPastOneHundred() async throws {
+    func testPullRequestDetailsPaginatesReviewHistoryPastOneHundred() async throws {
         let latestNodes = (1...100).map { index in
             #"{"state":"COMMENTED","submittedAt":"2026-08-08T12:00:00Z","author":{"login":"reviewer\#(index)","name":null,"avatarUrl":null}}"#
         }.joined(separator: ",")
-        let opinionatedNodes = (1...100).map { index in
+        let reviewHistoryNodes = (1...100).map { index in
             #"{"state":"APPROVED","submittedAt":"2026-08-08T11:00:00Z","author":{"login":"reviewer\#(index)","name":null,"avatarUrl":null}}"#
         }.joined(separator: ",")
         let firstPage = #"""
@@ -653,12 +653,12 @@ final class GitHubAPITests: XCTestCase {
           "closingIssuesReferences":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},
           "reviewRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},
           "latestReviews":{"pageInfo":{"hasNextPage":false,"endCursor":"latest-100"},"nodes":[\#(latestNodes)]},
-          "latestOpinionatedReviews":{"pageInfo":{"hasNextPage":true,"endCursor":"opinionated-100"},"nodes":[\#(opinionatedNodes)]}
+          "reviewHistory":{"pageInfo":{"hasNextPage":true,"endCursor":"history-100"},"nodes":[\#(reviewHistoryNodes)]}
         }}}}
         """#
         let secondPage = #"""
         {"data":{"repository":{"pullRequest":{"number":30,"page":{
-          "pageInfo":{"hasNextPage":false,"endCursor":"opinionated-101"},
+          "pageInfo":{"hasNextPage":false,"endCursor":"history-101"},
           "nodes":[{"state":"APPROVED","submittedAt":"2026-08-08T10:00:00Z","author":{"login":"reviewer101","name":null,"avatarUrl":null}}]
         }}}}}
         """#
@@ -683,10 +683,10 @@ final class GitHubAPITests: XCTestCase {
             JSONSerialization.jsonObject(with: paginationBody) as? [String: Any]
         )
         let paginationVariables = try XCTUnwrap(paginationObject["variables"] as? [String: Any])
-        XCTAssertEqual(paginationVariables["after"] as? String, "opinionated-100")
+        XCTAssertEqual(paginationVariables["after"] as? String, "history-100")
         XCTAssertTrue(
             try XCTUnwrap(paginationObject["query"] as? String)
-                .contains("page: latestOpinionatedReviews(first: 100, after: $after)")
+                .contains("page: reviews(first: 100, after: $after)")
         )
     }
 
@@ -705,7 +705,7 @@ final class GitHubAPITests: XCTestCase {
           "closingIssuesReferences":{"pageInfo":{"hasNextPage":true,"endCursor":"issues-100"},"nodes":[\#(issueNodes)]},
           "reviewRequests":{"pageInfo":{"hasNextPage":true,"endCursor":"requests-100"},"nodes":[\#(requestNodes)]},
           "latestReviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},
-          "latestOpinionatedReviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}
+          "reviewHistory":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}
         }}}}
         """#
         let remainingIssues = #"""
@@ -766,7 +766,7 @@ final class GitHubAPITests: XCTestCase {
           "closingIssuesReferences":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[null]},
           "reviewRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},
           "latestReviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[null]},
-          "latestOpinionatedReviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[null]}
+          "reviewHistory":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[null]}
         }}}}
         """#
 
