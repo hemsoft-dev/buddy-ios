@@ -583,13 +583,14 @@ final class GitHubAPITests: XCTestCase {
                   {"requestedReviewer":{"__typename":"User","login":"bob","name":"Bob","avatarUrl":null}},
                   {"requestedReviewer":{"__typename":"Team","name":"Core Team","slug":"core","avatarUrl":null,"organization":{"login":"Relias"}}}
                 ]},
-                "reviews": {"nodes":[
-                  {"state":"COMMENTED","submittedAt":"2026-08-08T12:00:00Z","author":{"login":"alice","name":"Alice","avatarUrl":null}},
-                  {"state":"APPROVED","submittedAt":"2026-08-08T13:00:00Z","author":{"login":"alice","name":"Alice","avatarUrl":null}},
+                "latestReviews": {"pageInfo":{"hasNextPage":false,"endCursor":"latest-end"},"nodes":[
                   {"state":"COMMENTED","submittedAt":"2026-08-08T13:30:00Z","author":{"login":"alice","name":"Alice","avatarUrl":null}},
                   {"state":"CHANGES_REQUESTED","submittedAt":"2026-08-08T14:00:00Z","author":{"login":"bob","name":"Bob","avatarUrl":null}},
-                  {"state":"APPROVED","submittedAt":"2026-08-08T15:00:00Z","author":{"login":"dana","name":"Dana","avatarUrl":null}},
                   {"state":"DISMISSED","submittedAt":"2026-08-08T16:00:00Z","author":{"login":"dana","name":"Dana","avatarUrl":null}}
+                ]},
+                "latestOpinionatedReviews": {"pageInfo":{"hasNextPage":false,"endCursor":"opinionated-end"},"nodes":[
+                  {"state":"APPROVED","submittedAt":"2026-08-08T13:00:00Z","author":{"login":"alice","name":"Alice","avatarUrl":null}},
+                  {"state":"CHANGES_REQUESTED","submittedAt":"2026-08-08T14:00:00Z","author":{"login":"bob","name":"Bob","avatarUrl":null}}
                 ]}
               }
             }
@@ -629,7 +630,61 @@ final class GitHubAPITests: XCTestCase {
         let query = try XCTUnwrap(object["query"] as? String)
         XCTAssertTrue(query.contains("closingIssuesReferences(first: 50)"))
         XCTAssertTrue(query.contains("reviewRequests(first: 50)"))
-        XCTAssertTrue(query.contains("reviews(last: 100)"))
+        XCTAssertTrue(query.contains("latestReviews(first: 100)"))
+        XCTAssertTrue(query.contains("latestOpinionatedReviews(first: 100)"))
+        let requests = await client.requests()
+        XCTAssertEqual(requests.count, 1)
+    }
+
+    func testPullRequestDetailsPaginatesLatestReviewerDecisionsPastOneHundred() async throws {
+        let latestNodes = (1...100).map { index in
+            #"{"state":"COMMENTED","submittedAt":"2026-08-08T12:00:00Z","author":{"login":"reviewer\#(index)","name":null,"avatarUrl":null}}"#
+        }.joined(separator: ",")
+        let opinionatedNodes = (1...100).map { index in
+            #"{"state":"APPROVED","submittedAt":"2026-08-08T11:00:00Z","author":{"login":"reviewer\#(index)","name":null,"avatarUrl":null}}"#
+        }.joined(separator: ",")
+        let firstPage = #"""
+        {"data":{"repository":{"pullRequest":{
+          "databaseId":30,"number":30,"title":"Large review set","state":"OPEN","isDraft":false,
+          "updatedAt":"2026-08-08T18:00:00Z","url":"https://github.com/HemSoft/buddy-ios/pull/30",
+          "body":"","changedFiles":1,"additions":1,"deletions":0,"author":null,
+          "closingIssuesReferences":{"nodes":[]},"reviewRequests":{"nodes":[]},
+          "latestReviews":{"pageInfo":{"hasNextPage":false,"endCursor":"latest-100"},"nodes":[\#(latestNodes)]},
+          "latestOpinionatedReviews":{"pageInfo":{"hasNextPage":true,"endCursor":"opinionated-100"},"nodes":[\#(opinionatedNodes)]}
+        }}}}
+        """#
+        let secondPage = #"""
+        {"data":{"repository":{"pullRequest":{"number":30,"reviewPage":{
+          "pageInfo":{"hasNextPage":false,"endCursor":"opinionated-101"},
+          "nodes":[{"state":"APPROVED","submittedAt":"2026-08-08T10:00:00Z","author":{"login":"reviewer101","name":null,"avatarUrl":null}}]
+        }}}}}
+        """#
+        let client = MockHTTPClient(responses: [
+            .success(firstPage, statusCode: 200),
+            .success(secondPage, statusCode: 200),
+        ])
+
+        let details = try await GitHubAPI(httpClient: client).pullRequestDetails(
+            repository: "HemSoft/buddy-ios",
+            number: 30,
+            token: "private-account-token"
+        )
+
+        XCTAssertEqual(details.reviewers.count, 101)
+        XCTAssertEqual(details.reviewers.first { $0.reviewer.login == "reviewer1" }?.status, .approved)
+        XCTAssertEqual(details.reviewers.first { $0.reviewer.login == "reviewer101" }?.status, .approved)
+        let requests = await client.requests()
+        XCTAssertEqual(requests.count, 2)
+        let paginationBody = try XCTUnwrap(requests.last?.httpBody)
+        let paginationObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: paginationBody) as? [String: Any]
+        )
+        let paginationVariables = try XCTUnwrap(paginationObject["variables"] as? [String: Any])
+        XCTAssertEqual(paginationVariables["after"] as? String, "opinionated-100")
+        XCTAssertTrue(
+            try XCTUnwrap(paginationObject["query"] as? String)
+                .contains("reviewPage: latestOpinionatedReviews(first: 100, after: $after)")
+        )
     }
 
     func testPullRequestDetailsSupportsPartialAndEmptyMetadata() async throws {
@@ -638,7 +693,9 @@ final class GitHubAPITests: XCTestCase {
           "databaseId":31,"number":31,"title":"Sparse detail","state":"CLOSED","isDraft":false,
           "updatedAt":"2026-08-08T18:00:00Z","url":"https://github.com/HemSoft/buddy-ios/pull/31",
           "body":"","changedFiles":0,"additions":0,"deletions":0,"author":null,
-          "closingIssuesReferences":{"nodes":[null]},"reviewRequests":{"nodes":[]},"reviews":{"nodes":[null]}
+          "closingIssuesReferences":{"nodes":[null]},"reviewRequests":{"nodes":[]},
+          "latestReviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[null]},
+          "latestOpinionatedReviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[null]}
         }}}}
         """#
 
@@ -749,5 +806,9 @@ private actor MockHTTPClient: HTTPClient {
 
     func lastRequest() -> URLRequest? {
         capturedRequests.last
+    }
+
+    func requests() -> [URLRequest] {
+        capturedRequests
     }
 }
