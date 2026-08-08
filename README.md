@@ -107,6 +107,18 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   CODE_SIGNING_ALLOWED=NO
 ```
 
+For a physical Hemsoft iPhone deployment, keep the dedicated OAuth exchange
+credential in the login Keychain with service `com.hemsoft.buddy.oauth` and
+account `github-oauth-client-secret`, then run:
+
+```sh
+scripts/install-device-build.sh
+```
+
+The script refuses to install the app unless the signed bundle contains both
+the configured GitHub client ID and the expected Keychain-backed exchange
+credential.
+
 ## License
 
 Buddy is available under the MIT License. See `LICENSE`.
