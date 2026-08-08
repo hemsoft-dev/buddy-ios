@@ -474,7 +474,8 @@ struct DashboardView: View {
             GitHubPullRequestDetailView(
                 pullRequest: pullRequest,
                 account: account,
-                store: githubPullRequestDetailStore
+                store: githubPullRequestDetailStore,
+                openAccounts: openAccounts
             )
         } label: {
             HStack(alignment: .top, spacing: BuddyTheme.Spacing.small) {

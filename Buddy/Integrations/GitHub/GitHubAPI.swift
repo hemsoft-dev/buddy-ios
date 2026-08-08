@@ -418,7 +418,9 @@ struct GitHubAPI: GitHubAPIProviding {
                   let status = GitHubReviewerStatus(graphQLReviewState: review.state)
             else { continue }
             let reviewer = try userSummary(author)
-            reviewers[reviewer.id] = GitHubReviewerSummary(reviewer: reviewer, status: status)
+            if status != .commented || reviewers[reviewer.id] == nil {
+                reviewers[reviewer.id] = GitHubReviewerSummary(reviewer: reviewer, status: status)
+            }
         }
 
         for request in pullRequest.reviewRequests.nodes.compactMap({ $0 }) {

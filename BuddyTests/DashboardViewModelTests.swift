@@ -753,6 +753,15 @@ final class DashboardViewModelTests: XCTestCase {
         XCTAssertEqual(key.number, 30)
         XCTAssertEqual(GitHubPullRequestDetailCopy.navigationHint, "Opens pull request details in Buddy")
         XCTAssertEqual(
+            GitHubPullRequestDetailCopy.failureActionLabel(.authenticationRequired),
+            "Reconnect in Settings"
+        )
+        XCTAssertEqual(
+            GitHubPullRequestDetailCopy.failureActionLabel(.repositoryAccessRequired),
+            "Reconnect in Settings"
+        )
+        XCTAssertEqual(GitHubPullRequestDetailCopy.failureActionLabel(.offline), "Try Again")
+        XCTAssertEqual(
             GitHubPullRequestDetailCopy.diffAccessibilityLabel(details),
             "Diff summary, 8 changed files, 214 changed lines, 162 additions, 52 deletions"
         )

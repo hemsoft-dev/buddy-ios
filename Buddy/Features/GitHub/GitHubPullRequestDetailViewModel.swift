@@ -44,6 +44,10 @@ enum GitHubPullRequestDetailState: Equatable, Sendable {
 enum GitHubPullRequestDetailCopy {
     static let navigationHint = "Opens pull request details in Buddy"
 
+    static func failureActionLabel(_ failure: GitHubPullRequestFailure) -> String {
+        failure.requiresReconnect ? "Reconnect in Settings" : "Try Again"
+    }
+
     static func diffAccessibilityLabel(_ details: GitHubPullRequestDetails) -> String {
         "Diff summary, \(details.changedFiles) changed files, \(details.changedLines) changed lines, " +
             "\(details.additions) additions, \(details.deletions) deletions"

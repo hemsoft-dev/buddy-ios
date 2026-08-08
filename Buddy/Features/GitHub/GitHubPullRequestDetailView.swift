@@ -4,6 +4,7 @@ struct GitHubPullRequestDetailView: View {
     let pullRequest: GitHubPullRequest
     let account: GitHubAccount
     let store: GitHubPullRequestDetailStore
+    let openAccounts: () -> Void
 
     var body: some View {
         Group {
@@ -241,8 +242,8 @@ struct GitHubPullRequestDetailView: View {
         } description: {
             Text(failure.message)
         } actions: {
-            Button("Try Again") {
-                Task { await store.retry(pullRequest, account: account) }
+            Button(GitHubPullRequestDetailCopy.failureActionLabel(failure)) {
+                recover(from: failure)
             }
             .buttonStyle(.borderedProminent)
         }
@@ -252,10 +253,18 @@ struct GitHubPullRequestDetailView: View {
         VStack(alignment: .leading, spacing: BuddyTheme.Spacing.small) {
             Label(failure.message, systemImage: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
-            Button("Try Again") {
-                Task { await store.retry(pullRequest, account: account) }
+            Button(GitHubPullRequestDetailCopy.failureActionLabel(failure)) {
+                recover(from: failure)
             }
             .buttonStyle(.bordered)
+        }
+    }
+
+    private func recover(from failure: GitHubPullRequestFailure) {
+        if failure.requiresReconnect {
+            openAccounts()
+        } else {
+            Task { await store.retry(pullRequest, account: account) }
         }
     }
 }
