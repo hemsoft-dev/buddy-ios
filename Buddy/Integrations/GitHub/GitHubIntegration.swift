@@ -1078,6 +1078,109 @@ actor GitHubIntegration: IntegrationProviding {
         try await pullRequests(for: account, query: .assigned)
     }
 
+    func pullRequestDetails(
+        for pullRequest: GitHubPullRequest,
+        account: GitHubAccount
+    ) async throws -> GitHubPullRequestDetails {
+        if let activeCredentialCleanup {
+            do {
+                try await activeCredentialCleanup.task.value
+            } catch {
+                throw GitHubConnectionError.credentialStorage
+            }
+        }
+
+        let generation = authorizationGeneration
+        let accountID = account.connectedAccountID
+        let accountGeneration = accountGenerations[accountID, default: 0]
+        let tokenData: Data?
+        let credentialAccount: String
+        do {
+            let registered = try await accountStore.accounts(for: .github)
+                .contains { $0.id == accountID }
+            if let scopedToken = try await credentials.data(for: Self.credentialAccount(for: accountID)) {
+                tokenData = scopedToken
+                credentialAccount = Self.credentialAccount(for: accountID)
+            } else if !registered {
+                tokenData = try await credentials.data(for: Self.credentialAccount)
+                credentialAccount = Self.credentialAccount
+            } else {
+                tokenData = nil
+                credentialAccount = Self.credentialAccount(for: accountID)
+            }
+        } catch {
+            throw GitHubConnectionError.credentialStorage
+        }
+
+        guard generation == authorizationGeneration,
+              accountGeneration == accountGenerations[accountID, default: 0]
+        else {
+            throw CancellationError()
+        }
+        guard let tokenData,
+              let token = String(data: tokenData, encoding: .utf8),
+              !token.isEmpty
+        else {
+            updateSummary(detail: "Authorization expired", state: .needsAttention)
+            throw GitHubConnectionError.invalidToken
+        }
+
+        do {
+            let details = try await api.pullRequestDetails(
+                repository: pullRequest.repository,
+                number: pullRequest.number,
+                token: token
+            )
+            try Task.checkCancellation()
+            guard generation == authorizationGeneration,
+                  accountGeneration == accountGenerations[accountID, default: 0]
+            else {
+                throw CancellationError()
+            }
+            return details
+        } catch GitHubAPIError.unauthorized {
+            guard generation == authorizationGeneration,
+                  accountGeneration == accountGenerations[accountID, default: 0]
+            else {
+                throw CancellationError()
+            }
+            let removed: Bool
+            do {
+                removed = try await credentials.removeData(
+                    for: credentialAccount,
+                    ifMatches: tokenData
+                )
+            } catch {
+                throw GitHubConnectionError.credentialStorage
+            }
+            guard generation == authorizationGeneration,
+                  accountGeneration == accountGenerations[accountID, default: 0],
+                  removed
+            else {
+                throw CancellationError()
+            }
+            accountGenerations[accountID, default: 0] &+= 1
+            updateSummary(detail: "Authorization expired", state: .needsAttention)
+            throw GitHubConnectionError.invalidToken
+        } catch GitHubAPIError.insufficientOAuthScope {
+            guard generation == authorizationGeneration,
+                  accountGeneration == accountGenerations[accountID, default: 0]
+            else {
+                throw CancellationError()
+            }
+            updateSummary(detail: "Private repository access required", state: .needsAttention)
+            throw GitHubConnectionError.privateRepositoryAccessRequired
+        } catch {
+            if Task.isCancelled { throw CancellationError() }
+            guard generation == authorizationGeneration,
+                  accountGeneration == accountGenerations[accountID, default: 0]
+            else {
+                throw CancellationError()
+            }
+            throw map(error)
+        }
+    }
+
     private func pullRequests(
         for account: GitHubAccount,
         query: PullRequestQuery

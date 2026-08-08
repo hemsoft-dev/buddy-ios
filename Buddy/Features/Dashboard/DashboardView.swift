@@ -47,6 +47,7 @@ struct DashboardView: View {
     @State private var viewModel = DashboardViewModel(
         integrations: IntegrationCatalog.defaultIntegrations
     )
+    @State private var githubPullRequestDetailStore = GitHubPullRequestDetailStore()
     @DashboardGitHubCardExpansionStorage private var expandedGitHubAccountCards
     @State private var githubPullRequestTreeExpansion = DashboardGitHubPullRequestTreeExpansionState()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -322,7 +323,7 @@ struct DashboardView: View {
                         .foregroundStyle(.secondary)
                 }
                 if !pullRequests.isEmpty {
-                    repositoryGroupList(pullRequests, accountID: account.id, section: section)
+                    repositoryGroupList(pullRequests, account: account, section: section)
                 }
             }
 
@@ -343,7 +344,7 @@ struct DashboardView: View {
                 .buttonStyle(.bordered)
 
                 if !pullRequests.isEmpty {
-                    repositoryGroupList(pullRequests, accountID: account.id, section: section)
+                    repositoryGroupList(pullRequests, account: account, section: section)
                 }
             }
         }
@@ -372,13 +373,13 @@ struct DashboardView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         } else {
-            repositoryGroupList(pullRequests, accountID: account.id, section: section)
+            repositoryGroupList(pullRequests, account: account, section: section)
         }
     }
 
     private func repositoryGroupList(
         _ pullRequests: [GitHubPullRequest],
-        accountID: Int,
+        account: GitHubAccount,
         section: GitHubPullRequestSection
     ) -> some View {
         let groups = GitHubPullRequestRepositoryGroup.grouped(pullRequests)
@@ -388,7 +389,7 @@ struct DashboardView: View {
                 if index > 0 {
                     Divider()
                 }
-                repositoryGroup(group, accountID: accountID, section: section)
+                repositoryGroup(group, account: account, section: section)
                     .padding(.vertical, BuddyTheme.Spacing.small)
             }
         }
@@ -396,12 +397,12 @@ struct DashboardView: View {
 
     private func repositoryGroup(
         _ group: GitHubPullRequestRepositoryGroup,
-        accountID: Int,
+        account: GitHubAccount,
         section: GitHubPullRequestSection
     ) -> some View {
         let isExpanded = githubPullRequestTreeExpansion.isRepositoryExpanded(
             group.id,
-            for: accountID,
+            for: account.id,
             section: section
         )
 
@@ -410,7 +411,7 @@ struct DashboardView: View {
                 withAnimation(reduceMotion ? nil : .snappy) {
                     githubPullRequestTreeExpansion.toggleRepository(
                         group.id,
-                        for: accountID,
+                        for: account.id,
                         section: section
                     )
                 }
@@ -442,7 +443,7 @@ struct DashboardView: View {
             .accessibilityHint(isExpanded ? "Collapses pull requests for this repository" : "Expands pull requests for this repository")
 
             if isExpanded {
-                pullRequestList(group.pullRequests)
+                pullRequestList(group.pullRequests, account: account)
                     .padding(.leading, BuddyTheme.Spacing.medium)
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }
@@ -450,20 +451,33 @@ struct DashboardView: View {
         .animation(reduceMotion ? nil : .snappy, value: isExpanded)
     }
 
-    private func pullRequestList(_ pullRequests: [GitHubPullRequest]) -> some View {
+    private func pullRequestList(
+        _ pullRequests: [GitHubPullRequest],
+        account: GitHubAccount
+    ) -> some View {
         LazyVStack(alignment: .leading, spacing: 0) {
             ForEach(Array(pullRequests.enumerated()), id: \.element.id) { index, pullRequest in
                 if index > 0 {
                     Divider()
                 }
-                pullRequestRow(pullRequest)
+                pullRequestRow(pullRequest, account: account)
                     .padding(.vertical, BuddyTheme.Spacing.small)
             }
         }
     }
 
-    private func pullRequestRow(_ pullRequest: GitHubPullRequest) -> some View {
-        Link(destination: pullRequest.url) {
+    private func pullRequestRow(
+        _ pullRequest: GitHubPullRequest,
+        account: GitHubAccount
+    ) -> some View {
+        NavigationLink {
+            GitHubPullRequestDetailView(
+                pullRequest: pullRequest,
+                account: account,
+                store: githubPullRequestDetailStore,
+                openAccounts: openAccounts
+            )
+        } label: {
             HStack(alignment: .top, spacing: BuddyTheme.Spacing.small) {
                 VStack(alignment: .leading, spacing: BuddyTheme.Spacing.xSmall) {
                     Text("\(pullRequest.repository) #\(pullRequest.number)")
@@ -485,14 +499,14 @@ struct DashboardView: View {
 
                 Spacer(minLength: BuddyTheme.Spacing.small)
 
-                Image(systemName: "arrow.up.right.square")
+                Image(systemName: "chevron.right")
                     .foregroundStyle(BuddyTheme.accent)
                     .accessibilityHidden(true)
             }
             .contentShape(Rectangle())
         }
         .accessibilityLabel("\(pullRequest.repository) pull request \(pullRequest.number), \(pullRequest.title), \(pullRequest.isDraft ? "draft" : "open")")
-        .accessibilityHint("Opens on GitHub")
+        .accessibilityHint(GitHubPullRequestDetailCopy.navigationHint)
     }
 
     private func sectionTitle(_ section: GitHubPullRequestSection) -> String {

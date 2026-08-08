@@ -92,6 +92,57 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(requests, [PullRequestRequest(login: "franz", token: "scoped-token")])
     }
 
+    func testPullRequestDetailsUsesTheSupplyingAccountsScopedCredential() async throws {
+        let pullRequest = GitHubPullRequest(
+            id: 30,
+            repository: "Relias/private-repo",
+            number: 30,
+            title: "Private detail",
+            isDraft: false,
+            updatedAt: Date(timeIntervalSince1970: 1_000),
+            url: URL(string: "https://github.com/Relias/private-repo/pull/30")!
+        )
+        let details = GitHubPullRequestDetails(
+            id: 30,
+            repository: pullRequest.repository,
+            number: pullRequest.number,
+            title: pullRequest.title,
+            state: .open,
+            isDraft: false,
+            updatedAt: pullRequest.updatedAt,
+            url: pullRequest.url,
+            body: "Private description",
+            changedFiles: 1,
+            additions: 2,
+            deletions: 1,
+            author: nil,
+            linkedIssues: [],
+            reviewers: []
+        )
+        let account = GitHubAccount(id: 7, login: "franz", name: nil, avatarURL: nil)
+        let credentials = MockCredentialStore(values: [
+            GitHubIntegration.credentialAccount(for: account.connectedAccountID): "private-account-token",
+        ])
+        let api = StubGitHubAPI(detailResults: [.success(details)])
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: credentials
+        )
+
+        let result = try await integration.pullRequestDetails(for: pullRequest, account: account)
+
+        XCTAssertEqual(result, details)
+        let requests = await api.detailRequests()
+        XCTAssertEqual(requests, [
+            PullRequestDetailRequest(
+                repository: "Relias/private-repo",
+                number: 30,
+                token: "private-account-token"
+            ),
+        ])
+    }
+
     func testUnauthorizedPullRequestRefreshRemovesCredentialAndRequestsRecovery() async throws {
         let api = StubGitHubAPI(pullRequestResults: [.failure(.unauthorized)])
         let credentials = MockCredentialStore(initialValue: "revoked-token")
@@ -3795,6 +3846,12 @@ private struct PullRequestRequest: Equatable, Sendable {
     let token: String
 }
 
+private struct PullRequestDetailRequest: Equatable, Sendable {
+    let repository: String
+    let number: Int
+    let token: String
+}
+
 private struct RevokedAuthorization: Equatable, Sendable {
     let token: String
     let configuration: GitHubOAuthConfiguration
@@ -3812,9 +3869,11 @@ private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing, GitHubO
     private var userResults: [Result<GitHubAccount, GitHubAPIError>]
     private var pullRequestResults: [Result<GitHubPullRequestCollection, GitHubAPIError>]
     private var assignedPullRequestResults: [Result<GitHubPullRequestCollection, GitHubAPIError>]
+    private var detailResults: [Result<GitHubPullRequestDetails, GitHubAPIError>]
     private var capturedUserTokens: [String] = []
     private var capturedPullRequestRequests: [PullRequestRequest] = []
     private var capturedAssignedPullRequestRequests: [PullRequestRequest] = []
+    private var capturedDetailRequests: [PullRequestDetailRequest] = []
     private var capturedDeviceRequestCount = 0
     private var capturedPollRequestCount = 0
     private var capturedCanceledAuthorizations: [GitHubBrowserAuthorization] = []
@@ -3825,13 +3884,15 @@ private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing, GitHubO
         pollResults: [Result<GitHubTokenPollResult, GitHubAPIError>] = [],
         userResults: [Result<GitHubAccount, GitHubAPIError>] = [],
         pullRequestResults: [Result<GitHubPullRequestCollection, GitHubAPIError>] = [],
-        assignedPullRequestResults: [Result<GitHubPullRequestCollection, GitHubAPIError>] = []
+        assignedPullRequestResults: [Result<GitHubPullRequestCollection, GitHubAPIError>] = [],
+        detailResults: [Result<GitHubPullRequestDetails, GitHubAPIError>] = []
     ) {
         self.deviceResults = deviceResults
         self.pollResults = pollResults
         self.userResults = userResults
         self.pullRequestResults = pullRequestResults
         self.assignedPullRequestResults = assignedPullRequestResults
+        self.detailResults = detailResults
     }
 
     func beginAuthorization(configuration: GitHubOAuthConfiguration) throws -> GitHubBrowserAuthorization {
@@ -3877,6 +3938,17 @@ private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing, GitHubO
         return try assignedPullRequestResults.removeFirst().get()
     }
 
+    func pullRequestDetails(
+        repository: String,
+        number: Int,
+        token: String
+    ) throws -> GitHubPullRequestDetails {
+        capturedDetailRequests.append(
+            PullRequestDetailRequest(repository: repository, number: number, token: token)
+        )
+        return try detailResults.removeFirst().get()
+    }
+
     func userTokens() -> [String] {
         capturedUserTokens
     }
@@ -3887,6 +3959,10 @@ private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing, GitHubO
 
     func assignedPullRequestRequests() -> [PullRequestRequest] {
         capturedAssignedPullRequestRequests
+    }
+
+    func detailRequests() -> [PullRequestDetailRequest] {
+        capturedDetailRequests
     }
 
     func deviceRequestCount() -> Int {

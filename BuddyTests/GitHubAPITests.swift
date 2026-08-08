@@ -557,6 +557,254 @@ final class GitHubAPITests: XCTestCase {
         }
     }
 
+    func testPullRequestDetailsUsesOneAccountScopedGraphQLRequestAndReducesReviewers() async throws {
+        let response = #"""
+        {
+          "data": {
+            "repository": {
+              "pullRequest": {
+                "databaseId": 300,
+                "number": 30,
+                "title": "Private detail",
+                "state": "OPEN",
+                "isDraft": false,
+                "updatedAt": "2026-08-08T18:00:00Z",
+                "url": "https://github.com/Relias/private-repo/pull/30",
+                "body": "## Summary\n\n[Read more](https://example.com)",
+                "changedFiles": 8,
+                "additions": 162,
+                "deletions": 52,
+                "author": {"login":"octocat","name":"The Octocat","avatarUrl":"https://avatars.githubusercontent.com/u/1"},
+                "closingIssuesReferences": {"pageInfo":{"hasNextPage":false,"endCursor":"issues-end"},"nodes":[
+                  {"id":"I_kwDO_private_29","number":29,"title":"Detail issue","url":"https://github.com/Relias/private-repo/issues/29"},
+                  {"id":"I_kwDO_shared_29","number":29,"title":"Shared issue","url":"https://github.com/Relias/shared-repo/issues/29"}
+                ]},
+                "reviewRequests": {"pageInfo":{"hasNextPage":false,"endCursor":"requests-end"},"nodes":[
+                  {"requestedReviewer":{"__typename":"User","login":"bob","name":"Bob","avatarUrl":null}},
+                  {"requestedReviewer":{"__typename":"Team","name":"Core Team","slug":"core","avatarUrl":null,"organization":{"login":"Relias"}}}
+                ]},
+                "latestReviews": {"pageInfo":{"hasNextPage":false,"endCursor":"latest-end"},"nodes":[
+                  {"state":"COMMENTED","submittedAt":"2026-08-08T13:30:00Z","author":{"login":"alice","name":"Alice","avatarUrl":null}},
+                  {"state":"CHANGES_REQUESTED","submittedAt":"2026-08-08T14:00:00Z","author":{"login":"bob","name":"Bob","avatarUrl":null}},
+                  {"state":"DISMISSED","submittedAt":"2026-08-08T16:00:00Z","author":{"login":"dana","name":"Dana","avatarUrl":null}}
+                ]},
+                "reviewHistory": {"pageInfo":{"hasNextPage":false,"endCursor":"history-end"},"nodes":[
+                  {"state":"APPROVED","submittedAt":"2026-08-08T13:00:00Z","author":{"login":"alice","name":"Alice","avatarUrl":null}},
+                  {"state":"CHANGES_REQUESTED","submittedAt":"2026-08-08T14:00:00Z","author":{"login":"bob","name":"Bob","avatarUrl":null}},
+                  {"state":"APPROVED","submittedAt":"2026-08-08T15:00:00Z","author":{"login":"dana","name":"Dana","avatarUrl":null}},
+                  {"state":"DISMISSED","submittedAt":"2026-08-08T16:00:00Z","author":{"login":"dana","name":"Dana","avatarUrl":null}}
+                ]}
+              }
+            }
+          }
+        }
+        """#
+        let client = MockHTTPClient(responses: [.success(response, statusCode: 200)])
+
+        let details = try await GitHubAPI(httpClient: client).pullRequestDetails(
+            repository: "Relias/private-repo",
+            number: 30,
+            token: "private-account-token"
+        )
+
+        XCTAssertEqual(details.repository, "Relias/private-repo")
+        XCTAssertEqual(details.number, 30)
+        XCTAssertEqual(details.changedFiles, 8)
+        XCTAssertEqual(details.changedLines, 214)
+        XCTAssertEqual(details.author?.login, "octocat")
+        XCTAssertEqual(details.linkedIssues.map(\.number), [29, 29])
+        XCTAssertEqual(Set(details.linkedIssues.map(\.id)), ["I_kwDO_private_29", "I_kwDO_shared_29"])
+        XCTAssertEqual(details.reviewers.map(\.reviewer.login), ["alice", "bob", "dana", "Relias/core"])
+        XCTAssertEqual(details.reviewers.map(\.status), [.approved, .requested, .approved, .requested])
+
+        let capturedRequest = await client.lastRequest()
+        let request = try XCTUnwrap(capturedRequest)
+        XCTAssertEqual(request.url?.absoluteString, "https://api.github.com/graphql")
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer private-account-token")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-GitHub-Api-Version"), "2022-11-28")
+        let body = try XCTUnwrap(request.httpBody)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let variables = try XCTUnwrap(object["variables"] as? [String: Any])
+        XCTAssertEqual(variables["owner"] as? String, "Relias")
+        XCTAssertEqual(variables["name"] as? String, "private-repo")
+        XCTAssertEqual(variables["number"] as? Int, 30)
+        let query = try XCTUnwrap(object["query"] as? String)
+        XCTAssertTrue(query.contains("closingIssuesReferences(first: 100)"))
+        XCTAssertTrue(query.contains("reviewRequests(first: 100)"))
+        XCTAssertTrue(query.contains("latestReviews(first: 100)"))
+        XCTAssertTrue(query.contains("reviewHistory: reviews(first: 100)"))
+        let requests = await client.requests()
+        XCTAssertEqual(requests.count, 1)
+    }
+
+    func testPullRequestDetailsPaginatesReviewHistoryPastOneHundred() async throws {
+        let latestNodes = (1...100).map { index in
+            #"{"state":"COMMENTED","submittedAt":"2026-08-08T12:00:00Z","author":{"login":"reviewer\#(index)","name":null,"avatarUrl":null}}"#
+        }.joined(separator: ",")
+        let reviewHistoryNodes = (1...100).map { index in
+            #"{"state":"APPROVED","submittedAt":"2026-08-08T11:00:00Z","author":{"login":"reviewer\#(index)","name":null,"avatarUrl":null}}"#
+        }.joined(separator: ",")
+        let firstPage = #"""
+        {"data":{"repository":{"pullRequest":{
+          "databaseId":30,"number":30,"title":"Large review set","state":"OPEN","isDraft":false,
+          "updatedAt":"2026-08-08T18:00:00Z","url":"https://github.com/HemSoft/buddy-ios/pull/30",
+          "body":"","changedFiles":1,"additions":1,"deletions":0,"author":null,
+          "closingIssuesReferences":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},
+          "reviewRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},
+          "latestReviews":{"pageInfo":{"hasNextPage":false,"endCursor":"latest-100"},"nodes":[\#(latestNodes)]},
+          "reviewHistory":{"pageInfo":{"hasNextPage":true,"endCursor":"history-100"},"nodes":[\#(reviewHistoryNodes)]}
+        }}}}
+        """#
+        let secondPage = #"""
+        {"data":{"repository":{"pullRequest":{"number":30,"page":{
+          "pageInfo":{"hasNextPage":false,"endCursor":"history-101"},
+          "nodes":[{"state":"APPROVED","submittedAt":"2026-08-08T10:00:00Z","author":{"login":"reviewer101","name":null,"avatarUrl":null}}]
+        }}}}}
+        """#
+        let client = MockHTTPClient(responses: [
+            .success(firstPage, statusCode: 200),
+            .success(secondPage, statusCode: 200),
+        ])
+
+        let details = try await GitHubAPI(httpClient: client).pullRequestDetails(
+            repository: "HemSoft/buddy-ios",
+            number: 30,
+            token: "private-account-token"
+        )
+
+        XCTAssertEqual(details.reviewers.count, 101)
+        XCTAssertEqual(details.reviewers.first { $0.reviewer.login == "reviewer1" }?.status, .approved)
+        XCTAssertEqual(details.reviewers.first { $0.reviewer.login == "reviewer101" }?.status, .approved)
+        let requests = await client.requests()
+        XCTAssertEqual(requests.count, 2)
+        let paginationBody = try XCTUnwrap(requests.last?.httpBody)
+        let paginationObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: paginationBody) as? [String: Any]
+        )
+        let paginationVariables = try XCTUnwrap(paginationObject["variables"] as? [String: Any])
+        XCTAssertEqual(paginationVariables["after"] as? String, "history-100")
+        XCTAssertTrue(
+            try XCTUnwrap(paginationObject["query"] as? String)
+                .contains("page: reviews(first: 100, after: $after)")
+        )
+    }
+
+    func testPullRequestDetailsPaginatesLinkedIssuesAndOutstandingReviewRequests() async throws {
+        let issueNodes = (1...100).map { index in
+            #"{"id":"issue-\#(index)","number":\#(index),"title":"Issue \#(index)","url":"https://github.com/HemSoft/buddy-ios/issues/\#(index)"}"#
+        }.joined(separator: ",")
+        let requestNodes = (1...100).map { index in
+            #"{"requestedReviewer":{"__typename":"User","login":"reviewer\#(index)","name":null,"avatarUrl":null}}"#
+        }.joined(separator: ",")
+        let firstPage = #"""
+        {"data":{"repository":{"pullRequest":{
+          "databaseId":30,"number":30,"title":"Large relationship set","state":"OPEN","isDraft":false,
+          "updatedAt":"2026-08-08T18:00:00Z","url":"https://github.com/HemSoft/buddy-ios/pull/30",
+          "body":"","changedFiles":1,"additions":1,"deletions":0,"author":null,
+          "closingIssuesReferences":{"pageInfo":{"hasNextPage":true,"endCursor":"issues-100"},"nodes":[\#(issueNodes)]},
+          "reviewRequests":{"pageInfo":{"hasNextPage":true,"endCursor":"requests-100"},"nodes":[\#(requestNodes)]},
+          "latestReviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},
+          "reviewHistory":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}
+        }}}}
+        """#
+        let remainingIssues = #"""
+        {"data":{"repository":{"pullRequest":{"number":30,"page":{
+          "pageInfo":{"hasNextPage":false,"endCursor":"issues-101"},
+          "nodes":[{"id":"issue-101","number":101,"title":"Issue 101","url":"https://github.com/HemSoft/buddy-ios/issues/101"}]
+        }}}}}
+        """#
+        let remainingRequests = #"""
+        {"data":{"repository":{"pullRequest":{"number":30,"page":{
+          "pageInfo":{"hasNextPage":false,"endCursor":"requests-101"},
+          "nodes":[{"requestedReviewer":{"__typename":"User","login":"reviewer101","name":null,"avatarUrl":null}}]
+        }}}}}
+        """#
+        let client = MockHTTPClient(responses: [
+            .success(firstPage, statusCode: 200),
+            .success(remainingIssues, statusCode: 200),
+            .success(remainingRequests, statusCode: 200),
+        ])
+
+        let details = try await GitHubAPI(httpClient: client).pullRequestDetails(
+            repository: "HemSoft/buddy-ios",
+            number: 30,
+            token: "private-account-token"
+        )
+
+        XCTAssertEqual(details.linkedIssues.count, 101)
+        XCTAssertEqual(details.linkedIssues.last?.id, "issue-101")
+        XCTAssertEqual(details.reviewers.count, 101)
+        XCTAssertEqual(details.reviewers.first { $0.reviewer.login == "reviewer101" }?.status, .requested)
+
+        let requests = await client.requests()
+        XCTAssertEqual(requests.count, 3)
+        let issuePage = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try XCTUnwrap(requests[1].httpBody)) as? [String: Any]
+        )
+        XCTAssertEqual((issuePage["variables"] as? [String: Any])?["after"] as? String, "issues-100")
+        XCTAssertTrue(
+            try XCTUnwrap(issuePage["query"] as? String)
+                .contains("page: closingIssuesReferences(first: 100, after: $after)")
+        )
+        let requestPage = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try XCTUnwrap(requests[2].httpBody)) as? [String: Any]
+        )
+        XCTAssertEqual((requestPage["variables"] as? [String: Any])?["after"] as? String, "requests-100")
+        XCTAssertTrue(
+            try XCTUnwrap(requestPage["query"] as? String)
+                .contains("page: reviewRequests(first: 100, after: $after)")
+        )
+    }
+
+    func testPullRequestDetailsSupportsPartialAndEmptyMetadata() async throws {
+        let response = #"""
+        {"data":{"repository":{"pullRequest":{
+          "databaseId":31,"number":31,"title":"Sparse detail","state":"CLOSED","isDraft":false,
+          "updatedAt":"2026-08-08T18:00:00Z","url":"https://github.com/HemSoft/buddy-ios/pull/31",
+          "body":"","changedFiles":0,"additions":0,"deletions":0,"author":null,
+          "closingIssuesReferences":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[null]},
+          "reviewRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},
+          "latestReviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[null]},
+          "reviewHistory":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[null]}
+        }}}}
+        """#
+
+        let details = try await GitHubAPI(httpClient: MockHTTPClient(responses: [.success(response, statusCode: 200)]))
+            .pullRequestDetails(repository: "HemSoft/buddy-ios", number: 31, token: "token")
+
+        XCTAssertEqual(details.state, .closed)
+        XCTAssertNil(details.author)
+        XCTAssertTrue(details.body.isEmpty)
+        XCTAssertTrue(details.linkedIssues.isEmpty)
+        XCTAssertTrue(details.reviewers.isEmpty)
+    }
+
+    func testPullRequestDetailsRejectsGraphQLErrorsMissingNodesAndMalformedIdentity() async throws {
+        let responses = [
+            #"{"errors":[{"message":"denied"}],"data":{"repository":null}}"#,
+            #"{"data":{"repository":{"pullRequest":null}}}"#,
+        ]
+
+        for response in responses {
+            do {
+                _ = try await GitHubAPI(httpClient: MockHTTPClient(responses: [.success(response, statusCode: 200)]))
+                    .pullRequestDetails(repository: "HemSoft/buddy-ios", number: 30, token: "token")
+                XCTFail("Expected malformed GraphQL response")
+            } catch let error as GitHubAPIError {
+                XCTAssertEqual(error, .malformedResponse)
+            }
+        }
+
+        do {
+            _ = try await GitHubAPI(httpClient: MockHTTPClient(responses: []))
+                .pullRequestDetails(repository: "not-a-repository", number: 30, token: "token")
+            XCTFail("Expected malformed repository identity")
+        } catch let error as GitHubAPIError {
+            XCTAssertEqual(error, .malformedResponse)
+        }
+    }
+
     func testNetworkFailureRemainsRecoverable() async throws {
         let httpClient = MockHTTPClient(responses: [.networkFailure])
 
@@ -629,5 +877,9 @@ private actor MockHTTPClient: HTTPClient {
 
     func lastRequest() -> URLRequest? {
         capturedRequests.last
+    }
+
+    func requests() -> [URLRequest] {
+        capturedRequests
     }
 }
