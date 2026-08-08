@@ -314,8 +314,22 @@ struct GitHubAPI: GitHubAPIProviding {
         }
 
         let author = try node.author.map(Self.userSummary)
+        var closingIssues = node.closingIssuesReferences.nodes
+        if node.closingIssuesReferences.pageInfo.hasNextPage {
+            guard let cursor = node.closingIssuesReferences.pageInfo.endCursor, !cursor.isEmpty else {
+                throw GitHubAPIError.malformedResponse
+            }
+            closingIssues.append(contentsOf: try await remainingConnectionNodes(
+                owner: String(repositoryParts[0]),
+                name: String(repositoryParts[1]),
+                number: number,
+                after: cursor,
+                token: token,
+                query: Self.pullRequestClosingIssuesQuery
+            ))
+        }
         var linkedIssues: [GitHubIssueReference] = []
-        for issue in node.closingIssuesReferences.nodes.compactMap({ $0 }) {
+        for issue in closingIssues.compactMap({ $0 }) {
             guard !issue.id.isEmpty,
                   issue.number > 0,
                   !issue.title.isEmpty,
@@ -339,7 +353,7 @@ struct GitHubAPI: GitHubAPIProviding {
             guard let cursor = node.latestReviews.pageInfo.endCursor, !cursor.isEmpty else {
                 throw GitHubAPIError.malformedResponse
             }
-            latestReviews.append(contentsOf: try await remainingReviewPage(
+            latestReviews.append(contentsOf: try await remainingConnectionNodes(
                 owner: String(repositoryParts[0]),
                 name: String(repositoryParts[1]),
                 number: number,
@@ -353,13 +367,27 @@ struct GitHubAPI: GitHubAPIProviding {
             guard let cursor = node.latestOpinionatedReviews.pageInfo.endCursor, !cursor.isEmpty else {
                 throw GitHubAPIError.malformedResponse
             }
-            latestOpinionatedReviews.append(contentsOf: try await remainingReviewPage(
+            latestOpinionatedReviews.append(contentsOf: try await remainingConnectionNodes(
                 owner: String(repositoryParts[0]),
                 name: String(repositoryParts[1]),
                 number: number,
                 after: cursor,
                 token: token,
                 query: Self.pullRequestLatestOpinionatedReviewsQuery
+            ))
+        }
+        var reviewRequests = node.reviewRequests.nodes
+        if node.reviewRequests.pageInfo.hasNextPage {
+            guard let cursor = node.reviewRequests.pageInfo.endCursor, !cursor.isEmpty else {
+                throw GitHubAPIError.malformedResponse
+            }
+            reviewRequests.append(contentsOf: try await remainingConnectionNodes(
+                owner: String(repositoryParts[0]),
+                name: String(repositoryParts[1]),
+                number: number,
+                after: cursor,
+                token: token,
+                query: Self.pullRequestReviewRequestsQuery
             ))
         }
 
@@ -381,7 +409,7 @@ struct GitHubAPI: GitHubAPIProviding {
             reviewers: try Self.reviewerSummaries(
                 reviews: latestReviews,
                 opinionatedReviews: latestOpinionatedReviews,
-                reviewRequests: node.reviewRequests
+                reviewRequests: reviewRequests
             )
         )
     }
@@ -406,10 +434,12 @@ struct GitHubAPI: GitHubAPIProviding {
             avatarUrl
             ... on User { name }
           }
-          closingIssuesReferences(first: 50) {
+          closingIssuesReferences(first: 100) {
+            pageInfo { hasNextPage endCursor }
             nodes { id number title url }
           }
-          reviewRequests(first: 50) {
+          reviewRequests(first: 100) {
+            pageInfo { hasNextPage endCursor }
             nodes {
               requestedReviewer {
                 __typename
@@ -447,6 +477,50 @@ struct GitHubAPI: GitHubAPIProviding {
     }
     """
 
+    private static let pullRequestClosingIssuesQuery = """
+    query BuddyPullRequestClosingIssues(
+      $owner: String!,
+      $name: String!,
+      $number: Int!,
+      $after: String!
+    ) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          number
+          page: closingIssuesReferences(first: 100, after: $after) {
+            pageInfo { hasNextPage endCursor }
+            nodes { id number title url }
+          }
+        }
+      }
+    }
+    """
+
+    private static let pullRequestReviewRequestsQuery = """
+    query BuddyPullRequestReviewRequests(
+      $owner: String!,
+      $name: String!,
+      $number: Int!,
+      $after: String!
+    ) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          number
+          page: reviewRequests(first: 100, after: $after) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              requestedReviewer {
+                __typename
+                ... on User { login name avatarUrl }
+                ... on Team { name slug avatarUrl organization { login } }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+
     private static let pullRequestLatestReviewsQuery = """
     query BuddyPullRequestLatestReviews(
       $owner: String!,
@@ -457,7 +531,7 @@ struct GitHubAPI: GitHubAPIProviding {
       repository(owner: $owner, name: $name) {
         pullRequest(number: $number) {
           number
-          reviewPage: latestReviews(first: 100, after: $after) {
+          page: latestReviews(first: 100, after: $after) {
             pageInfo { hasNextPage endCursor }
             nodes {
               state
@@ -484,7 +558,7 @@ struct GitHubAPI: GitHubAPIProviding {
       repository(owner: $owner, name: $name) {
         pullRequest(number: $number) {
           number
-          reviewPage: latestOpinionatedReviews(first: 100, after: $after) {
+          page: latestOpinionatedReviews(first: 100, after: $after) {
             pageInfo { hasNextPage endCursor }
             nodes {
               state
@@ -501,21 +575,21 @@ struct GitHubAPI: GitHubAPIProviding {
     }
     """
 
-    private func remainingReviewPage(
+    private func remainingConnectionNodes<Node: Decodable>(
         owner: String,
         name: String,
         number: Int,
         after initialCursor: String,
         token: String,
         query: String
-    ) async throws -> [PullRequestDetailsReviewNode?] {
+    ) async throws -> [Node?] {
         guard let url = URL(string: "https://api.github.com/graphql") else {
             throw GitHubAPIError.malformedResponse
         }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         var cursor: String? = initialCursor
-        var reviews: [PullRequestDetailsReviewNode?] = []
+        var nodes: [Node?] = []
 
         while let currentCursor = cursor {
             var request = URLRequest(url: url)
@@ -536,9 +610,9 @@ struct GitHubAPI: GitHubAPIProviding {
             guard request.httpBody != nil else { throw GitHubAPIError.malformedResponse }
 
             let data = try await perform(request)
-            let response: PullRequestLatestReviewsGraphQLResponse
+            let response: PullRequestDetailsPageGraphQLResponse<Node>
             do {
-                response = try decoder.decode(PullRequestLatestReviewsGraphQLResponse.self, from: data)
+                response = try decoder.decode(PullRequestDetailsPageGraphQLResponse<Node>.self, from: data)
             } catch {
                 throw GitHubAPIError.malformedResponse
             }
@@ -548,8 +622,8 @@ struct GitHubAPI: GitHubAPIProviding {
             else {
                 throw GitHubAPIError.malformedResponse
             }
-            let connection = pullRequest.reviewPage
-            reviews.append(contentsOf: connection.nodes)
+            let connection = pullRequest.page
+            nodes.append(contentsOf: connection.nodes)
 
             if connection.pageInfo.hasNextPage {
                 guard let nextCursor = connection.pageInfo.endCursor,
@@ -563,7 +637,7 @@ struct GitHubAPI: GitHubAPIProviding {
                 cursor = nil
             }
         }
-        return reviews
+        return nodes
     }
 
     private static func userSummary(_ actor: PullRequestDetailsActor) throws -> GitHubUserSummary {
@@ -580,7 +654,7 @@ struct GitHubAPI: GitHubAPIProviding {
     private static func reviewerSummaries(
         reviews latestReviews: [PullRequestDetailsReviewNode?],
         opinionatedReviews: [PullRequestDetailsReviewNode?],
-        reviewRequests: PullRequestDetailsReviewRequestConnection
+        reviewRequests: [PullRequestDetailsReviewRequestNode?]
     ) throws -> [GitHubReviewerSummary] {
         var reviewers: [String: GitHubReviewerSummary] = [:]
 
@@ -606,7 +680,7 @@ struct GitHubAPI: GitHubAPIProviding {
             reviewers[reviewer.id] = GitHubReviewerSummary(reviewer: reviewer, status: status)
         }
 
-        for request in reviewRequests.nodes.compactMap({ $0 }) {
+        for request in reviewRequests.compactMap({ $0 }) {
             guard let requestedReviewer = request.requestedReviewer else { continue }
             let reviewer: GitHubUserSummary
             switch requestedReviewer.typeName {
@@ -874,22 +948,22 @@ private struct PullRequestDetailsRepository: Decodable {
     let pullRequest: PullRequestDetailsNode?
 }
 
-private struct PullRequestLatestReviewsGraphQLResponse: Decodable {
-    let data: PullRequestLatestReviewsGraphQLData?
+private struct PullRequestDetailsPageGraphQLResponse<Node: Decodable>: Decodable {
+    let data: PullRequestDetailsPageGraphQLData<Node>?
     let errors: [PullRequestDetailsGraphQLError]?
 }
 
-private struct PullRequestLatestReviewsGraphQLData: Decodable {
-    let repository: PullRequestLatestReviewsRepository?
+private struct PullRequestDetailsPageGraphQLData<Node: Decodable>: Decodable {
+    let repository: PullRequestDetailsPageRepository<Node>?
 }
 
-private struct PullRequestLatestReviewsRepository: Decodable {
-    let pullRequest: PullRequestLatestReviewsNode?
+private struct PullRequestDetailsPageRepository<Node: Decodable>: Decodable {
+    let pullRequest: PullRequestDetailsPageNode<Node>?
 }
 
-private struct PullRequestLatestReviewsNode: Decodable {
+private struct PullRequestDetailsPageNode<Node: Decodable>: Decodable {
     let number: Int
-    let reviewPage: PullRequestDetailsReviewConnection
+    let page: PullRequestDetailsConnection<Node>
 }
 
 private struct PullRequestDetailsNode: Decodable {
@@ -944,6 +1018,7 @@ private struct PullRequestDetailsActor: Decodable {
 
 private struct PullRequestDetailsIssueConnection: Decodable {
     let nodes: [PullRequestDetailsIssueNode?]
+    let pageInfo: PullRequestDetailsPageInfo
 }
 
 private struct PullRequestDetailsIssueNode: Decodable {
@@ -955,6 +1030,7 @@ private struct PullRequestDetailsIssueNode: Decodable {
 
 private struct PullRequestDetailsReviewRequestConnection: Decodable {
     let nodes: [PullRequestDetailsReviewRequestNode?]
+    let pageInfo: PullRequestDetailsPageInfo
 }
 
 private struct PullRequestDetailsReviewRequestNode: Decodable {
@@ -983,10 +1059,12 @@ private struct PullRequestDetailsOrganization: Decodable {
     let login: String
 }
 
-private struct PullRequestDetailsReviewConnection: Decodable {
-    let nodes: [PullRequestDetailsReviewNode?]
+private struct PullRequestDetailsConnection<Node: Decodable>: Decodable {
+    let nodes: [Node?]
     let pageInfo: PullRequestDetailsPageInfo
 }
+
+private typealias PullRequestDetailsReviewConnection = PullRequestDetailsConnection<PullRequestDetailsReviewNode>
 
 private struct PullRequestDetailsPageInfo: Decodable {
     let hasNextPage: Bool

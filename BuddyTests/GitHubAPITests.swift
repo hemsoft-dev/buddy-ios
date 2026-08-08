@@ -575,11 +575,11 @@ final class GitHubAPITests: XCTestCase {
                 "additions": 162,
                 "deletions": 52,
                 "author": {"login":"octocat","name":"The Octocat","avatarUrl":"https://avatars.githubusercontent.com/u/1"},
-                "closingIssuesReferences": {"nodes":[
+                "closingIssuesReferences": {"pageInfo":{"hasNextPage":false,"endCursor":"issues-end"},"nodes":[
                   {"id":"I_kwDO_private_29","number":29,"title":"Detail issue","url":"https://github.com/Relias/private-repo/issues/29"},
                   {"id":"I_kwDO_shared_29","number":29,"title":"Shared issue","url":"https://github.com/Relias/shared-repo/issues/29"}
                 ]},
-                "reviewRequests": {"nodes":[
+                "reviewRequests": {"pageInfo":{"hasNextPage":false,"endCursor":"requests-end"},"nodes":[
                   {"requestedReviewer":{"__typename":"User","login":"bob","name":"Bob","avatarUrl":null}},
                   {"requestedReviewer":{"__typename":"Team","name":"Core Team","slug":"core","avatarUrl":null,"organization":{"login":"Relias"}}}
                 ]},
@@ -630,8 +630,8 @@ final class GitHubAPITests: XCTestCase {
         XCTAssertEqual(variables["name"] as? String, "private-repo")
         XCTAssertEqual(variables["number"] as? Int, 30)
         let query = try XCTUnwrap(object["query"] as? String)
-        XCTAssertTrue(query.contains("closingIssuesReferences(first: 50)"))
-        XCTAssertTrue(query.contains("reviewRequests(first: 50)"))
+        XCTAssertTrue(query.contains("closingIssuesReferences(first: 100)"))
+        XCTAssertTrue(query.contains("reviewRequests(first: 100)"))
         XCTAssertTrue(query.contains("latestReviews(first: 100)"))
         XCTAssertTrue(query.contains("latestOpinionatedReviews(first: 100)"))
         let requests = await client.requests()
@@ -650,13 +650,14 @@ final class GitHubAPITests: XCTestCase {
           "databaseId":30,"number":30,"title":"Large review set","state":"OPEN","isDraft":false,
           "updatedAt":"2026-08-08T18:00:00Z","url":"https://github.com/HemSoft/buddy-ios/pull/30",
           "body":"","changedFiles":1,"additions":1,"deletions":0,"author":null,
-          "closingIssuesReferences":{"nodes":[]},"reviewRequests":{"nodes":[]},
+          "closingIssuesReferences":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},
+          "reviewRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},
           "latestReviews":{"pageInfo":{"hasNextPage":false,"endCursor":"latest-100"},"nodes":[\#(latestNodes)]},
           "latestOpinionatedReviews":{"pageInfo":{"hasNextPage":true,"endCursor":"opinionated-100"},"nodes":[\#(opinionatedNodes)]}
         }}}}
         """#
         let secondPage = #"""
-        {"data":{"repository":{"pullRequest":{"number":30,"reviewPage":{
+        {"data":{"repository":{"pullRequest":{"number":30,"page":{
           "pageInfo":{"hasNextPage":false,"endCursor":"opinionated-101"},
           "nodes":[{"state":"APPROVED","submittedAt":"2026-08-08T10:00:00Z","author":{"login":"reviewer101","name":null,"avatarUrl":null}}]
         }}}}}
@@ -685,7 +686,74 @@ final class GitHubAPITests: XCTestCase {
         XCTAssertEqual(paginationVariables["after"] as? String, "opinionated-100")
         XCTAssertTrue(
             try XCTUnwrap(paginationObject["query"] as? String)
-                .contains("reviewPage: latestOpinionatedReviews(first: 100, after: $after)")
+                .contains("page: latestOpinionatedReviews(first: 100, after: $after)")
+        )
+    }
+
+    func testPullRequestDetailsPaginatesLinkedIssuesAndOutstandingReviewRequests() async throws {
+        let issueNodes = (1...100).map { index in
+            #"{"id":"issue-\#(index)","number":\#(index),"title":"Issue \#(index)","url":"https://github.com/HemSoft/buddy-ios/issues/\#(index)"}"#
+        }.joined(separator: ",")
+        let requestNodes = (1...100).map { index in
+            #"{"requestedReviewer":{"__typename":"User","login":"reviewer\#(index)","name":null,"avatarUrl":null}}"#
+        }.joined(separator: ",")
+        let firstPage = #"""
+        {"data":{"repository":{"pullRequest":{
+          "databaseId":30,"number":30,"title":"Large relationship set","state":"OPEN","isDraft":false,
+          "updatedAt":"2026-08-08T18:00:00Z","url":"https://github.com/HemSoft/buddy-ios/pull/30",
+          "body":"","changedFiles":1,"additions":1,"deletions":0,"author":null,
+          "closingIssuesReferences":{"pageInfo":{"hasNextPage":true,"endCursor":"issues-100"},"nodes":[\#(issueNodes)]},
+          "reviewRequests":{"pageInfo":{"hasNextPage":true,"endCursor":"requests-100"},"nodes":[\#(requestNodes)]},
+          "latestReviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},
+          "latestOpinionatedReviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}
+        }}}}
+        """#
+        let remainingIssues = #"""
+        {"data":{"repository":{"pullRequest":{"number":30,"page":{
+          "pageInfo":{"hasNextPage":false,"endCursor":"issues-101"},
+          "nodes":[{"id":"issue-101","number":101,"title":"Issue 101","url":"https://github.com/HemSoft/buddy-ios/issues/101"}]
+        }}}}}
+        """#
+        let remainingRequests = #"""
+        {"data":{"repository":{"pullRequest":{"number":30,"page":{
+          "pageInfo":{"hasNextPage":false,"endCursor":"requests-101"},
+          "nodes":[{"requestedReviewer":{"__typename":"User","login":"reviewer101","name":null,"avatarUrl":null}}]
+        }}}}}
+        """#
+        let client = MockHTTPClient(responses: [
+            .success(firstPage, statusCode: 200),
+            .success(remainingIssues, statusCode: 200),
+            .success(remainingRequests, statusCode: 200),
+        ])
+
+        let details = try await GitHubAPI(httpClient: client).pullRequestDetails(
+            repository: "HemSoft/buddy-ios",
+            number: 30,
+            token: "private-account-token"
+        )
+
+        XCTAssertEqual(details.linkedIssues.count, 101)
+        XCTAssertEqual(details.linkedIssues.last?.id, "issue-101")
+        XCTAssertEqual(details.reviewers.count, 101)
+        XCTAssertEqual(details.reviewers.first { $0.reviewer.login == "reviewer101" }?.status, .requested)
+
+        let requests = await client.requests()
+        XCTAssertEqual(requests.count, 3)
+        let issuePage = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try XCTUnwrap(requests[1].httpBody)) as? [String: Any]
+        )
+        XCTAssertEqual((issuePage["variables"] as? [String: Any])?["after"] as? String, "issues-100")
+        XCTAssertTrue(
+            try XCTUnwrap(issuePage["query"] as? String)
+                .contains("page: closingIssuesReferences(first: 100, after: $after)")
+        )
+        let requestPage = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try XCTUnwrap(requests[2].httpBody)) as? [String: Any]
+        )
+        XCTAssertEqual((requestPage["variables"] as? [String: Any])?["after"] as? String, "requests-100")
+        XCTAssertTrue(
+            try XCTUnwrap(requestPage["query"] as? String)
+                .contains("page: reviewRequests(first: 100, after: $after)")
         )
     }
 
@@ -695,7 +763,8 @@ final class GitHubAPITests: XCTestCase {
           "databaseId":31,"number":31,"title":"Sparse detail","state":"CLOSED","isDraft":false,
           "updatedAt":"2026-08-08T18:00:00Z","url":"https://github.com/HemSoft/buddy-ios/pull/31",
           "body":"","changedFiles":0,"additions":0,"deletions":0,"author":null,
-          "closingIssuesReferences":{"nodes":[null]},"reviewRequests":{"nodes":[]},
+          "closingIssuesReferences":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[null]},
+          "reviewRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},
           "latestReviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[null]},
           "latestOpinionatedReviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[null]}
         }}}}
