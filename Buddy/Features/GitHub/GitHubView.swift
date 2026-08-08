@@ -204,7 +204,28 @@ struct GitHubView: View {
                         + "out of GitHub in Safari, so reconnecting may not require credentials."
                 )
             }
+
+            if let authorizationSettingsURL {
+                Section("Private organization repositories") {
+                    Text(
+                        "GitHub organizations can restrict OAuth app access separately. "
+                            + "If private pull requests are missing, review Buddy iOS's "
+                            + "organization access for this GitHub account."
+                    )
+
+                    Link("Review GitHub organization access", destination: authorizationSettingsURL)
+                }
+            }
         }
+    }
+
+    private var authorizationSettingsURL: URL? {
+        guard let clientID = AppConfiguration.current.githubClientID,
+              let baseURL = URL(string: "https://github.com/settings/connections/applications")
+        else {
+            return nil
+        }
+        return baseURL.appendingPathComponent(clientID)
     }
 
     private func needsAttentionContent(_ message: String) -> some View {

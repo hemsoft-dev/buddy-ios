@@ -20,9 +20,11 @@ enum DashboardGitHubPullRequestCopy {
     ) -> String {
         switch section {
         case .authored:
-            "@\(login) has no authored pull requests open right now."
+            "Buddy sees no open pull requests authored by @\(login). "
+                + "Private organization pull requests require organization access in GitHub."
         case .assigned:
-            "No open pull requests currently request a review from @\(login)."
+            "No open pull requests visible to Buddy currently request a review from @\(login). "
+                + "Private organization pull requests require organization access in GitHub."
         }
     }
 

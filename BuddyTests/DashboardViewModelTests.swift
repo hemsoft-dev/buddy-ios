@@ -169,7 +169,7 @@ final class DashboardViewModelTests: XCTestCase {
 
         XCTAssertTrue(description.contains("No open pull requests"))
         XCTAssertTrue(description.contains("@octocat"))
-        XCTAssertFalse(description.contains("public repositories"))
+        XCTAssertTrue(description.contains("organization access"))
     }
 
     func testPullRequestTreeExpansionSurvivesRefreshForExistingRepositories() {
