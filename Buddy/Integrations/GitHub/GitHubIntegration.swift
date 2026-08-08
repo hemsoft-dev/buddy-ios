@@ -85,6 +85,7 @@ actor GitHubIntegration: IntegrationProviding {
     private let clientSecret: String?
     private let api: any GitHubAPIProviding
     private let authorizer: any GitHubOAuthAuthorizing
+    private let tokenRevoker: (any GitHubOAuthTokenRevoking)?
     private let credentials: any CredentialStoring
     private let accountStore: any ConnectedAccountStoring
     private let sleep: @Sendable (Duration) async throws -> Void
@@ -109,6 +110,7 @@ actor GitHubIntegration: IntegrationProviding {
         clientSecret: String? = AppConfiguration.current.githubClientSecret,
         api: (any GitHubAPIProviding)? = nil,
         authorizer: (any GitHubOAuthAuthorizing)? = nil,
+        tokenRevoker: (any GitHubOAuthTokenRevoking)? = nil,
         credentials: any CredentialStoring = KeychainStore(),
         accountStore: (any ConnectedAccountStoring)? = nil,
         sleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
@@ -118,6 +120,7 @@ actor GitHubIntegration: IntegrationProviding {
         self.clientID = clientID
         let resolvedAPI = api ?? GitHubAPI()
         let injectedAuthorizer = authorizer ?? (resolvedAPI as? any GitHubOAuthAuthorizing)
+        let resolvedAuthorizer = injectedAuthorizer ?? GitHubWebOAuthService()
         self.clientSecret = clientSecret ?? (injectedAuthorizer == nil ? nil : "test-client-secret")
         if clientID == nil {
             authorizationConfigurationError = .missingClientID
@@ -128,7 +131,16 @@ actor GitHubIntegration: IntegrationProviding {
         }
         isAuthorizationConfigured = authorizationConfigurationError == nil
         self.api = resolvedAPI
-        self.authorizer = injectedAuthorizer ?? GitHubWebOAuthService()
+        self.authorizer = resolvedAuthorizer
+        if let tokenRevoker {
+            self.tokenRevoker = tokenRevoker
+        } else if let injectedTokenRevoker = injectedAuthorizer as? any GitHubOAuthTokenRevoking {
+            self.tokenRevoker = injectedTokenRevoker
+        } else if api == nil || resolvedAPI is GitHubAPI {
+            self.tokenRevoker = resolvedAuthorizer as? any GitHubOAuthTokenRevoking
+        } else {
+            self.tokenRevoker = nil
+        }
         self.credentials = credentials
         if let accountStore {
             self.accountStore = accountStore
@@ -1305,6 +1317,8 @@ actor GitHubIntegration: IntegrationProviding {
         await cancelAllAccountAuthorizations()
 
         do {
+            let tokenData = try await credentials.data(for: Self.credentialAccount)
+            try await revokeAuthorizationIfPresent(tokenData)
             try await performCredentialCleanup()
             guard generation == authorizationGeneration else { return }
             authorizationGeneration &+= 1
@@ -1323,8 +1337,6 @@ actor GitHubIntegration: IntegrationProviding {
         await cancelAllAccountAuthorizations()
 
         do {
-            let tokenData = try await credentials.data(for: Self.credentialAccount)
-            try await revokeAuthorizationIfPresent(tokenData)
             try await performCredentialCleanup()
             guard generation == authorizationGeneration else { return }
             authorizationGeneration &+= 1
@@ -1379,7 +1391,7 @@ actor GitHubIntegration: IntegrationProviding {
     private func revokeAuthorizationIfPresent(_ tokenData: Data?) async throws {
         guard let tokenData else { return }
         guard let token = String(data: tokenData, encoding: .utf8), !token.isEmpty else {
-            // A malformed local item cannot represent a usable GitHub grant.
+            // A malformed local item cannot represent a usable GitHub token.
             // Continue with local cleanup so Disconnect remains recoverable.
             return
         }
@@ -1388,9 +1400,10 @@ actor GitHubIntegration: IntegrationProviding {
             // was removed after the credential was originally stored.
             return
         }
+        guard let tokenRevoker else { return }
 
         do {
-            try await authorizer.revokeAuthorization(
+            try await tokenRevoker.revokeAuthorization(
                 token: token,
                 configuration: GitHubOAuthConfiguration(
                     clientID: clientID,
@@ -1510,11 +1523,11 @@ enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
     var errorDescription: String? {
         switch self {
         case .missingClientID:
-            "Buddy was built without a GitHub client ID. Set BUDDY_GITHUB_CLIENT_ID in the build configuration and rebuild the app."
+            "Buddy was built without its bundled GitHub CLI-compatible client ID. Rebuild the app from a complete configuration."
         case .missingOAuthConfiguration:
-            "Buddy was built without complete GitHub browser OAuth configuration. Provision a dedicated Buddy OAuth app and set BUDDY_GITHUB_CLIENT_ID and BUDDY_GITHUB_CLIENT_SECRET."
+            "Buddy was built without complete GitHub CLI-compatible browser configuration. Rebuild the app from a complete configuration."
         case .invalidConfiguration:
-            "GitHub rejected Buddy's OAuth configuration. Check the dedicated Buddy OAuth app settings and try again."
+            "GitHub rejected the bundled GitHub CLI-compatible OAuth configuration. Rebuild Buddy or try again later."
         case .secureRandomUnavailable:
             "Buddy couldn't create a secure GitHub sign-in request. Try again."
         case .callbackUnavailable:

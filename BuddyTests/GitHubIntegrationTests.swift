@@ -713,6 +713,46 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertTrue(connectionFinished)
     }
 
+    func testAuthorizationSheetTracksActiveAuthorizationInsteadOfUnrelatedGlobalState() async throws {
+        let first = GitHubAccount(id: 7, login: "first", name: nil, avatarURL: nil)
+        let second = GitHubAccount(id: 42, login: "second", name: nil, avatarURL: nil)
+        let firstKey = GitHubIntegration.credentialAccount(for: first.connectedAccountID)
+        let secondKey = GitHubIntegration.credentialAccount(for: second.connectedAccountID)
+        let api = MultiAccountSuspendedPollingGitHubAPI(first: first, second: second)
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: MockCredentialStore(values: [
+                firstKey: "first-token",
+                secondKey: "second-token",
+            ]),
+            accountStore: InMemoryConnectedAccountStore(records: [
+                first.connectedAccountRecord,
+                second.connectedAccountRecord,
+            ]),
+            sleep: { _ in }
+        )
+        let viewModel = await MainActor.run { GitHubViewModel(integration: integration) }
+        await viewModel.restore()
+
+        await MainActor.run {
+            viewModel.reconnect(first.connectedAccountID, presentAuthorizationURL: { _ in })
+        }
+        await api.waitUntilPollBegins()
+
+        await MainActor.run {
+            XCTAssertTrue(viewModel.keepsAuthorizationSheetPresented)
+            viewModel.reportDashboardAuthenticationFailure(for: second.connectedAccountID)
+            XCTAssertTrue(viewModel.keepsAuthorizationSheetPresented)
+        }
+
+        await api.finishPoll()
+        let authorizationFinished = try await waitUntil {
+            await MainActor.run { !viewModel.keepsAuthorizationSheetPresented }
+        }
+        XCTAssertTrue(authorizationFinished)
+    }
+
     func testAddedAccountRouteShowsItsReconnectAuthorization() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let api = SuspendedPollingGitHubAPI(account: account)
@@ -1693,7 +1733,7 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertTrue(records.isEmpty)
     }
 
-    func testDisconnectRevokesGitHubGrantBeforeRemovingScopedCredential() async throws {
+    func testDisconnectRevokesOnlyBuddysTokenBeforeRemovingScopedCredential() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let scopedKey = GitHubIntegration.credentialAccount(for: account.connectedAccountID)
         let credentials = MockCredentialStore(values: [scopedKey: "private-repository-token"])
@@ -3766,7 +3806,7 @@ private enum GitHubTokenPollResult: Equatable, Sendable {
     case authorized(token: String)
 }
 
-private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
+private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing, GitHubOAuthTokenRevoking {
     private var deviceResults: [Result<GitHubBrowserAuthorization, GitHubAPIError>]
     private var pollResults: [Result<GitHubTokenPollResult, GitHubAPIError>]
     private var userResults: [Result<GitHubAccount, GitHubAPIError>]
@@ -3827,10 +3867,6 @@ private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
         return try userResults.removeFirst().get()
     }
 
-    func revokedAuthorizations() -> [RevokedAuthorization] {
-        capturedRevokedAuthorizations
-    }
-
     func authoredPullRequests(login: String, token: String) throws -> GitHubPullRequestCollection {
         capturedPullRequestRequests.append(PullRequestRequest(login: login, token: token))
         return try pullRequestResults.removeFirst().get()
@@ -3863,6 +3899,10 @@ private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
 
     func canceledAuthorizations() -> [GitHubBrowserAuthorization] {
         capturedCanceledAuthorizations
+    }
+
+    func revokedAuthorizations() -> [RevokedAuthorization] {
+        capturedRevokedAuthorizations
     }
 }
 

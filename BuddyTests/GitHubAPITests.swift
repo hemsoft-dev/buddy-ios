@@ -22,7 +22,7 @@ final class GitHubAPITests: XCTestCase {
         XCTAssertEqual(query["state"]!, "random-state")
         XCTAssertEqual(query["code_challenge"]!, "challenge")
         XCTAssertEqual(query["code_challenge_method"]!, "S256")
-        XCTAssertEqual(query["scope"]!, "repo")
+        XCTAssertEqual(query["scope"]!, "repo read:org")
         XCTAssertEqual(query["prompt"]!, "select_account")
     }
 
@@ -60,55 +60,6 @@ final class GitHubAPITests: XCTestCase {
         XCTAssertTrue(body.contains("code=code%2Bvalue"))
         XCTAssertTrue(body.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A49152%2Fcallback"))
         XCTAssertTrue(body.contains("code_verifier=verifier_value"))
-    }
-
-    func testAuthorizationRevocationUsesApplicationGrantEndpointAndBasicAuthentication() async throws {
-        let httpClient = MockHTTPClient(responses: [.success("", statusCode: 204)])
-        let service = GitHubWebOAuthService(httpClient: httpClient)
-        let configuration = GitHubOAuthConfiguration(
-            clientID: "buddy-client",
-            clientSecret: "private-secret"
-        )
-
-        try await service.revokeAuthorization(token: "account-token", configuration: configuration)
-
-        let capturedRequest = await httpClient.lastRequest()
-        let request = try XCTUnwrap(capturedRequest)
-        XCTAssertEqual(request.url?.absoluteString, "https://api.github.com/applications/buddy-client/grant")
-        XCTAssertEqual(request.httpMethod, "DELETE")
-        XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "application/vnd.github+json")
-        XCTAssertEqual(request.value(forHTTPHeaderField: "X-GitHub-Api-Version"), "2022-11-28")
-        XCTAssertEqual(
-            request.value(forHTTPHeaderField: "Authorization"),
-            "Basic " + Data("buddy-client:private-secret".utf8).base64EncodedString()
-        )
-        let body = try XCTUnwrap(request.httpBody)
-        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String])
-        XCTAssertEqual(object, ["access_token": "account-token"])
-    }
-
-    func testAuthorizationRevocationTreatsMissingGrantAsDisconnectedAndMapsFailure() async throws {
-        let configuration = GitHubOAuthConfiguration(clientID: "client", clientSecret: "secret")
-        let missingGrantService = GitHubWebOAuthService(
-            httpClient: MockHTTPClient(responses: [.success("", statusCode: 404)])
-        )
-        try await missingGrantService.revokeAuthorization(
-            token: "already-revoked-token",
-            configuration: configuration
-        )
-
-        let failingService = GitHubWebOAuthService(
-            httpClient: MockHTTPClient(responses: [.success("", statusCode: 503)])
-        )
-        do {
-            try await failingService.revokeAuthorization(
-                token: "account-token",
-                configuration: configuration
-            )
-            XCTFail("Expected revocation failure")
-        } catch let error as GitHubOAuthError {
-            XCTAssertEqual(error, .authorizationRevocationFailed(503))
-        }
     }
 
     func testCallbackParserHandlesFragmentedMalformedOversizedStateAndCode() throws {
@@ -361,6 +312,31 @@ final class GitHubAPITests: XCTestCase {
         } catch let error as GitHubOAuthError {
             XCTAssertEqual(error, .authorizationFailed)
         }
+    }
+
+    func testAuthorizationRevocationDeletesOnlyTheSuppliedApplicationToken() async throws {
+        let httpClient = MockHTTPClient(responses: [.success("", statusCode: 204)])
+        let service = GitHubWebOAuthService(httpClient: httpClient)
+        let configuration = GitHubOAuthConfiguration(
+            clientID: "shared-client",
+            clientSecret: "public-secret"
+        )
+
+        try await service.revokeAuthorization(token: "buddy-token", configuration: configuration)
+
+        let capturedRequest = await httpClient.lastRequest()
+        let request = try XCTUnwrap(capturedRequest)
+        XCTAssertEqual(request.url?.absoluteString, "https://api.github.com/applications/shared-client/token")
+        XCTAssertEqual(request.httpMethod, "DELETE")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "application/vnd.github+json")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-GitHub-Api-Version"), "2022-11-28")
+        XCTAssertEqual(
+            request.value(forHTTPHeaderField: "Authorization"),
+            "Basic " + Data("shared-client:public-secret".utf8).base64EncodedString()
+        )
+        let body = try XCTUnwrap(request.httpBody)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String])
+        XCTAssertEqual(object, ["access_token": "buddy-token"])
     }
 
     func testAuthenticatedUserUsesBearerTokenAndMapsUnauthorized() async throws {

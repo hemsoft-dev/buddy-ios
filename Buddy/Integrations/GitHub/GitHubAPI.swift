@@ -10,6 +10,7 @@ struct GitHubBrowserAuthorization: Equatable, Identifiable, Sendable {
 
 struct GitHubOAuthConfiguration: Equatable, Sendable {
     static let repositoryScope = "repo"
+    static let authorizationScope = "repo read:org"
 
     let clientID: String
     let clientSecret: String
@@ -19,11 +20,10 @@ protocol GitHubOAuthAuthorizing: Sendable {
     func beginAuthorization(configuration: GitHubOAuthConfiguration) async throws -> GitHubBrowserAuthorization
     func completeAuthorization(_ authorization: GitHubBrowserAuthorization) async throws -> String
     func cancelAuthorization(_ authorization: GitHubBrowserAuthorization) async
-    func revokeAuthorization(token: String, configuration: GitHubOAuthConfiguration) async throws
 }
 
-extension GitHubOAuthAuthorizing {
-    func revokeAuthorization(token _: String, configuration _: GitHubOAuthConfiguration) async throws {}
+protocol GitHubOAuthTokenRevoking: Sendable {
+    func revokeAuthorization(token: String, configuration: GitHubOAuthConfiguration) async throws
 }
 
 struct GitHubAccount: Hashable, Sendable {
@@ -425,14 +425,14 @@ enum GitHubOAuthError: Error, Equatable, LocalizedError, Sendable {
         case .invalidTokenResponse:
             "GitHub token exchange returned an invalid response."
         case let .authorizationRevocationFailed(statusCode):
-            "GitHub authorization revocation failed (HTTP \(statusCode))."
+            "GitHub token revocation failed (HTTP \(statusCode))."
         }
     }
 }
 
 typealias GitHubOAuthRandomByteGenerator = @Sendable (Int) throws -> Data
 
-actor GitHubWebOAuthService: GitHubOAuthAuthorizing {
+actor GitHubWebOAuthService: GitHubOAuthAuthorizing, GitHubOAuthTokenRevoking {
     struct PKCEPair: Equatable, Sendable {
         let verifier: String
         let challenge: String
@@ -589,7 +589,7 @@ actor GitHubWebOAuthService: GitHubOAuthAuthorizing {
         do {
             _ = try await httpClient.data(for: request)
         } catch HTTPClientError.unacceptableStatus(404) {
-            // The token or grant is already gone, which satisfies disconnect.
+            // An already-revoked token satisfies disconnect.
         } catch HTTPClientError.unacceptableStatus(let statusCode) {
             throw GitHubOAuthError.authorizationRevocationFailed(statusCode)
         } catch HTTPClientError.rateLimited {
@@ -611,7 +611,7 @@ actor GitHubWebOAuthService: GitHubOAuthAuthorizing {
 
         var request = URLRequest(url: applicationEndpoint
             .appendingPathComponent(clientID)
-            .appendingPathComponent("grant"))
+            .appendingPathComponent("token"))
         request.httpMethod = "DELETE"
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
@@ -644,7 +644,7 @@ actor GitHubWebOAuthService: GitHubOAuthAuthorizing {
             URLQueryItem(name: "state", value: state),
             URLQueryItem(name: "code_challenge", value: codeChallenge),
             URLQueryItem(name: "code_challenge_method", value: "S256"),
-            URLQueryItem(name: "scope", value: GitHubOAuthConfiguration.repositoryScope),
+            URLQueryItem(name: "scope", value: GitHubOAuthConfiguration.authorizationScope),
             URLQueryItem(name: "prompt", value: "select_account"),
         ]
         return components.url!

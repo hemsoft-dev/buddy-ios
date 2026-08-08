@@ -46,53 +46,52 @@ belong in Keychain, never SwiftData or source-controlled configuration.
 
 ## Configuration and OAuth
 
-`Config/Shared.xcconfig` contains safe defaults, including public OAuth client
-identifiers, and optionally includes the gitignored `Config/Local.xcconfig` for
-local build values. Access tokens must never be placed in either configuration
-file. OAuth integrations use an in-app system browser and PKCE whenever the
-provider supports it.
+`Config/Shared.xcconfig` contains safe defaults, including the public GitHub CLI
+OAuth client identifiers used by CodexBar, and optionally includes the
+gitignored `Config/Local.xcconfig` for local build values. These static values
+identify the OAuth application but do not grant GitHub account access. Access
+tokens must never be placed in either configuration file.
 
 ### GitHub
 
 Buddy uses GitHub's browser authorization-code flow with a loopback callback,
 cryptographically random state, and PKCE `S256`. The authorization request uses
-`prompt=select_account`, so initial connect, Add account, and reconnect all show
-GitHub's account chooser. Buddy requests GitHub's `repo` OAuth scope so authored
-and review-requested pull requests from private repositories appear alongside
-public repositories. GitHub's OAuth App model grants broad read/write repository
-access with this scope; Buddy uses it only for read-only identity and pull-request
-API requests. Tokens are stored only in iOS Keychain. Existing accounts must be
-reconnected once after this change so GitHub can grant the required scope.
+`prompt=select_account`, so initial connect, Add account, and reconnect ask
+GitHub to show its account chooser. Buddy requests `repo read:org`; the
+repository scope lets authored and review-requested pull requests from private
+repositories appear alongside public repositories, while organization identity
+supports established organization authorization. GitHub's OAuth scope grants
+broad read/write repository access; Buddy uses it only for read-only identity
+and pull-request API requests. Tokens are stored only in iOS Keychain.
 
-GitHub currently requires `client_secret` during authorization-code exchange,
-including when PKCE is supplied. A credential distributed in an iOS bundle is
-not confidential. Buddy's backend-free strategy therefore requires a dedicated
-Buddy OAuth app and explicitly treats its exchange credential as public/non-
-confidential. Never reuse another application's OAuth credentials. If that
-credential must remain confidential, route the code exchange through an owned
-backend instead of putting it in the app or Keychain.
+Buddy follows CodexBar's backend-free strategy and bundles the public OAuth
+client ID and client secret used by GitHub CLI-compatible clients. Static
+credentials shipped in an app cannot be confidential. Browser authorization
+and PKCE protect each account sign-in, and the bundled values alone provide no
+account access. GitHub may identify the authorization as GitHub CLI because the
+shared public OAuth client is the application receiving the grant.
 
-To test with a different GitHub OAuth app:
+To test deliberately with a different GitHub OAuth app:
 
-1. Register a dedicated Buddy GitHub OAuth app. Its callback URL must allow the
-   loopback-literal redirect `http://127.0.0.1:<ephemeral-port>/callback`.
-2. Pass both its client ID and public/non-confidential exchange credential as
+1. Ensure its callback configuration allows the loopback-literal redirect
+   `http://127.0.0.1:<ephemeral-port>/callback`.
+2. Pass both its client ID and exchange credential as
    higher-precedence command-line build settings, for example
    `xcodebuild ... BUDDY_GITHUB_CLIENT_ID=... BUDDY_GITHUB_CLIENT_SECRET=...`.
-   `Config/Local.xcconfig` may provide the exchange credential only when it
-   belongs to the source-controlled client ID, because `Shared.xcconfig`
-   intentionally restores that client ID after including local settings.
 3. Do not commit a real credential, authorization code, PKCE verifier, or token.
 
-The source-controlled client-ID assignment intentionally follows the optional
-local include so an older blank local value cannot disable that safe public
-identifier. No OAuth exchange credential is source-controlled. Command-line
-build settings retain higher precedence for deliberate test configuration.
+The source-controlled public client assignments intentionally follow the
+optional local include so older blank local values cannot make distributable
+builds incomplete. Command-line build settings retain higher precedence for
+deliberate test configuration.
 
 Buddy starts a listener bound only to `127.0.0.1` before presenting
 `SFSafariViewController`, uses the listener's exact redirect URI during exchange,
 and stops it on success, failure, timeout, or cancellation. The callback validates
 the path, state, and non-empty code and rejects malformed or oversized requests.
+Disconnect revokes only Buddy's exact access token, then removes its local
+Keychain item. It does not revoke the shared GitHub CLI application grant, so
+unrelated GitHub CLI and CodexBar sessions remain valid.
 
 ## Verification
 
@@ -106,6 +105,15 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
   CODE_SIGNING_ALLOWED=NO
 ```
+
+For a physical Hemsoft iPhone deployment, run:
+
+```sh
+scripts/install-device-build.sh
+```
+
+The script refuses to install unless the signed app contains the exact public
+GitHub CLI-compatible OAuth configuration declared in `Config/Shared.xcconfig`.
 
 ## License
 

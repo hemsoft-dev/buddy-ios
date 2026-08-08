@@ -1,10 +1,11 @@
-// Safe, source-controlled defaults. OAuth client IDs are public identifiers;
-// Local.xcconfig remains available for private local values and is intentionally ignored.
+// Safe, source-controlled defaults. Buddy uses the same public GitHub CLI OAuth
+// client strategy as CodexBar iOS. These values identify the OAuth application;
+// they do not grant access to a GitHub account without browser authorization.
 BUDDY_BUNDLE_IDENTIFIER = com.hemsoft.buddy
 
 #include? "Local.xcconfig"
 
-// Keep this assignment after Local.xcconfig so a legacy blank local value cannot
-// remove the client ID from distributable builds. Command-line build settings can
-// still override xcconfig values when testing another OAuth application.
-BUDDY_GITHUB_CLIENT_ID = Ov23liP6vIUAt7wzMI45
+// Keep these assignments after Local.xcconfig so stale local values cannot make a
+// distributable build incomplete. Command-line build settings still take precedence.
+BUDDY_GITHUB_CLIENT_ID = 178c6fc778ccc68e1d6a
+BUDDY_GITHUB_CLIENT_SECRET = 34ddeff2b558a23d38fba8a6de74f086ede1cc0b

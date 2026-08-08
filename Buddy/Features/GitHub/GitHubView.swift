@@ -41,19 +41,23 @@ struct GitHubView: View {
             GitHubSafariView(url: item.url)
                 .ignoresSafeArea()
         }
+        .onChange(of: viewModel.keepsAuthorizationSheetPresented) { _, keepsPresented in
+            guard !keepsPresented else { return }
+            presentedAuthorizationURL = nil
+        }
         .confirmationDialog(
             "Disconnect GitHub?",
             isPresented: $showsDisconnectConfirmation,
             titleVisibility: .visible
         ) {
-            Button("Disconnect and revoke access", role: .destructive) {
+            Button("Disconnect from Buddy", role: .destructive) {
                 Task { await disconnectPresentedAccount() }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
-                "Buddy will revoke its GitHub authorization for this account and remove "
-                    + "the access token from this device."
+                "Buddy will remove this account and its access token from this device. "
+                    + "Other GitHub CLI-compatible sessions are not changed."
             )
         }
     }
@@ -108,7 +112,7 @@ struct GitHubView: View {
         } description: {
             Text(
                 "GitHub may ask you to sign in before showing its account picker. "
-                    + "It identifies HemSoft as Buddy iOS's publisher, not as an account receiving access. "
+                    + "The authorization page uses GitHub's established CLI OAuth client, matching CodexBar. "
                     + "Buddy requests repository access to show public and private pull requests. "
                     + "GitHub's OAuth permission includes write access, but Buddy only makes read-only API requests. "
                     + "The token stays in this device's Keychain."
@@ -154,7 +158,7 @@ struct GitHubView: View {
 
             Text(
                 "Sign in if needed, choose an account, then approve repository access. "
-                    + "GitHub identifies Buddy iOS as the app and HemSoft as its publisher. "
+                    + "GitHub may identify the established GitHub CLI OAuth client used by CodexBar. "
                     + "Buddy uses the permission only to read public and private pull-request data. "
                     + "Buddy will finish connecting when GitHub returns to this device."
             )
@@ -196,8 +200,8 @@ struct GitHubView: View {
                 }
             } footer: {
                 Text(
-                    "Disconnecting revokes Buddy's GitHub authorization for this account "
-                        + "and removes its access token from this device."
+                    "Disconnecting removes Buddy's access token from this device. It does not "
+                        + "revoke the shared GitHub CLI authorization or sign the account out in Safari."
                 )
             }
         }
@@ -293,6 +297,10 @@ final class GitHubViewModel {
 
     var authorizationConfigurationError: GitHubConnectionError {
         integration.authorizationConfigurationError ?? .missingOAuthConfiguration
+    }
+
+    var keepsAuthorizationSheetPresented: Bool {
+        activeAccountAuthorization != nil
     }
 
     func restore() async {
