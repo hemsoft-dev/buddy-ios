@@ -4,8 +4,8 @@
 <dict>
 	<key>BuddyGitHubClientID</key>
 	<string>$(BUDDY_GITHUB_CLIENT_ID)</string>
-	<key>BuddyGitHubClientSecret</key>
-	<string>$(BUDDY_GITHUB_CLIENT_SECRET)</string>
+	<key>BuddyGitHubAppSlug</key>
+	<string>$(BUDDY_GITHUB_APP_SLUG)</string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>

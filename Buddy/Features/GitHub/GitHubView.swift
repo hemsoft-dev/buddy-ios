@@ -1,10 +1,9 @@
 import Observation
-import SafariServices
 import SwiftUI
 
 struct GitHubView: View {
+    @Environment(\.openURL) private var openURL
     @State private var addedAccountID: ConnectedAccountID?
-    @State private var presentedAuthorizationURL: PresentedGitHubAuthorizationURL?
     @State private var showsDisconnectConfirmation = false
     let viewModel: GitHubViewModel
     let accountID: ConnectedAccountID?
@@ -37,23 +36,19 @@ struct GitHubView: View {
             }
         }
         .navigationTitle("GitHub")
-        .sheet(item: $presentedAuthorizationURL, onDismiss: authorizationSheetDismissed) { item in
-            GitHubSafariView(url: item.url)
-                .ignoresSafeArea()
-        }
         .confirmationDialog(
-            "Disconnect GitHub?",
+            "Sign out of GitHub on this iPhone?",
             isPresented: $showsDisconnectConfirmation,
             titleVisibility: .visible
         ) {
-            Button("Disconnect and revoke access", role: .destructive) {
+            Button("Sign Out on This iPhone", role: .destructive) {
                 Task { await disconnectPresentedAccount() }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
-                "Buddy will revoke its GitHub authorization for this account and remove "
-                    + "the access token from this device."
+                "Buddy will remove this account's token from the iPhone. The GitHub App installation "
+                    + "remains under your control in GitHub settings."
             )
         }
     }
@@ -104,17 +99,22 @@ struct GitHubView: View {
 
     private var disconnectedContent: some View {
         ContentUnavailableView {
-            Label("Choose a GitHub account", systemImage: "chevron.left.forwardslash.chevron.right")
+            Label("Connect GitHub", systemImage: "chevron.left.forwardslash.chevron.right")
         } description: {
             Text(
-                "GitHub may ask you to sign in before showing its account picker. "
-                    + "It identifies HemSoft as Buddy iOS's publisher, not as an account receiving access. "
-                    + "Buddy requests repository access to show public and private pull requests. "
-                    + "GitHub's OAuth permission includes write access, but Buddy only makes read-only API requests. "
-                    + "The token stays in this device's Keychain."
+                "First install Buddy's GitHub App for the organizations or repositories you want to see. "
+                    + "Then connect the GitHub account that can access them. Buddy receives read-only pull-request "
+                    + "access, and its token stays in this device's Keychain."
             )
         } actions: {
-            Button("Choose Account in GitHub") {
+            if let installationURL = viewModel.installationURL {
+                Button("1. Install Buddy on GitHub") {
+                    openURL(installationURL)
+                }
+                .buttonStyle(.bordered)
+            }
+
+            Button("2. Connect GitHub Account") {
                 connectPresentedAccount()
             }
             .buttonStyle(.borderedProminent)
@@ -128,9 +128,9 @@ struct GitHubView: View {
     @MainActor
     func connectPresentedAccount() {
         if let presentedAccountID {
-            viewModel.reconnect(presentedAccountID, presentAuthorizationURL: presentAuthorizationURL)
+            viewModel.reconnect(presentedAccountID, openURL: openURL)
         } else {
-            viewModel.addAccount(presentAuthorizationURL: presentAuthorizationURL) { addedAccountID = $0 }
+            viewModel.addAccount(openURL: openURL) { addedAccountID = $0 }
         }
     }
 
@@ -149,20 +149,25 @@ struct GitHubView: View {
                 .font(.largeTitle)
                 .foregroundStyle(BuddyTheme.accent)
 
-            Text("Choose a GitHub account")
+            Text("Authorize this device on GitHub")
                 .font(.headline)
 
+            if let userCode = authorization.userCode {
+                Text(userCode)
+                    .font(.system(.title, design: .monospaced, weight: .bold))
+                    .textSelection(.enabled)
+                    .accessibilityLabel("GitHub device code \(userCode)")
+            }
+
             Text(
-                "Sign in if needed, choose an account, then approve repository access. "
-                    + "GitHub identifies Buddy iOS as the app and HemSoft as its publisher. "
-                    + "Buddy uses the permission only to read public and private pull-request data. "
-                    + "Buddy will finish connecting when GitHub returns to this device."
+                "Open GitHub, enter the code above, and choose the account you want to connect. "
+                    + "Buddy will finish automatically after GitHub confirms the code."
             )
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
 
             Button("Open GitHub Again") {
-                presentAuthorizationURL(authorization.authorizationURL)
+                openURL(authorization.authorizationURL)
             }
             .buttonStyle(.borderedProminent)
 
@@ -187,17 +192,23 @@ struct GitHubView: View {
                 Button("Reconnect account") {
                     viewModel.reconnect(
                         account.connectedAccountID,
-                        presentAuthorizationURL: presentAuthorizationURL
+                        openURL: openURL
                     )
                 }
 
-                Button("Disconnect GitHub", role: .destructive) {
+                Button("Manage Buddy on GitHub") {
+                    if let appURL = viewModel.appURL {
+                        openURL(appURL)
+                    }
+                }
+
+                Button("Sign Out on This iPhone", role: .destructive) {
                     showsDisconnectConfirmation = true
                 }
             } footer: {
                 Text(
-                    "Disconnecting revokes Buddy's GitHub authorization for this account "
-                        + "and removes its access token from this device."
+                    "Signing out removes the token from this device. Manage or uninstall the GitHub App "
+                        + "separately on GitHub to revoke its repository installation."
                 )
             }
         }
@@ -209,15 +220,21 @@ struct GitHubView: View {
         } description: {
             Text(message)
         } actions: {
+            if let installationURL = viewModel.installationURL {
+                Button("Install or Configure Buddy on GitHub") {
+                    openURL(installationURL)
+                }
+            }
+
             Button("Try Again") {
                 if let presentedAccountID {
                     viewModel.retry(
                         presentedAccountID,
-                        presentAuthorizationURL: presentAuthorizationURL
+                        openURL: openURL
                     )
                 } else {
                     viewModel.retryAccountSetup(
-                        presentAuthorizationURL: presentAuthorizationURL
+                        openURL: openURL
                     ) { addedAccountID = $0 }
                 }
             }
@@ -238,32 +255,6 @@ struct GitHubView: View {
         }
     }
 
-    private func presentAuthorizationURL(_ url: URL) {
-        presentedAuthorizationURL = PresentedGitHubAuthorizationURL(url: url)
-    }
-
-    func authorizationSheetDismissed() {
-        // Dismissing Safari is not a reliable cancellation signal: GitHub may
-        // already have delivered the callback while exchange and persistence
-        // are still finishing. Keep the bounded authorization alive; the user
-        // can reopen Safari or use the explicit Cancel action instead.
-    }
-
-}
-
-private struct PresentedGitHubAuthorizationURL: Identifiable {
-    let id = UUID()
-    let url: URL
-}
-
-private struct GitHubSafariView: UIViewControllerRepresentable {
-    let url: URL
-
-    func makeUIViewController(context: Context) -> SFSafariViewController {
-        SFSafariViewController(url: url)
-    }
-
-    func updateUIViewController(_ uiViewController: SFSafariViewController, context: Context) {}
 }
 
 @MainActor
@@ -294,6 +285,9 @@ final class GitHubViewModel {
     var authorizationConfigurationError: GitHubConnectionError {
         integration.authorizationConfigurationError ?? .missingOAuthConfiguration
     }
+
+    var installationURL: URL? { integration.installationURL }
+    var appURL: URL? { integration.appURL }
 
     func restore() async {
         guard connectionTask == nil,
@@ -425,7 +419,6 @@ final class GitHubViewModel {
                 activeAccountAuthorization = startedAuthorization
                 try Task.checkCancellation()
                 state = .authorizing(startedAuthorization)
-                presentAuthorizationURL(startedAuthorization.authorizationURL)
 
                 let connection = try await integration.completeAccountAuthorization(startedAuthorization)
                 try Task.checkCancellation()
@@ -581,7 +574,6 @@ final class GitHubViewModel {
                 guard generation == operationGeneration else { return }
                 stateScope = .accountSetup
                 state = .authorizing(authorization)
-                presentAuthorizationURL(authorization.authorizationURL)
 
                 let account = try await integration.completeAuthorization(authorization)
                 try Task.checkCancellation()

@@ -2,6 +2,50 @@ import XCTest
 @testable import Buddy
 
 final class GitHubAPITests: XCTestCase {
+    func testGitHubAppDeviceFlowRequestsCodeAndPollsWithoutClientSecretOrScope() async throws {
+        let httpClient = MockHTTPClient(responses: [
+            .success(
+                #"{"device_code":"device-secret","user_code":"ABCD-EFGH","verification_uri":"https://github.com/login/device","expires_in":900,"interval":5}"#,
+                statusCode: 200
+            ),
+            .success(#"{"access_token":"ghu_app-user-token","token_type":"bearer","scope":""}"#, statusCode: 200),
+        ])
+        let service = GitHubDeviceOAuthService(httpClient: httpClient, sleep: { _ in })
+
+        let authorization = try await service.beginAuthorization(
+            configuration: GitHubOAuthConfiguration(clientID: "Iv1.buddy-app", clientSecret: "")
+        )
+        XCTAssertEqual(authorization.authorizationURL.absoluteString, "https://github.com/login/device")
+        XCTAssertEqual(authorization.userCode, "ABCD-EFGH")
+        let token = try await service.completeAuthorization(authorization)
+        XCTAssertEqual(token, "ghu_app-user-token")
+
+        let capturedRequest = await httpClient.lastRequest()
+        let request = try XCTUnwrap(capturedRequest)
+        let body = try XCTUnwrap(request.httpBody.flatMap { String(data: $0, encoding: .utf8) })
+        XCTAssertTrue(body.contains("client_id=Iv1.buddy-app"))
+        XCTAssertTrue(body.contains("device_code=device-secret"))
+        XCTAssertTrue(body.contains("grant_type=urn:ietf:params:oauth:grant-type:device_code"))
+        XCTAssertFalse(body.contains("client_secret"))
+        XCTAssertFalse(body.contains("scope="))
+    }
+
+    func testGitHubAppInstallationCheckRequiresAtLeastOneAccessibleInstallation() async throws {
+        let installedClient = MockHTTPClient(responses: [
+            .success(#"{"total_count":1,"installations":[{"id":1,"permissions":{"metadata":"read","pull_requests":"read"}}]}"#, statusCode: 200),
+        ])
+        let hasInstallation = try await GitHubAPI(httpClient: installedClient)
+            .hasAccessibleInstallation(token: "ghu_user-token")
+        XCTAssertTrue(hasInstallation)
+
+        let missingClient = MockHTTPClient(responses: [
+            .success(#"{"total_count":0,"installations":[]}"#, statusCode: 200),
+        ])
+        let isMissingInstallation = try await GitHubAPI(httpClient: missingClient)
+            .hasAccessibleInstallation(token: "ghu_user-token")
+        XCTAssertFalse(isMissingInstallation)
+    }
+
     func testBrowserAuthorizationURLUsesPKCEStateExactLoopbackRedirectAndAccountPicker() throws {
         let redirectURI = "http://127.0.0.1:49152/callback"
         let url = GitHubWebOAuthService.authorizationURL(
@@ -373,25 +417,25 @@ final class GitHubAPITests: XCTestCase {
         ])
         let api = GitHubAPI(httpClient: validClient)
 
-        let account = try await api.authenticatedUser(token: "sensitive-token")
+        let account = try await api.authenticatedUser(token: "ghu_sensitive-token")
 
         XCTAssertEqual(account.id, 42)
         XCTAssertEqual(account.login, "octocat")
         let capturedRequest = await validClient.lastRequest()
         let request = try XCTUnwrap(capturedRequest)
         XCTAssertEqual(request.httpMethod, "GET")
-        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer sensitive-token")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer ghu_sensitive-token")
 
         let unauthorizedClient = MockHTTPClient(responses: [.success("{}", statusCode: 401)])
         do {
-            _ = try await GitHubAPI(httpClient: unauthorizedClient).authenticatedUser(token: "revoked")
+            _ = try await GitHubAPI(httpClient: unauthorizedClient).authenticatedUser(token: "ghu_revoked")
             XCTFail("Expected unauthorized")
         } catch let error as GitHubAPIError {
             XCTAssertEqual(error, .unauthorized)
         }
     }
 
-    func testAuthenticatedUserRejectsTokensWithoutPrivateRepositoryScope() async throws {
+    func testAuthenticatedUserRejectsLegacyOAuthTokens() async throws {
         let client = MockHTTPClient(responses: [
             .successWithScopes(
                 #"{"id":42,"login":"octocat"}"#,
@@ -402,9 +446,9 @@ final class GitHubAPITests: XCTestCase {
 
         do {
             _ = try await GitHubAPI(httpClient: client).authenticatedUser(token: "public-only-token")
-            XCTFail("Expected missing repository scope")
+            XCTFail("Expected legacy OAuth token rejection")
         } catch let error as GitHubAPIError {
-            XCTAssertEqual(error, .insufficientOAuthScope)
+            XCTAssertEqual(error, .legacyOAuthToken)
         }
     }
 
@@ -585,7 +629,7 @@ final class GitHubAPITests: XCTestCase {
         let httpClient = MockHTTPClient(responses: [.networkFailure])
 
         do {
-            _ = try await GitHubAPI(httpClient: httpClient).authenticatedUser(token: "token")
+            _ = try await GitHubAPI(httpClient: httpClient).authenticatedUser(token: "ghu_token")
             XCTFail("Expected network failure")
         } catch let error as URLError {
             XCTAssertEqual(error.code, .notConnectedToInternet)

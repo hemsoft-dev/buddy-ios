@@ -80,6 +80,8 @@ actor GitHubIntegration: IntegrationProviding {
     nonisolated var summary: IntegrationSummary { summaryStorage.value }
     nonisolated let isAuthorizationConfigured: Bool
     nonisolated let authorizationConfigurationError: GitHubConnectionError?
+    nonisolated let installationURL: URL?
+    nonisolated let appURL: URL?
 
     private let clientID: String?
     private let clientSecret: String?
@@ -106,7 +108,8 @@ actor GitHubIntegration: IntegrationProviding {
 
     init(
         clientID: String? = AppConfiguration.current.githubClientID,
-        clientSecret: String? = AppConfiguration.current.githubClientSecret,
+        clientSecret: String? = nil,
+        appSlug: String? = AppConfiguration.current.githubAppSlug,
         api: (any GitHubAPIProviding)? = nil,
         authorizer: (any GitHubOAuthAuthorizing)? = nil,
         credentials: any CredentialStoring = KeychainStore(),
@@ -118,17 +121,22 @@ actor GitHubIntegration: IntegrationProviding {
         self.clientID = clientID
         let resolvedAPI = api ?? GitHubAPI()
         let injectedAuthorizer = authorizer ?? (resolvedAPI as? any GitHubOAuthAuthorizing)
-        self.clientSecret = clientSecret ?? (injectedAuthorizer == nil ? nil : "test-client-secret")
+        let resolvedAppSlug = appSlug ?? (injectedAuthorizer == nil ? nil : "test-app")
+        installationURL = resolvedAppSlug.flatMap {
+            URL(string: "https://github.com/apps/\($0)/installations/new")
+        }
+        appURL = resolvedAppSlug.flatMap { URL(string: "https://github.com/apps/\($0)") }
+        self.clientSecret = clientSecret
         if clientID == nil {
             authorizationConfigurationError = .missingClientID
-        } else if self.clientSecret == nil {
-            authorizationConfigurationError = .missingOAuthConfiguration
+        } else if resolvedAppSlug == nil {
+            authorizationConfigurationError = .missingGitHubAppConfiguration
         } else {
             authorizationConfigurationError = nil
         }
         isAuthorizationConfigured = authorizationConfigurationError == nil
         self.api = resolvedAPI
-        self.authorizer = injectedAuthorizer ?? GitHubWebOAuthService()
+        self.authorizer = injectedAuthorizer ?? GitHubDeviceOAuthService()
         self.credentials = credentials
         if let accountStore {
             self.accountStore = accountStore
@@ -182,7 +190,7 @@ actor GitHubIntegration: IntegrationProviding {
                 let connection = GitHubAccountConnection(
                     account: account,
                     state: .needsAttention,
-                    message: GitHubConnectionError.privateRepositoryAccessRequired.localizedDescription,
+                    message: GitHubConnectionError.githubAppReconnectRequired.localizedDescription,
                     recoveryAction: .reconnect
                 )
                 connections.append(connection)
@@ -275,6 +283,9 @@ actor GitHubIntegration: IntegrationProviding {
                 throw CancellationError()
             }
             let account = try await api.authenticatedUser(token: token)
+            guard try await api.hasAccessibleInstallation(token: token) else {
+                throw GitHubConnectionError.installationRequired
+            }
             let accountID = account.connectedAccountID
             if let targetID, targetID != accountID {
                 throw GitHubConnectionError.accountMismatch
@@ -757,7 +768,7 @@ actor GitHubIntegration: IntegrationProviding {
                 throw GitHubConnectionError.credentialStorage
             }
             return nil
-        } catch GitHubAPIError.insufficientOAuthScope {
+        } catch GitHubAPIError.insufficientOAuthScope, GitHubAPIError.legacyOAuthToken {
             let migrationAccount: GitHubAccount
             do {
                 migrationAccount = try await api.authenticatedUserForCredentialMigration(token: token)
@@ -954,6 +965,14 @@ actor GitHubIntegration: IntegrationProviding {
                     recoveryAction: .reconnect
                 )
             }
+            guard try await api.hasAccessibleInstallation(token: token) else {
+                return GitHubAccountConnection(
+                    account: refreshed,
+                    state: .needsAttention,
+                    message: GitHubConnectionError.installationRequired.localizedDescription,
+                    recoveryAction: .validate
+                )
+            }
             let refreshedRecord = refreshed.connectedAccountRecord
             try? await accountStore.upsert(refreshedRecord)
             guard generation == accountGenerations[record.id, default: 0] else {
@@ -998,6 +1017,14 @@ actor GitHubIntegration: IntegrationProviding {
                 account: account,
                 state: .needsAttention,
                 message: GitHubConnectionError.privateRepositoryAccessRequired.localizedDescription,
+                recoveryAction: .reconnect
+            )
+        } catch GitHubAPIError.legacyOAuthToken {
+            guard generation == accountGenerations[record.id, default: 0] else { return nil }
+            return GitHubAccountConnection(
+                account: account,
+                state: .needsAttention,
+                message: GitHubConnectionError.githubAppReconnectRequired.localizedDescription,
                 recoveryAction: .reconnect
             )
         } catch {
@@ -1383,7 +1410,7 @@ actor GitHubIntegration: IntegrationProviding {
             // Continue with local cleanup so Disconnect remains recoverable.
             return
         }
-        guard let clientID, let clientSecret else {
+        guard !token.hasPrefix("ghu_"), let clientID, let clientSecret else {
             // Local cleanup must remain possible for a build whose OAuth configuration
             // was removed after the credential was originally stored.
             return
@@ -1418,11 +1445,7 @@ actor GitHubIntegration: IntegrationProviding {
             updateSummary(detail: "Client ID is not configured", state: .needsAttention)
             throw GitHubConnectionError.missingClientID
         }
-        guard let clientSecret else {
-            updateSummary(detail: "GitHub browser sign-in is not configured", state: .needsAttention)
-            throw GitHubConnectionError.missingOAuthConfiguration
-        }
-        return GitHubOAuthConfiguration(clientID: clientID, clientSecret: clientSecret)
+        return GitHubOAuthConfiguration(clientID: clientID, clientSecret: clientSecret ?? "")
     }
 
     private func map(_ error: Error) -> GitHubConnectionError {
@@ -1448,6 +1471,8 @@ actor GitHubIntegration: IntegrationProviding {
                 return .incompleteResults
             case .insufficientOAuthScope:
                 return .privateRepositoryAccessRequired
+            case .legacyOAuthToken:
+                return .githubAppReconnectRequired
             case let .server(statusCode):
                 return .server(statusCode)
             }
@@ -1490,6 +1515,7 @@ actor GitHubIntegration: IntegrationProviding {
 enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
     case missingClientID
     case missingOAuthConfiguration
+    case missingGitHubAppConfiguration
     case invalidConfiguration
     case secureRandomUnavailable
     case callbackUnavailable
@@ -1506,6 +1532,8 @@ enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
     case accountStorage
     case accountMismatch
     case duplicateAccount
+    case githubAppReconnectRequired
+    case installationRequired
 
     var errorDescription: String? {
         switch self {
@@ -1513,6 +1541,8 @@ enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
             "Buddy was built without a GitHub client ID. Set BUDDY_GITHUB_CLIENT_ID in the build configuration and rebuild the app."
         case .missingOAuthConfiguration:
             "Buddy was built without complete GitHub browser OAuth configuration. Provision a dedicated Buddy OAuth app and set BUDDY_GITHUB_CLIENT_ID and BUDDY_GITHUB_CLIENT_SECRET."
+        case .missingGitHubAppConfiguration:
+            "Buddy was built without a GitHub App slug. Set BUDDY_GITHUB_APP_SLUG to the dedicated GitHub App's slug and rebuild."
         case .invalidConfiguration:
             "GitHub rejected Buddy's OAuth configuration. Check the dedicated Buddy OAuth app settings and try again."
         case .secureRandomUnavailable:
@@ -1545,6 +1575,10 @@ enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
             "GitHub authorized a different account. Sign in with the account being reconnected."
         case .duplicateAccount:
             "This GitHub account is already connected. Use Reconnect account to replace its authorization."
+        case .githubAppReconnectRequired:
+            "This account uses Buddy's retired OAuth connection. Reconnect it with the new GitHub App."
+        case .installationRequired:
+            "Buddy is authorized, but its GitHub App is not installed on any repositories this account can access. Install Buddy for the organization or repositories you want to see, then try again."
         }
     }
 
@@ -1552,6 +1586,7 @@ enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
         switch self {
         case .missingClientID: "Client ID is not configured"
         case .missingOAuthConfiguration: "GitHub browser sign-in is not configured"
+        case .missingGitHubAppConfiguration: "GitHub App is not configured"
         case .invalidConfiguration: "GitHub configuration is invalid"
         case .secureRandomUnavailable: "Secure sign-in unavailable"
         case .callbackUnavailable: "Local sign-in callback unavailable"
@@ -1568,6 +1603,8 @@ enum GitHubConnectionError: Error, Equatable, LocalizedError, Sendable {
         case .accountStorage: "Account list unavailable"
         case .accountMismatch: "Different GitHub account authorized"
         case .duplicateAccount: "GitHub account already connected"
+        case .githubAppReconnectRequired: "Reconnect with the GitHub App"
+        case .installationRequired: "GitHub App installation required"
         }
     }
 }

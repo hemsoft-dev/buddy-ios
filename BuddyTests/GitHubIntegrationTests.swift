@@ -676,7 +676,7 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertTrue(connectionFinished)
     }
 
-    func testDismissingAuthorizationSheetPreservesInFlightAccountAuthorization() async throws {
+    func testDeviceAuthorizationWaitsInAppUntilGitHubCompletes() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let api = SuspendedPollingGitHubAPI(account: account)
         let integration = GitHubIntegration(
@@ -695,12 +695,8 @@ final class GitHubIntegrationTests: XCTestCase {
         }
         XCTAssertTrue(pollingStarted)
 
-        let stateAfterDismissal = await MainActor.run {
-            let view = GitHubView(viewModel: viewModel)
-            view.authorizationSheetDismissed()
-            return viewModel.state
-        }
-        XCTAssertEqual(stateAfterDismissal, .authorizing(testAuthorization))
+        let waitingState = await MainActor.run { viewModel.state }
+        XCTAssertEqual(waitingState, .authorizing(testAuthorization))
 
         await api.finishPoll()
         let connectionFinished = try await waitUntil {
@@ -1336,7 +1332,7 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(finalRequestCount, 1)
     }
 
-    func testConfiguredClientIDRestoresConnectActionAndOpensVerificationURL() async throws {
+    func testConfiguredClientIDWaitsForExplicitVerificationURLOpen() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let api = SuspendedPollingGitHubAPI(account: account)
         let integration = GitHubIntegration(
@@ -1368,7 +1364,7 @@ final class GitHubIntegrationTests: XCTestCase {
 
         let authorizingState = await MainActor.run { viewModel.state }
         XCTAssertEqual(authorizingState, .authorizing(testAuthorization))
-        XCTAssertEqual(openedURLs.values, [testAuthorization.authorizationURL])
+        XCTAssertTrue(openedURLs.values.isEmpty)
 
         await api.finishPoll()
         let connectionFinished = try await waitUntil {
@@ -1450,10 +1446,11 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertEqual(integration.summary.connectionState, .needsAttention)
     }
 
-    func testMissingOAuthSecretReportsCompleteConfigurationRequirement() async {
+    func testMissingGitHubAppSlugReportsCompleteConfigurationRequirement() async {
         let integration = GitHubIntegration(
             clientID: "client-id",
             clientSecret: nil,
+            appSlug: nil,
             api: GitHubAPI(),
             credentials: MockCredentialStore()
         )
@@ -1464,7 +1461,7 @@ final class GitHubIntegrationTests: XCTestCase {
         let state = await MainActor.run { viewModel.state }
         XCTAssertEqual(
             state,
-            .configurationRequired(GitHubConnectionError.missingOAuthConfiguration.localizedDescription)
+            .configurationRequired(GitHubConnectionError.missingGitHubAppConfiguration.localizedDescription)
         )
     }
 
@@ -1640,7 +1637,7 @@ final class GitHubIntegrationTests: XCTestCase {
             GitHubAccountConnection(
                 account: account,
                 state: .needsAttention,
-                message: GitHubConnectionError.privateRepositoryAccessRequired.localizedDescription,
+                message: GitHubConnectionError.githubAppReconnectRequired.localizedDescription,
                 recoveryAction: .reconnect
             ),
         ])
@@ -1659,6 +1656,39 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertNil(legacyToken)
         XCTAssertEqual(scopedToken, "private-repository-token")
         XCTAssertEqual(records, [account.connectedAccountRecord])
+    }
+
+    func testAuthorizationRequiresAccessibleGitHubAppInstallationBeforePersistence() async throws {
+        let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+        let api = StubGitHubAPI(
+            deviceResults: [.success(testAuthorization)],
+            pollResults: [.success(.authorized(token: "ghu_user-token"))],
+            userResults: [.success(account)],
+            installationAccessible: false
+        )
+        let credentials = MockCredentialStore()
+        let accountStore = InMemoryConnectedAccountStore()
+        let integration = GitHubIntegration(
+            clientID: "client-id",
+            api: api,
+            credentials: credentials,
+            accountStore: accountStore
+        )
+
+        let authorization = try await integration.beginAccountAuthorization()
+        do {
+            _ = try await integration.completeAccountAuthorization(authorization)
+            XCTFail("Expected installation requirement")
+        } catch let error as GitHubConnectionError {
+            XCTAssertEqual(error, .installationRequired)
+        }
+
+        let storedToken = await credentials.stringValue(
+            for: GitHubIntegration.credentialAccount(for: account.connectedAccountID)
+        )
+        let records = await accountStore.accounts(for: .github)
+        XCTAssertNil(storedToken)
+        XCTAssertTrue(records.isEmpty)
     }
 
     func testDisconnectAfterLegacyScopeUpgradeRemovesSupersededCredential() async throws {
@@ -3779,19 +3809,22 @@ private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
     private var capturedPollRequestCount = 0
     private var capturedCanceledAuthorizations: [GitHubBrowserAuthorization] = []
     private var capturedRevokedAuthorizations: [RevokedAuthorization] = []
+    private let installationAccessible: Bool
 
     init(
         deviceResults: [Result<GitHubBrowserAuthorization, GitHubAPIError>] = [],
         pollResults: [Result<GitHubTokenPollResult, GitHubAPIError>] = [],
         userResults: [Result<GitHubAccount, GitHubAPIError>] = [],
         pullRequestResults: [Result<GitHubPullRequestCollection, GitHubAPIError>] = [],
-        assignedPullRequestResults: [Result<GitHubPullRequestCollection, GitHubAPIError>] = []
+        assignedPullRequestResults: [Result<GitHubPullRequestCollection, GitHubAPIError>] = [],
+        installationAccessible: Bool = true
     ) {
         self.deviceResults = deviceResults
         self.pollResults = pollResults
         self.userResults = userResults
         self.pullRequestResults = pullRequestResults
         self.assignedPullRequestResults = assignedPullRequestResults
+        self.installationAccessible = installationAccessible
     }
 
     func beginAuthorization(configuration: GitHubOAuthConfiguration) throws -> GitHubBrowserAuthorization {
@@ -3825,6 +3858,10 @@ private actor StubGitHubAPI: GitHubAPIProviding, GitHubOAuthAuthorizing {
     func authenticatedUser(token: String) throws -> GitHubAccount {
         capturedUserTokens.append(token)
         return try userResults.removeFirst().get()
+    }
+
+    func hasAccessibleInstallation(token _: String) -> Bool {
+        installationAccessible
     }
 
     func revokedAuthorizations() -> [RevokedAuthorization] {

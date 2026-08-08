@@ -1,11 +1,33 @@
-import CryptoKit
 import Foundation
+#if DEBUG
+import CryptoKit
 import Network
 import Security
+#endif
 
 struct GitHubBrowserAuthorization: Equatable, Identifiable, Sendable {
     let id: UUID
     let authorizationURL: URL
+    let deviceCode: String?
+    let userCode: String?
+    let expiresIn: Int
+    let interval: Int
+
+    init(
+        id: UUID,
+        authorizationURL: URL,
+        deviceCode: String? = nil,
+        userCode: String? = nil,
+        expiresIn: Int = 900,
+        interval: Int = 5
+    ) {
+        self.id = id
+        self.authorizationURL = authorizationURL
+        self.deviceCode = deviceCode
+        self.userCode = userCode
+        self.expiresIn = expiresIn
+        self.interval = interval
+    }
 }
 
 struct GitHubOAuthConfiguration: Equatable, Sendable {
@@ -80,6 +102,7 @@ protocol GitHubAPIProviding: Sendable {
     func authenticatedUserForCredentialMigration(token: String) async throws -> GitHubAccount
     func authoredPullRequests(login: String, token: String) async throws -> GitHubPullRequestCollection
     func assignedPullRequests(login: String, token: String) async throws -> GitHubPullRequestCollection
+    func hasAccessibleInstallation(token: String) async throws -> Bool
 }
 
 extension GitHubAPIProviding {
@@ -94,6 +117,10 @@ extension GitHubAPIProviding {
     func assignedPullRequests(login _: String, token _: String) async throws -> GitHubPullRequestCollection {
         throw GitHubAPIError.malformedResponse
     }
+
+    func hasAccessibleInstallation(token _: String) async throws -> Bool {
+        true
+    }
 }
 
 struct GitHubAPI: GitHubAPIProviding {
@@ -104,7 +131,10 @@ struct GitHubAPI: GitHubAPIProviding {
     }
 
     func authenticatedUser(token: String) async throws -> GitHubAccount {
-        try await authenticatedUser(token: token, requiresRepositoryScope: true)
+        guard token.hasPrefix("ghu_") else {
+            throw GitHubAPIError.legacyOAuthToken
+        }
+        return try await authenticatedUser(token: token, requiresRepositoryScope: true)
     }
 
     /// Identifies a legacy token owner so an upgrade never deletes another account's credential.
@@ -168,6 +198,27 @@ struct GitHubAPI: GitHubAPIProviding {
             token: token,
             qualifier: "review-requested"
         )
+    }
+
+    func hasAccessibleInstallation(token: String) async throws -> Bool {
+        guard let url = URL(string: "https://api.github.com/user/installations?per_page=100") else {
+            throw GitHubAPIError.malformedResponse
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+        let data = try await perform(request, requiresRepositoryScope: false)
+        do {
+            let response = try JSONDecoder().decode(InstallationListResponse.self, from: data)
+            return response.totalCount > 0 && response.installations.contains { installation in
+                installation.permissions.pullRequests == "read" ||
+                    installation.permissions.pullRequests == "write"
+            }
+        } catch {
+            throw GitHubAPIError.malformedResponse
+        }
     }
 
     private func pullRequests(
@@ -253,7 +304,9 @@ struct GitHubAPI: GitHubAPIProviding {
     ) async throws -> Data {
         do {
             let (data, response) = try await httpClient.data(for: request)
-            guard !requiresRepositoryScope ||
+            let usesGitHubAppUserToken = request.value(forHTTPHeaderField: "Authorization")?
+                .hasPrefix("Bearer ghu_") == true
+            guard !requiresRepositoryScope || usesGitHubAppUserToken ||
                     Self.oauthScopes(from: response).contains(GitHubOAuthConfiguration.repositoryScope)
             else {
                 throw GitHubAPIError.insufficientOAuthScope
@@ -331,7 +384,30 @@ enum GitHubAPIError: Error, Equatable, Sendable {
     case rateLimited
     case incompleteResults
     case insufficientOAuthScope
+    case legacyOAuthToken
     case server(Int)
+}
+
+private struct InstallationListResponse: Decodable {
+    let totalCount: Int
+    let installations: [Installation]
+
+    struct Installation: Decodable {
+        let permissions: Permissions
+    }
+
+    struct Permissions: Decodable {
+        let pullRequests: String?
+
+        enum CodingKeys: String, CodingKey {
+            case pullRequests = "pull_requests"
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case totalCount = "total_count"
+        case installations
+    }
 }
 
 private struct UserResponse: Decodable {
@@ -432,6 +508,190 @@ enum GitHubOAuthError: Error, Equatable, LocalizedError, Sendable {
 
 typealias GitHubOAuthRandomByteGenerator = @Sendable (Int) throws -> Data
 
+actor GitHubDeviceOAuthService: GitHubOAuthAuthorizing {
+    private struct DeviceResponse: Decodable {
+        let deviceCode: String
+        let userCode: String
+        let verificationURI: String
+        let expiresIn: Int
+        let interval: Int
+
+        enum CodingKeys: String, CodingKey {
+            case deviceCode = "device_code"
+            case userCode = "user_code"
+            case verificationURI = "verification_uri"
+            case expiresIn = "expires_in"
+            case interval
+        }
+    }
+
+    private struct TokenResponse: Decodable {
+        let accessToken: String?
+        let error: String?
+        let interval: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case accessToken = "access_token"
+            case error
+            case interval
+        }
+    }
+
+    private let httpClient: any HTTPClient
+    private let sleep: @Sendable (Duration) async throws -> Void
+    private var activeAuthorizationIDs: Set<UUID> = []
+
+    init(
+        httpClient: any HTTPClient = URLSessionHTTPClient(),
+        sleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
+            try await Task.sleep(for: duration)
+        }
+    ) {
+        self.httpClient = httpClient
+        self.sleep = sleep
+    }
+
+    func beginAuthorization(
+        configuration: GitHubOAuthConfiguration
+    ) async throws -> GitHubBrowserAuthorization {
+        guard !configuration.clientID.isEmpty else {
+            throw GitHubOAuthError.missingConfiguration
+        }
+        let request = try formRequest(
+            url: "https://github.com/login/device/code",
+            fields: ["client_id": configuration.clientID]
+        )
+        let data = try await perform(request)
+        let response: DeviceResponse
+        do {
+            response = try JSONDecoder().decode(DeviceResponse.self, from: data)
+        } catch {
+            throw GitHubOAuthError.invalidTokenResponse
+        }
+        guard !response.deviceCode.isEmpty,
+              !response.userCode.isEmpty,
+              response.expiresIn > 0,
+              response.interval > 0,
+              let verificationURI = URL(string: response.verificationURI),
+              verificationURI.scheme == "https",
+              verificationURI.host == "github.com"
+        else {
+            throw GitHubOAuthError.invalidTokenResponse
+        }
+        let authorization = GitHubBrowserAuthorization(
+            id: UUID(),
+            authorizationURL: verificationURI,
+            deviceCode: response.deviceCode,
+            userCode: response.userCode,
+            expiresIn: response.expiresIn,
+            interval: response.interval
+        )
+        activeAuthorizationIDs.insert(authorization.id)
+        clientIDs[authorization.id] = configuration.clientID
+        return authorization
+    }
+
+    func completeAuthorization(_ authorization: GitHubBrowserAuthorization) async throws -> String {
+        guard let deviceCode = authorization.deviceCode,
+              activeAuthorizationIDs.contains(authorization.id)
+        else {
+            throw CancellationError()
+        }
+        defer {
+            activeAuthorizationIDs.remove(authorization.id)
+            clientIDs.removeValue(forKey: authorization.id)
+        }
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(authorization.expiresIn)
+        var interval = authorization.interval
+
+        while clock.now < deadline {
+            try Task.checkCancellation()
+            try await sleep(.seconds(interval))
+            guard activeAuthorizationIDs.contains(authorization.id) else {
+                throw CancellationError()
+            }
+            let request = try formRequest(
+                url: "https://github.com/login/oauth/access_token",
+                fields: [
+                    "client_id": "\(try configurationClientID(for: authorization))",
+                    "device_code": deviceCode,
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                ]
+            )
+            let data = try await perform(request)
+            let response: TokenResponse
+            do {
+                response = try JSONDecoder().decode(TokenResponse.self, from: data)
+            } catch {
+                throw GitHubOAuthError.invalidTokenResponse
+            }
+            if let token = response.accessToken, token.hasPrefix("ghu_") {
+                return token
+            }
+            switch response.error {
+            case "authorization_pending":
+                continue
+            case "slow_down":
+                interval = max(interval + 5, response.interval ?? 0)
+            case "access_denied":
+                throw GitHubOAuthError.accessDenied
+            case "expired_token", "token_expired":
+                throw GitHubOAuthError.callbackTimedOut
+            case "incorrect_client_credentials", "incorrect_device_code", "device_flow_disabled":
+                throw GitHubOAuthError.invalidConfiguration
+            default:
+                throw GitHubOAuthError.invalidTokenResponse
+            }
+        }
+        throw GitHubOAuthError.callbackTimedOut
+    }
+
+    func cancelAuthorization(_ authorization: GitHubBrowserAuthorization) {
+        activeAuthorizationIDs.remove(authorization.id)
+        clientIDs.removeValue(forKey: authorization.id)
+    }
+
+    private var clientIDs: [UUID: String] = [:]
+
+    private func configurationClientID(for authorization: GitHubBrowserAuthorization) throws -> String {
+        guard let clientID = clientIDs[authorization.id] else {
+            throw GitHubOAuthError.invalidConfiguration
+        }
+        return clientID
+    }
+
+    private func formRequest(url urlString: String, fields: [String: String]) throws -> URLRequest {
+        guard let url = URL(string: urlString) else {
+            throw GitHubOAuthError.invalidTokenResponse
+        }
+        var components = URLComponents()
+        components.queryItems = fields.sorted { $0.key < $1.key }
+            .map { URLQueryItem(name: $0.key, value: $0.value) }
+        guard let body = components.percentEncodedQuery?.data(using: .utf8) else {
+            throw GitHubOAuthError.invalidTokenResponse
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        return request
+    }
+
+    private func perform(_ request: URLRequest) async throws -> Data {
+        do {
+            let (data, _) = try await httpClient.data(for: request)
+            return data
+        } catch HTTPClientError.unacceptableStatus(let statusCode) {
+            throw GitHubOAuthError.tokenExchangeFailed(statusCode)
+        } catch HTTPClientError.invalidResponse {
+            throw GitHubOAuthError.invalidTokenResponse
+        }
+    }
+}
+
+#if DEBUG
 actor GitHubWebOAuthService: GitHubOAuthAuthorizing {
     struct PKCEPair: Equatable, Sendable {
         let verifier: String
@@ -976,3 +1236,4 @@ final class GitHubOAuthCallbackServer: @unchecked Sendable {
         }
     }
 }
+#endif
