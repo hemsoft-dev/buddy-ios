@@ -575,7 +575,10 @@ final class GitHubAPITests: XCTestCase {
                 "additions": 162,
                 "deletions": 52,
                 "author": {"login":"octocat","name":"The Octocat","avatarUrl":"https://avatars.githubusercontent.com/u/1"},
-                "closingIssuesReferences": {"nodes":[{"number":29,"title":"Detail issue","url":"https://github.com/Relias/private-repo/issues/29"}]},
+                "closingIssuesReferences": {"nodes":[
+                  {"id":"I_kwDO_private_29","number":29,"title":"Detail issue","url":"https://github.com/Relias/private-repo/issues/29"},
+                  {"id":"I_kwDO_shared_29","number":29,"title":"Shared issue","url":"https://github.com/Relias/shared-repo/issues/29"}
+                ]},
                 "reviewRequests": {"nodes":[
                   {"requestedReviewer":{"__typename":"User","login":"bob","name":"Bob","avatarUrl":null}},
                   {"requestedReviewer":{"__typename":"Team","name":"Core Team","slug":"core","avatarUrl":null,"organization":{"login":"Relias"}}}
@@ -604,7 +607,8 @@ final class GitHubAPITests: XCTestCase {
         XCTAssertEqual(details.changedFiles, 8)
         XCTAssertEqual(details.changedLines, 214)
         XCTAssertEqual(details.author?.login, "octocat")
-        XCTAssertEqual(details.linkedIssues.map(\.number), [29])
+        XCTAssertEqual(details.linkedIssues.map(\.number), [29, 29])
+        XCTAssertEqual(Set(details.linkedIssues.map(\.id)), ["I_kwDO_private_29", "I_kwDO_shared_29"])
         XCTAssertEqual(details.reviewers.map(\.reviewer.login), ["alice", "bob", "Relias/core"])
         XCTAssertEqual(details.reviewers.map(\.status), [.approved, .requested, .requested])
 

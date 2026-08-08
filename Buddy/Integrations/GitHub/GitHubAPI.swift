@@ -76,8 +76,7 @@ struct GitHubPullRequestCollection: Equatable, Sendable {
 }
 
 struct GitHubIssueReference: Identifiable, Equatable, Sendable {
-    var id: Int { number }
-
+    let id: String
     let number: Int
     let title: String
     let url: URL
@@ -317,14 +316,20 @@ struct GitHubAPI: GitHubAPIProviding {
         let author = try node.author.map(Self.userSummary)
         var linkedIssues: [GitHubIssueReference] = []
         for issue in node.closingIssuesReferences.nodes.compactMap({ $0 }) {
-            guard issue.number > 0,
+            guard !issue.id.isEmpty,
+                  issue.number > 0,
                   !issue.title.isEmpty,
                   let issueURL = canonicalGitHubURL(from: issue.url)
             else {
                 throw GitHubAPIError.malformedResponse
             }
             linkedIssues.append(
-                GitHubIssueReference(number: issue.number, title: issue.title, url: issueURL)
+                GitHubIssueReference(
+                    id: issue.id,
+                    number: issue.number,
+                    title: issue.title,
+                    url: issueURL
+                )
             )
         }
         linkedIssues.sort { $0.number < $1.number }
@@ -369,7 +374,7 @@ struct GitHubAPI: GitHubAPIProviding {
             ... on User { name }
           }
           closingIssuesReferences(first: 50) {
-            nodes { number title url }
+            nodes { id number title url }
           }
           reviewRequests(first: 50) {
             nodes {
@@ -744,6 +749,7 @@ private struct PullRequestDetailsIssueConnection: Decodable {
 }
 
 private struct PullRequestDetailsIssueNode: Decodable {
+    let id: String
     let number: Int
     let title: String
     let url: String
