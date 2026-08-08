@@ -41,6 +41,10 @@ struct GitHubView: View {
             GitHubSafariView(url: item.url)
                 .ignoresSafeArea()
         }
+        .onChange(of: viewModel.state) { _, state in
+            guard !state.keepsAuthorizationSheetPresented else { return }
+            presentedAuthorizationURL = nil
+        }
         .confirmationDialog(
             "Disconnect GitHub?",
             isPresented: $showsDisconnectConfirmation,
@@ -53,7 +57,8 @@ struct GitHubView: View {
         } message: {
             Text(
                 "Buddy will revoke its GitHub authorization for this account and remove "
-                    + "the access token from this device."
+                    + "the access token from this device. This does not sign the account "
+                    + "out of GitHub in Safari."
             )
         }
     }
@@ -107,8 +112,7 @@ struct GitHubView: View {
             Label("Choose a GitHub account", systemImage: "chevron.left.forwardslash.chevron.right")
         } description: {
             Text(
-                "GitHub may ask you to sign in before showing its account picker. "
-                    + "It identifies HemSoft as Buddy iOS's publisher, not as an account receiving access. "
+                "GitHub will show its account picker. Verify the account name before continuing. "
                     + "Buddy requests repository access to show public and private pull requests. "
                     + "GitHub's OAuth permission includes write access, but Buddy only makes read-only API requests. "
                     + "The token stays in this device's Keychain."
@@ -153,8 +157,7 @@ struct GitHubView: View {
                 .font(.headline)
 
             Text(
-                "Sign in if needed, choose an account, then approve repository access. "
-                    + "GitHub identifies Buddy iOS as the app and HemSoft as its publisher. "
+                "Sign in if needed, verify the selected account, then approve repository access. "
                     + "Buddy uses the permission only to read public and private pull-request data. "
                     + "Buddy will finish connecting when GitHub returns to this device."
             )
@@ -197,7 +200,8 @@ struct GitHubView: View {
             } footer: {
                 Text(
                     "Disconnecting revokes Buddy's GitHub authorization for this account "
-                        + "and removes its access token from this device."
+                        + "and removes its access token from this device. It does not sign the account "
+                        + "out of GitHub in Safari, so reconnecting may not require credentials."
                 )
             }
         }
@@ -737,6 +741,11 @@ enum GitHubViewState: Equatable {
     case authorizing(GitHubBrowserAuthorization)
     case connected(GitHubAccount)
     case needsAttention(String)
+
+    var keepsAuthorizationSheetPresented: Bool {
+        if case .authorizing = self { return true }
+        return false
+    }
 }
 
 #Preview {

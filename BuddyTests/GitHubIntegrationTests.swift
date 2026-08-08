@@ -713,6 +713,17 @@ final class GitHubIntegrationTests: XCTestCase {
         XCTAssertTrue(connectionFinished)
     }
 
+    func testAuthorizationSheetOnlyRemainsPresentedWhileAuthorizationIsActive() {
+        XCTAssertTrue(GitHubViewState.authorizing(testAuthorization).keepsAuthorizationSheetPresented)
+        XCTAssertFalse(GitHubViewState.disconnected.keepsAuthorizationSheetPresented)
+        XCTAssertFalse(
+            GitHubViewState.connected(
+                GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
+            ).keepsAuthorizationSheetPresented
+        )
+        XCTAssertFalse(GitHubViewState.needsAttention("Authorization failed").keepsAuthorizationSheetPresented)
+    }
+
     func testAddedAccountRouteShowsItsReconnectAuthorization() async throws {
         let account = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
         let api = SuspendedPollingGitHubAPI(account: account)
