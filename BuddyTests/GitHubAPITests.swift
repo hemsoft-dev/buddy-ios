@@ -590,7 +590,9 @@ final class GitHubAPITests: XCTestCase {
                 ]},
                 "latestOpinionatedReviews": {"pageInfo":{"hasNextPage":false,"endCursor":"opinionated-end"},"nodes":[
                   {"state":"APPROVED","submittedAt":"2026-08-08T13:00:00Z","author":{"login":"alice","name":"Alice","avatarUrl":null}},
-                  {"state":"CHANGES_REQUESTED","submittedAt":"2026-08-08T14:00:00Z","author":{"login":"bob","name":"Bob","avatarUrl":null}}
+                  {"state":"CHANGES_REQUESTED","submittedAt":"2026-08-08T14:00:00Z","author":{"login":"bob","name":"Bob","avatarUrl":null}},
+                  {"state":"APPROVED","submittedAt":"2026-08-08T15:00:00Z","author":{"login":"dana","name":"Dana","avatarUrl":null}},
+                  {"state":"DISMISSED","submittedAt":"2026-08-08T16:00:00Z","author":{"login":"dana","name":"Dana","avatarUrl":null}}
                 ]}
               }
             }
@@ -612,8 +614,8 @@ final class GitHubAPITests: XCTestCase {
         XCTAssertEqual(details.author?.login, "octocat")
         XCTAssertEqual(details.linkedIssues.map(\.number), [29, 29])
         XCTAssertEqual(Set(details.linkedIssues.map(\.id)), ["I_kwDO_private_29", "I_kwDO_shared_29"])
-        XCTAssertEqual(details.reviewers.map(\.reviewer.login), ["alice", "bob", "Relias/core"])
-        XCTAssertEqual(details.reviewers.map(\.status), [.approved, .requested, .requested])
+        XCTAssertEqual(details.reviewers.map(\.reviewer.login), ["alice", "bob", "dana", "Relias/core"])
+        XCTAssertEqual(details.reviewers.map(\.status), [.approved, .requested, .approved, .requested])
 
         let capturedRequest = await client.lastRequest()
         let request = try XCTUnwrap(capturedRequest)
