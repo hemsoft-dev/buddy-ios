@@ -5,6 +5,7 @@ import SwiftUI
 struct GitHubView: View {
     @State private var addedAccountID: ConnectedAccountID?
     @State private var presentedAuthorizationURL: PresentedGitHubAuthorizationURL?
+    @State private var showsDisconnectConfirmation = false
     let viewModel: GitHubViewModel
     let accountID: ConnectedAccountID?
 
@@ -40,9 +41,20 @@ struct GitHubView: View {
             GitHubSafariView(url: item.url)
                 .ignoresSafeArea()
         }
-        .onChange(of: viewModel.state) { _, state in
-            if case .authorizing = state { return }
-            presentedAuthorizationURL = nil
+        .confirmationDialog(
+            "Disconnect GitHub?",
+            isPresented: $showsDisconnectConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Disconnect and revoke access", role: .destructive) {
+                Task { await disconnectPresentedAccount() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "Buddy will revoke its GitHub authorization for this account and remove "
+                    + "the access token from this device."
+            )
         }
     }
 
@@ -180,10 +192,13 @@ struct GitHubView: View {
                 }
 
                 Button("Disconnect GitHub", role: .destructive) {
-                    Task { await viewModel.disconnect(account.connectedAccountID) }
+                    showsDisconnectConfirmation = true
                 }
             } footer: {
-                Text("Disconnecting removes Buddy's GitHub access token from this device.")
+                Text(
+                    "Disconnecting revokes Buddy's GitHub authorization for this account "
+                        + "and removes its access token from this device."
+                )
             }
         }
     }
@@ -209,7 +224,7 @@ struct GitHubView: View {
             .buttonStyle(.borderedProminent)
 
             Button("Disconnect", role: .destructive) {
-                Task { await disconnectPresentedAccount() }
+                showsDisconnectConfirmation = true
             }
         }
     }

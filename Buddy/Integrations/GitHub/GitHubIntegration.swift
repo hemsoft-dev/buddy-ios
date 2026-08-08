@@ -496,6 +496,11 @@ actor GitHubIntegration: IntegrationProviding {
                 throw CancellationError()
             }
 
+            try await revokeAuthorizationIfPresent(tokenData)
+            guard generation == accountGenerations[accountID, default: 0] else {
+                throw CancellationError()
+            }
+
             // Remove metadata before the scoped token. If a reconnect supersedes this
             // operation, rollback only fills values that its newer write did not replace.
             try await accountStore.remove(accountID)
@@ -541,6 +546,15 @@ actor GitHubIntegration: IntegrationProviding {
             }
         } catch is CancellationError {
             throw CancellationError()
+        } catch let error as GitHubConnectionError {
+            await restoreDisconnectedAccount(
+                accountID: accountID,
+                record: previousRecord,
+                tokenData: tokenData,
+                credentialAccount: credentialAccount,
+                generation: generation
+            )
+            throw error
         } catch {
             await restoreDisconnectedAccount(
                 accountID: accountID,
@@ -1309,6 +1323,8 @@ actor GitHubIntegration: IntegrationProviding {
         await cancelAllAccountAuthorizations()
 
         do {
+            let tokenData = try await credentials.data(for: Self.credentialAccount)
+            try await revokeAuthorizationIfPresent(tokenData)
             try await performCredentialCleanup()
             guard generation == authorizationGeneration else { return }
             authorizationGeneration &+= 1
@@ -1357,6 +1373,32 @@ actor GitHubIntegration: IntegrationProviding {
                 activeCredentialCleanup = nil
             }
             throw error
+        }
+    }
+
+    private func revokeAuthorizationIfPresent(_ tokenData: Data?) async throws {
+        guard let tokenData else { return }
+        guard let token = String(data: tokenData, encoding: .utf8), !token.isEmpty else {
+            // A malformed local item cannot represent a usable GitHub grant.
+            // Continue with local cleanup so Disconnect remains recoverable.
+            return
+        }
+        guard let clientID, let clientSecret else {
+            // Local cleanup must remain possible for a build whose OAuth configuration
+            // was removed after the credential was originally stored.
+            return
+        }
+
+        do {
+            try await authorizer.revokeAuthorization(
+                token: token,
+                configuration: GitHubOAuthConfiguration(
+                    clientID: clientID,
+                    clientSecret: clientSecret
+                )
+            )
+        } catch {
+            throw map(error)
         }
     }
 
@@ -1432,6 +1474,8 @@ actor GitHubIntegration: IntegrationProviding {
                 return .malformedResponse
             case let .tokenExchangeFailed(statusCode):
                 return .server(statusCode)
+            case let .authorizationRevocationFailed(statusCode):
+                return statusCode == 0 ? .malformedResponse : .server(statusCode)
             }
         }
 
