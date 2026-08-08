@@ -118,6 +118,33 @@ enum GitHubPullRequestFailure: Equatable, Sendable {
     var requiresReconnect: Bool {
         self == .authenticationRequired || self == .repositoryAccessRequired
     }
+
+    static func mapped(from error: Error) -> GitHubPullRequestFailure {
+        guard let error = error as? GitHubConnectionError else {
+            return error is URLError ? .offline : .unknown
+        }
+
+        return switch error {
+        case .invalidToken:
+            .authenticationRequired
+        case .privateRepositoryAccessRequired:
+            .repositoryAccessRequired
+        case .networkUnavailable:
+            .offline
+        case .rateLimited:
+            .rateLimited
+        case .incompleteResults:
+            .incompleteResults
+        case .malformedResponse:
+            .malformedResponse
+        case .server:
+            .server
+        case .credentialStorage:
+            .credentialStorage
+        default:
+            .unknown
+        }
+    }
 }
 
 enum GitHubPullRequestDashboardState: Equatable, Sendable {
@@ -437,7 +464,7 @@ final class DashboardViewModel {
             return nil
         } catch {
             guard githubRefreshGenerations[refreshKey] == refreshGeneration else { return nil }
-            let failure = Self.mapGitHubFailure(error)
+            let failure = GitHubPullRequestFailure.mapped(from: error)
             setGitHubState(
                 .failed(previousPullRequests, refreshedAt: previousRefreshDate, failure),
                 for: accountID,
@@ -499,32 +526,4 @@ final class DashboardViewModel {
         lastUpdated = .now
     }
 
-    private static func mapGitHubFailure(_ error: Error) -> GitHubPullRequestFailure {
-        guard let error = error as? GitHubConnectionError else {
-            return error is URLError ? .offline : .unknown
-        }
-
-        return switch error {
-        case .invalidToken:
-            .authenticationRequired
-        case .privateRepositoryAccessRequired:
-            .repositoryAccessRequired
-        case .networkUnavailable:
-            .offline
-        case .rateLimited:
-            .rateLimited
-        case .incompleteResults:
-            .incompleteResults
-        case .malformedResponse:
-            .malformedResponse
-        case .server:
-            .server
-        case .credentialStorage:
-            .credentialStorage
-        case .accountStorage, .accountMismatch:
-            .unknown
-        default:
-            .unknown
-        }
-    }
 }

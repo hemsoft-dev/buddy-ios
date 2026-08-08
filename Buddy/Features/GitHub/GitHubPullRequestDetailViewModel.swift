@@ -115,7 +115,7 @@ final class GitHubPullRequestDetailStore {
         } catch {
             guard generations[key] == generation else { return }
             inFlight.removeValue(forKey: key)
-            states[key] = .failed(previous, Self.mapFailure(error))
+            states[key] = .failed(previous, GitHubPullRequestFailure.mapped(from: error))
             AppLogger.integrations.error("GitHub pull request detail refresh failed")
         }
     }
@@ -134,22 +134,5 @@ final class GitHubPullRequestDetailStore {
         generations[key, default: 0] = max(generations[key, default: 0], request.generation) + 1
         request.task.cancel()
         states[key] = states[key]?.details.map(GitHubPullRequestDetailState.loaded) ?? .idle
-    }
-
-    private static func mapFailure(_ error: Error) -> GitHubPullRequestFailure {
-        guard let error = error as? GitHubConnectionError else {
-            return error is URLError ? .offline : .unknown
-        }
-        return switch error {
-        case .invalidToken: .authenticationRequired
-        case .privateRepositoryAccessRequired: .repositoryAccessRequired
-        case .networkUnavailable: .offline
-        case .rateLimited: .rateLimited
-        case .incompleteResults: .incompleteResults
-        case .malformedResponse: .malformedResponse
-        case .server: .server
-        case .credentialStorage: .credentialStorage
-        default: .unknown
-        }
     }
 }

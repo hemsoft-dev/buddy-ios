@@ -587,7 +587,9 @@ final class GitHubAPITests: XCTestCase {
                   {"state":"COMMENTED","submittedAt":"2026-08-08T12:00:00Z","author":{"login":"alice","name":"Alice","avatarUrl":null}},
                   {"state":"APPROVED","submittedAt":"2026-08-08T13:00:00Z","author":{"login":"alice","name":"Alice","avatarUrl":null}},
                   {"state":"COMMENTED","submittedAt":"2026-08-08T13:30:00Z","author":{"login":"alice","name":"Alice","avatarUrl":null}},
-                  {"state":"CHANGES_REQUESTED","submittedAt":"2026-08-08T14:00:00Z","author":{"login":"bob","name":"Bob","avatarUrl":null}}
+                  {"state":"CHANGES_REQUESTED","submittedAt":"2026-08-08T14:00:00Z","author":{"login":"bob","name":"Bob","avatarUrl":null}},
+                  {"state":"APPROVED","submittedAt":"2026-08-08T15:00:00Z","author":{"login":"dana","name":"Dana","avatarUrl":null}},
+                  {"state":"DISMISSED","submittedAt":"2026-08-08T16:00:00Z","author":{"login":"dana","name":"Dana","avatarUrl":null}}
                 ]}
               }
             }

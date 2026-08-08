@@ -419,10 +419,15 @@ struct GitHubAPI: GitHubAPIProviding {
 
         for review in pullRequest.reviews.nodes.compactMap({ $0 })
             .sorted(by: { ($0.submittedAt ?? .distantPast) < ($1.submittedAt ?? .distantPast) }) {
-            guard let author = review.author,
-                  let status = GitHubReviewerStatus(graphQLReviewState: review.state)
-            else { continue }
+            guard let author = review.author else { continue }
             let reviewer = try userSummary(author)
+            if review.state == "DISMISSED" {
+                reviewers.removeValue(forKey: reviewer.id)
+                continue
+            }
+            guard let status = GitHubReviewerStatus(graphQLReviewState: review.state) else {
+                continue
+            }
             if status != .commented || reviewers[reviewer.id] == nil {
                 reviewers[reviewer.id] = GitHubReviewerSummary(reviewer: reviewer, status: status)
             }

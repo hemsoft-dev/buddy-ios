@@ -766,6 +766,21 @@ final class DashboardViewModelTests: XCTestCase {
             "Diff summary, 8 changed files, 214 changed lines, 162 additions, 52 deletions"
         )
     }
+
+    func testPullRequestFailureMappingIsSharedAcrossDashboardAndDetailStores() {
+        XCTAssertEqual(GitHubPullRequestFailure.mapped(from: GitHubConnectionError.invalidToken), .authenticationRequired)
+        XCTAssertEqual(
+            GitHubPullRequestFailure.mapped(from: GitHubConnectionError.privateRepositoryAccessRequired),
+            .repositoryAccessRequired
+        )
+        XCTAssertEqual(GitHubPullRequestFailure.mapped(from: GitHubConnectionError.networkUnavailable), .offline)
+        XCTAssertEqual(GitHubPullRequestFailure.mapped(from: GitHubConnectionError.rateLimited), .rateLimited)
+        XCTAssertEqual(GitHubPullRequestFailure.mapped(from: GitHubConnectionError.incompleteResults), .incompleteResults)
+        XCTAssertEqual(GitHubPullRequestFailure.mapped(from: GitHubConnectionError.malformedResponse), .malformedResponse)
+        XCTAssertEqual(GitHubPullRequestFailure.mapped(from: GitHubConnectionError.server(503)), .server)
+        XCTAssertEqual(GitHubPullRequestFailure.mapped(from: GitHubConnectionError.credentialStorage), .credentialStorage)
+        XCTAssertEqual(GitHubPullRequestFailure.mapped(from: URLError(.notConnectedToInternet)), .offline)
+    }
 }
 
 private let testAccount = GitHubAccount(id: 42, login: "octocat", name: nil, avatarURL: nil)
