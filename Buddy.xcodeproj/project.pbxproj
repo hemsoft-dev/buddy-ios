@@ -33,6 +33,10 @@
 		A10000000000000000000018 /* ConnectedAccount.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000001E /* ConnectedAccount.swift */; };
 		A10000000000000000000019 /* GitHubPullRequestDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000001F /* GitHubPullRequestDetailView.swift */; };
 		A1000000000000000000001A /* GitHubPullRequestDetailViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000020 /* GitHubPullRequestDetailViewModel.swift */; };
+		A1000000000000000000001B /* GitHubStatusService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000021 /* GitHubStatusService.swift */; };
+		A1000000000000000000001C /* GitHubStatusMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000022 /* GitHubStatusMonitor.swift */; };
+		A1000000000000000000001D /* GitHubStatusBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000023 /* GitHubStatusBanner.swift */; };
+		A1000000000000000000001E /* GitHubStatusTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000024 /* GitHubStatusTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -78,6 +82,10 @@
 		A2000000000000000000001E /* ConnectedAccount.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectedAccount.swift; sourceTree = "<group>"; };
 		A2000000000000000000001F /* GitHubPullRequestDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubPullRequestDetailView.swift; sourceTree = "<group>"; };
 		A20000000000000000000020 /* GitHubPullRequestDetailViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubPullRequestDetailViewModel.swift; sourceTree = "<group>"; };
+		A20000000000000000000021 /* GitHubStatusService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubStatusService.swift; sourceTree = "<group>"; };
+		A20000000000000000000022 /* GitHubStatusMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubStatusMonitor.swift; sourceTree = "<group>"; };
+		A20000000000000000000023 /* GitHubStatusBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubStatusBanner.swift; sourceTree = "<group>"; };
+		A20000000000000000000024 /* GitHubStatusTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubStatusTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -98,7 +106,7 @@
 		};
 		A70000000000000000000002 /* Buddy */ = {isa = PBXGroup; children = (A70000000000000000000003 /* App */, A70000000000000000000004 /* Features */, A70000000000000000000008 /* Core */, A7000000000000000000000E /* Integrations */, A70000000000000000000010 /* Resources */); path = Buddy; sourceTree = "<group>"; };
 		A70000000000000000000003 /* App */ = {isa = PBXGroup; children = (A20000000000000000000001 /* BuddyApp.swift */, A20000000000000000000002 /* RootTabView.swift */); path = App; sourceTree = "<group>"; };
-		A70000000000000000000004 /* Features */ = {isa = PBXGroup; children = (A70000000000000000000005 /* Dashboard */, A70000000000000000000006 /* GitHub */, A70000000000000000000007 /* Settings */); path = Features; sourceTree = "<group>"; };
+		A70000000000000000000004 /* Features */ = {isa = PBXGroup; children = (A70000000000000000000005 /* Dashboard */, A70000000000000000000006 /* GitHub */, A70000000000000000000017 /* GitHubStatus */, A70000000000000000000007 /* Settings */); path = Features; sourceTree = "<group>"; };
 		A70000000000000000000005 /* Dashboard */ = {isa = PBXGroup; children = (A20000000000000000000003 /* DashboardView.swift */, A20000000000000000000004 /* DashboardViewModel.swift */, A20000000000000000000005 /* DashboardCard.swift */); path = Dashboard; sourceTree = "<group>"; };
 		A70000000000000000000006 /* GitHub */ = {isa = PBXGroup; children = (A20000000000000000000006 /* GitHubView.swift */, A2000000000000000000001F /* GitHubPullRequestDetailView.swift */, A20000000000000000000020 /* GitHubPullRequestDetailViewModel.swift */); path = GitHub; sourceTree = "<group>"; };
 		A70000000000000000000007 /* Settings */ = {isa = PBXGroup; children = (A20000000000000000000007 /* SettingsView.swift */); path = Settings; sourceTree = "<group>"; };
@@ -108,15 +116,17 @@
 		A7000000000000000000000B /* Logging */ = {isa = PBXGroup; children = (A2000000000000000000000C /* AppLogger.swift */); path = Logging; sourceTree = "<group>"; };
 		A7000000000000000000000C /* Networking */ = {isa = PBXGroup; children = (A2000000000000000000000A /* HTTPClient.swift */); path = Networking; sourceTree = "<group>"; };
 		A7000000000000000000000D /* Persistence */ = {isa = PBXGroup; children = (A2000000000000000000000E /* DashboardSnapshot.swift */); path = Persistence; sourceTree = "<group>"; };
-		A7000000000000000000000E /* Integrations */ = {isa = PBXGroup; children = (A2000000000000000000000F /* Integration.swift */, A2000000000000000000001E /* ConnectedAccount.swift */, A7000000000000000000000F /* GitHub */); path = Integrations; sourceTree = "<group>"; };
+		A7000000000000000000000E /* Integrations */ = {isa = PBXGroup; children = (A2000000000000000000000F /* Integration.swift */, A2000000000000000000001E /* ConnectedAccount.swift */, A7000000000000000000000F /* GitHub */, A70000000000000000000018 /* GitHubStatus */); path = Integrations; sourceTree = "<group>"; };
 		A7000000000000000000000F /* GitHub */ = {isa = PBXGroup; children = (A20000000000000000000010 /* GitHubIntegration.swift */, A2000000000000000000001B /* GitHubAPI.swift */); path = GitHub; sourceTree = "<group>"; };
 		A70000000000000000000010 /* Resources */ = {isa = PBXGroup; children = (A20000000000000000000011 /* Assets.xcassets */, A20000000000000000000013 /* Info.plist */, A20000000000000000000012 /* PrivacyInfo.xcprivacy */, A70000000000000000000016 /* Brand */); path = Resources; sourceTree = "<group>"; };
-		A70000000000000000000011 /* BuddyTests */ = {isa = PBXGroup; children = (A20000000000000000000015 /* AppRouteTests.swift */, A20000000000000000000016 /* DashboardViewModelTests.swift */, A2000000000000000000001C /* GitHubAPITests.swift */, A2000000000000000000001D /* GitHubIntegrationTests.swift */); path = BuddyTests; sourceTree = "<group>"; };
+		A70000000000000000000011 /* BuddyTests */ = {isa = PBXGroup; children = (A20000000000000000000015 /* AppRouteTests.swift */, A20000000000000000000016 /* DashboardViewModelTests.swift */, A2000000000000000000001C /* GitHubAPITests.swift */, A2000000000000000000001D /* GitHubIntegrationTests.swift */, A20000000000000000000024 /* GitHubStatusTests.swift */); path = BuddyTests; sourceTree = "<group>"; };
 		A70000000000000000000012 /* Config */ = {isa = PBXGroup; children = (A20000000000000000000017 /* Shared.xcconfig */, A20000000000000000000018 /* Local.xcconfig.example */); path = Config; sourceTree = "<group>"; };
 		A70000000000000000000013 /* Products */ = {isa = PBXGroup; children = (A20000000000000000000019 /* Buddy.app */, A2000000000000000000001A /* BuddyTests.xctest */); name = Products; sourceTree = "<group>"; };
 		A70000000000000000000014 /* Routing */ = {isa = PBXGroup; children = (A2000000000000000000000D /* AppRoute.swift */); path = Routing; sourceTree = "<group>"; };
 		A70000000000000000000015 /* Security */ = {isa = PBXGroup; children = (A2000000000000000000000B /* KeychainStore.swift */); path = Security; sourceTree = "<group>"; };
 		A70000000000000000000016 /* Brand */ = {isa = PBXGroup; children = (A20000000000000000000014 /* AppIconSource.svg */); path = Brand; sourceTree = "<group>"; };
+		A70000000000000000000017 /* GitHubStatus */ = {isa = PBXGroup; children = (A20000000000000000000022 /* GitHubStatusMonitor.swift */, A20000000000000000000023 /* GitHubStatusBanner.swift */); path = GitHubStatus; sourceTree = "<group>"; };
+		A70000000000000000000018 /* GitHubStatus */ = {isa = PBXGroup; children = (A20000000000000000000021 /* GitHubStatusService.swift */); path = GitHubStatus; sourceTree = "<group>"; };
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -179,10 +189,10 @@
 		A80000000000000000000001 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
-			files = (A10000000000000000000001, A10000000000000000000002, A10000000000000000000003, A10000000000000000000004, A10000000000000000000005, A10000000000000000000006, A10000000000000000000007, A10000000000000000000008, A10000000000000000000009, A1000000000000000000000A, A1000000000000000000000B, A1000000000000000000000C, A1000000000000000000000D, A1000000000000000000000E, A1000000000000000000000F, A10000000000000000000010, A10000000000000000000015, A10000000000000000000018, A10000000000000000000019, A1000000000000000000001A);
+			files = (A10000000000000000000001, A10000000000000000000002, A10000000000000000000003, A10000000000000000000004, A10000000000000000000005, A10000000000000000000006, A10000000000000000000007, A10000000000000000000008, A10000000000000000000009, A1000000000000000000000A, A1000000000000000000000B, A1000000000000000000000C, A1000000000000000000000D, A1000000000000000000000E, A1000000000000000000000F, A10000000000000000000010, A10000000000000000000015, A10000000000000000000018, A10000000000000000000019, A1000000000000000000001A, A1000000000000000000001B, A1000000000000000000001C, A1000000000000000000001D);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		A80000000000000000000002 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000013, A10000000000000000000014, A10000000000000000000016, A10000000000000000000017); runOnlyForDeploymentPostprocessing = 0; };
+		A80000000000000000000002 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000013, A10000000000000000000014, A10000000000000000000016, A10000000000000000000017, A1000000000000000000001E); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
