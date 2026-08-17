@@ -8,6 +8,8 @@ enum SettingsRoute: Hashable {
 struct SettingsView: View {
     @Binding var path: [SettingsRoute]
     let githubViewModel: GitHubViewModel
+    @Binding var githubStatusMonitoringEnabled: Bool
+    @Binding var githubStatusPresentationStyle: GitHubStatusPresentationStyle
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -17,6 +19,21 @@ struct SettingsView: View {
                         Label("Accounts", systemImage: "person.crop.circle.badge.gearshape")
                     }
                     .accessibilityHint("Manage connected services")
+                }
+
+                Section {
+                    Toggle("GitHub Status monitoring", isOn: $githubStatusMonitoringEnabled)
+
+                    Picker("Presentation", selection: $githubStatusPresentationStyle) {
+                        ForEach(GitHubStatusPresentationStyle.allCases) { style in
+                            Text(style.title).tag(style)
+                        }
+                    }
+                    .disabled(!githubStatusMonitoringEnabled)
+                } header: {
+                    Text("Service status")
+                } footer: {
+                    Text("Checks GitHub's public status feed while Buddy is active. Scheduled maintenance is not shown.")
                 }
 
                 Section("Privacy") {
@@ -147,5 +164,10 @@ extension GitHubViewState {
 }
 
 #Preview {
-    SettingsView(path: .constant([]), githubViewModel: GitHubViewModel())
+    SettingsView(
+        path: .constant([]),
+        githubViewModel: GitHubViewModel(),
+        githubStatusMonitoringEnabled: .constant(false),
+        githubStatusPresentationStyle: .constant(.alert)
+    )
 }
