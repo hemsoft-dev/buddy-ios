@@ -125,6 +125,28 @@ final class GitHubStatusMonitorTests: XCTestCase {
         XCTAssertEqual(monitor.currentIncident, updated)
     }
 
+    func testAlertDoesNotLoseUpdateThatArrivesWhilePreviousAlertIsPending() async throws {
+        let first = makeIncident(updateID: "update-1", status: "investigating")
+        let updated = makeIncident(updateID: "update-2", status: "identified")
+        let service = GitHubStatusSequenceService(responses: [
+            .incidents([first]),
+            .incidents([updated]),
+            .incidents([updated]),
+        ])
+        let monitor = GitHubStatusMonitor(service: service, defaults: try makeDefaults())
+
+        await monitor.refresh(isEnabled: true, style: .alert)
+        XCTAssertEqual(monitor.pendingAlert, first)
+
+        await monitor.refresh(isEnabled: true, style: .alert)
+        XCTAssertEqual(monitor.pendingAlert, first)
+        XCTAssertEqual(monitor.currentIncident, updated)
+
+        monitor.dismissAlert()
+        await monitor.refresh(isEnabled: true, style: .alert)
+        XCTAssertEqual(monitor.pendingAlert, updated)
+    }
+
     func testBannerUpdatesClearsAfterResolutionAndDoesNotQueueAlert() async throws {
         let first = makeIncident(updateID: "update-1", status: "investigating")
         let updated = makeIncident(updateID: "update-2", status: "monitoring")

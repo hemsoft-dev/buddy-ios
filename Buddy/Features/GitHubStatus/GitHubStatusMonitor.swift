@@ -80,11 +80,20 @@ final class GitHubStatusMonitor {
                 return
             }
 
+            guard !activeIncidents.isEmpty else {
+                pendingAlert = nil
+                storePresentedIdentities(presentedIdentities)
+                return
+            }
+
+            guard pendingAlert == nil else {
+                storePresentedIdentities(presentedIdentities)
+                return
+            }
+
             if let incident = activeIncidents.first(where: { !presentedIdentities.contains($0.identity) }) {
                 pendingAlert = incident
                 presentedIdentities.insert(incident.identity)
-            } else if pendingAlert.map({ !activeIdentities.contains($0.identity) }) == true {
-                pendingAlert = nil
             }
             storePresentedIdentities(presentedIdentities)
         } catch is CancellationError {

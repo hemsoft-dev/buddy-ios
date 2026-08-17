@@ -3,6 +3,7 @@ import SwiftUI
 struct GitHubStatusBanner: View {
     let incident: GitHubStatusIncident
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
         Link(destination: incident.detailsURL) {
@@ -10,14 +11,13 @@ struct GitHubStatusBanner: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .accessibilityHidden(true)
 
-                if reduceMotion {
+                if reduceMotion || dynamicTypeSize.isAccessibilitySize {
                     Text(bannerText)
                         .font(.subheadline.weight(.semibold))
                         .multilineTextAlignment(.leading)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
                     ScrollingIncidentText(text: bannerText)
-                        .frame(height: 22)
                 }
 
                 Image(systemName: "arrow.up.right.square")
@@ -42,11 +42,13 @@ struct GitHubStatusBanner: View {
 
 private struct ScrollingIncidentText: View {
     let text: String
+    @ScaledMetric(relativeTo: .subheadline) private var lineHeight: CGFloat = 22
+    @ScaledMetric(relativeTo: .subheadline) private var estimatedCharacterWidth: CGFloat = 8
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
             GeometryReader { proxy in
-                let estimatedTextWidth = max(CGFloat(text.count) * 8, proxy.size.width)
+                let estimatedTextWidth = max(CGFloat(text.count) * estimatedCharacterWidth, proxy.size.width)
                 let travel = proxy.size.width + estimatedTextWidth
                 let seconds = timeline.date.timeIntervalSinceReferenceDate
                 let progress = seconds.truncatingRemainder(dividingBy: 18) / 18
@@ -59,6 +61,7 @@ private struct ScrollingIncidentText: View {
             }
             .clipped()
         }
+        .frame(height: lineHeight)
         .accessibilityHidden(true)
     }
 }

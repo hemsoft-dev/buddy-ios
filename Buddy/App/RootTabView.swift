@@ -113,6 +113,7 @@ struct RootTabView: View {
     }
 
     private func refreshGitHubStatus() async {
+        guard scenePhase == .active else { return }
         await githubStatusMonitor.refresh(
             isEnabled: githubStatusMonitoringEnabled,
             style: githubStatusPresentationStyle
