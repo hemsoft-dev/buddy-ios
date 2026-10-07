@@ -87,13 +87,16 @@ try {
             $script:failureCategory = 'identity_or_access'
             if ($repository.data.id -ne $ExpectedRepositoryId -or $repository.data.full_name -cne $env:GITHUB_REPOSITORY -or
                 $repository.data.permissions.push -ne $true -or
-                (($actor.scopes -notcontains 'repo') -and
+                ($actor.scopes.Count -gt 0 -and ($actor.scopes -notcontains 'repo') -and
                  (($actor.scopes -notcontains 'public_repo') -or $repository.data.private -eq $true))) {
                 throw 'Current repository write permission or repository scope is missing.'
             }
             $result.actor = 'HemSoft'
-            $result.repository_scope = if ($actor.scopes -contains 'repo') { 'repo' } else { 'public_repo' }
-            $result.repository_access = 'write'
+            $result.repository_scope = if ($actor.scopes -contains 'repo') { 'repo' } elseif ($actor.scopes -contains 'public_repo') { 'public_repo' } else { 'unreported' }
+            # Repository metadata reports the actor's permission, not fine-grained token write grants.
+            $result.repository_access = 'metadata'
+            $result.actor_repository_access = 'write'
+            $result.token_write_permissions_verified = $false
             $result.post_transfer_access_verified = $env:GITHUB_REPOSITORY_OWNER -ceq 'hemsoft-dev'
         }
     }
