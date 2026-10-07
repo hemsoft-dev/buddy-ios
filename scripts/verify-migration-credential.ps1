@@ -1,13 +1,14 @@
 # Read-only authentication metadata for the organization ownership migration.
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet('OpenAI', 'OpenRouter', 'GitHubPAT')][string]$Provider,
+    [Parameter(Mandatory)][ValidateSet('OpenAI', 'OpenRouter', 'GitHubToken')][string]$Provider,
     [Parameter(Mandatory)][long]$ExpectedRepositoryId,
     [Parameter(Mandatory)][string]$OutputPath
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$script:failureCategory = 'precondition'
 
 function Invoke-CredentialMetadataGet {
     param([string]$Uri, [string]$Token)
@@ -20,8 +21,16 @@ function Invoke-CredentialMetadataGet {
     $request.Headers.UserAgent.ParseAdd('HemSoft-Migration-Credential-Check')
     $response = $null
     try {
+        $script:failureCategory = 'provider_unavailable'
         $response = $client.Send($request)
-        if ([int]$response.StatusCode -ne 200) { throw 'Credential metadata GET failed.' }
+        if ([int]$response.StatusCode -ne 200) {
+            $script:failureCategory = switch ([int]$response.StatusCode) {
+                401 { 'authentication_rejected' }; 403 { 'authentication_or_policy_rejected' }
+                429 { 'rate_limited' }; default { 'provider_http_error' }
+            }
+            throw 'Credential metadata GET failed.'
+        }
+        $script:failureCategory = 'invalid_response'
         $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json -AsHashtable
         $scopes = if ($response.Headers.Contains('X-OAuth-Scopes')) {
             ($response.Headers.GetValues('X-OAuth-Scopes') -join ',').Split(',').Trim()
@@ -35,12 +44,14 @@ function Invoke-CredentialMetadataGet {
 }
 
 try {
-    if ($env:GITHUB_EVENT_NAME -cne 'workflow_dispatch' -or $env:GITHUB_REF -cne 'refs/heads/main' -or
+    if ($env:GITHUB_ACTOR -cne 'HemSoft' -or $env:GITHUB_TRIGGERING_ACTOR -cne 'HemSoft' -or
+        $env:GITHUB_EVENT_NAME -cne 'workflow_dispatch' -or $env:GITHUB_REF -cne 'refs/heads/main' -or
         [long]$env:GITHUB_REPOSITORY_ID -ne $ExpectedRepositoryId -or
         $env:GITHUB_REPOSITORY_OWNER -cnotin @('HemSoft', 'hemsoft-dev') -or
         [string]::IsNullOrWhiteSpace($env:VERIFY_CREDENTIAL_TOKEN)) {
         throw 'Trusted main credential check prerequisites are missing.'
     }
+    $script:failureCategory = 'provider_response'
     $result = [ordered]@{
         repository_id = $ExpectedRepositoryId
         repository = $env:GITHUB_REPOSITORY
@@ -49,6 +60,7 @@ try {
         provider = $Provider
         method = 'GET'
         authentication = 'verified'
+        # Authentication metadata does not prove model or deployment runtime.
         runtime_verified = $false
     }
     switch ($Provider) {
@@ -63,29 +75,33 @@ try {
             if ($proof.data.data -isnot [System.Collections.IDictionary]) { throw 'Unexpected current-key response.' }
             $expires = $proof.data.data['expires_at']
             if ($null -ne $expires -and [DateTimeOffset]::Parse($expires) -le [DateTimeOffset]::UtcNow) {
+                $script:failureCategory = 'credential_expired'
                 throw 'Provider credential has expired.'
             }
         }
-        'GitHubPAT' {
+        'GitHubToken' {
             $actor = Invoke-CredentialMetadataGet 'https://api.github.com/user' $env:VERIFY_CREDENTIAL_TOKEN
+            $script:failureCategory = 'identity_or_access'
             if ($actor.data.login -cne 'HemSoft') { throw 'Unexpected credential actor.' }
             $repository = Invoke-CredentialMetadataGet "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)" $env:VERIFY_CREDENTIAL_TOKEN
+            $script:failureCategory = 'identity_or_access'
             if ($repository.data.id -ne $ExpectedRepositoryId -or $repository.data.full_name -cne $env:GITHUB_REPOSITORY -or
                 $repository.data.permissions.push -ne $true -or
                 (($actor.scopes -notcontains 'repo') -and
                  (($actor.scopes -notcontains 'public_repo') -or $repository.data.private -eq $true))) {
-                throw 'Current repository write permission or transferable classic scope is missing.'
+                throw 'Current repository write permission or repository scope is missing.'
             }
             $result.actor = 'HemSoft'
-            $result.token_type = 'classic'
+            $result.repository_scope = if ($actor.scopes -contains 'repo') { 'repo' } else { 'public_repo' }
             $result.repository_access = 'write'
             $result.post_transfer_access_verified = $env:GITHUB_REPOSITORY_OWNER -ceq 'hemsoft-dev'
         }
     }
+    $script:failureCategory = 'metadata_output'
     $result.observed_at = [DateTimeOffset]::UtcNow.ToString('o')
     $result | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $OutputPath -Encoding utf8
 } catch {
-    throw 'Read-only credential authentication failed. No credential or provider response is reported.'
+    throw "Read-only credential authentication failed ($script:failureCategory). No credential or provider response is reported."
 } finally {
     Remove-Item Env:VERIFY_CREDENTIAL_TOKEN -ErrorAction SilentlyContinue
 }
