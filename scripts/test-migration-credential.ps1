@@ -17,7 +17,8 @@ function Invoke-CredentialMetadataGet {
   'https://api.openai.com/v1/models' { return @{data=@{object=$global:FixtureList;data=@()};scopes=@()} }
   'https://openrouter.ai/api/v1/key' {return @{data=@{data=@{expires_at=$global:FixtureExpiry}};scopes=@()} }
   'https://api.github.com/user' {return @{data=@{login=$global:FixtureActor};scopes=$global:FixtureScopes} }
-  {$_ -cin @('https://api.github.com/repos/HemSoft/dashboard','https://api.github.com/repos/hemsoft-dev/dashboard')} {return @{data=@{id=$global:FixtureRepoId;full_name=$env:GITHUB_REPOSITORY;private=$true;permissions=@{push=$global:FixturePush}};scopes=@()} }
+  'https://api.github.com/repos/HemSoft/dashboard' {return @{data=@{id=$global:FixtureRepoId;full_name='HemSoft/dashboard';private=$true;permissions=@{push=$global:FixturePush}};scopes=@()} }
+  'https://api.github.com/repos/hemsoft-dev/dashboard' {return @{data=@{id=$global:FixtureRepoId;full_name='hemsoft-dev/dashboard';private=$true;permissions=@{push=$global:FixturePush}};scopes=@()} }
   default {throw 'Unexpected URL.'}
  }
 }
@@ -71,6 +72,7 @@ try {
    if((($metadata.PSObject.Properties.Name | Sort-Object) -join ',') -cne (($allowed | Sort-Object) -join ',')){throw 'Unexpected public metadata properties.'}
    if($Provider -ceq 'GitHubToken'){
     if($metadata.post_transfer_access_verified -ne ($case -ceq 'destination-valid') -or $metadata.repository_access -cne 'metadata' -or $metadata.actor_repository_access -cne 'write' -or $metadata.token_write_permissions_verified -ne $false){throw 'Unsupported access claim.'}
+    if($case -ceq 'destination-valid' -and ($global:FixtureCalls.ToArray() -join ',') -cne 'https://api.github.com/user,https://api.github.com/repos/hemsoft-dev/dashboard'){throw 'Destination check used the wrong endpoint.'}
     if($case -ceq 'fine-grained-valid' -and $metadata.repository_scope -cne 'unreported'){throw 'Invented classic scope.'}
    }
   }elseif(Test-Path -LiteralPath $OutputPath){throw 'Failed check wrote passing metadata.'}
