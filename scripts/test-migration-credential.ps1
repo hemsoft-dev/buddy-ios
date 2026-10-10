@@ -25,7 +25,7 @@ function Invoke-CredentialMetadataGet {
 '@
 $body=$content.Substring(0,$function.Extent.StartOffset)+$mock+$content.Substring($function.Extent.EndOffset)
 $script=[ScriptBlock]::Create($body)
-$directory=Join-Path ([IO.Path]::GetTempPath()) ('sfl-health-fixtures-'+[Guid]::NewGuid().ToString('N'))
+$directory=Join-Path ([IO.Path]::GetTempPath()) ('credential-health-fixtures-'+[Guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($directory)
 $results=[Collections.Generic.List[object]]::new()
 try {
