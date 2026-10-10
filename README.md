@@ -1,7 +1,5 @@
 # Buddy
 
-[![SFL Upstream](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2FHemSoft%2Fbuddy-ios%2Fmain%2Fsfl.json&query=%24.version&prefix=v&label=SFL%20Upstream&color=FFD700&style=flat&logo=githubactions&logoColor=white)](https://github.com/hemsoft-dev/set-it-free-loop)
-<!-- SFL_BADGE: auto-updated by deploy-workflow.ps1 -->
 # Buddy
 
 Buddy is a native iPhone productivity dashboard by HemSoft. It brings useful
